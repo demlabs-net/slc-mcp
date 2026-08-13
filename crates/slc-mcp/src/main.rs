@@ -106,6 +106,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // Local settings live in .env (cwd, e.g. slc-mcp/.env or repo root).
+    dotenvy::dotenv().ok();
     let mut config = SlcConfig::default();
     config.storage = if cli.sqlite { StorageKind::Sqlite } else { StorageKind::ObsidianVault };
     if let Some(v) = cli.vault {
