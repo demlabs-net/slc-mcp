@@ -26,6 +26,8 @@ rand = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 axum = { version = "0.8", features = ["json"] }
+futures = "0.3"
+async-stream = "0.3"
 slc-core = { path = "crates/slc-core" }
 
 [profile.release]

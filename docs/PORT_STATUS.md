@@ -117,7 +117,7 @@
 |---|---|---|---|
 | AgentRegistry + runs (LangGraph) | ✅ | ⛔ | Phase 7 «агент» — большой блок, отдельно |
 | REST API (/api/*) | ✅ | ⛔ | admin/auth/kb/seats/tasks/agents/activity… |
-| Web UI (Svelte 5) | ✅ | ⛔ | в плане Vassista — clients/ позже |
+| Web UI (Svelte 5) | ✅ | 🔶 | решено портировать на Rust: standalone `slc-webui`, отдельный Docker (P6) |
 | Observability (ActivityRecorder, MemoryMetrics) | ✅ | ⛔ | |
 
 ## LLM
@@ -138,6 +138,10 @@
 1. MCP: остальные ~32 тула, пагинация, auth-режимы/пермишены, SSE; NL-парсер
    remind_at (dateparser), recurrence (cron).
 2. Backup/restore, link/unlink + auto_load traversal, search_and_replace,
-   чанкинг эмбеддингов 1800/200.
-3. Personalization (профили), observability, External sync.
-4. Агенты (registry/runs), REST API, Web UI — отдельные крупные блоки.
+   чанкинг эмбеддингов 1800/200; **diff-обновления документов** (P4).
+3. Истории: read-only API + archive/purge (только admin) (P4.1).
+4. Personalization (профили), observability, External sync.
+5. **Агентская система (registry/runs/субагенты) — НЕ портируем**; только
+   агентский поиск (agentic search на gemma-4-e4b).
+6. **Web UI — портируем на Rust** как standalone `slc-webui` в отдельном
+   Docker (P6). REST API + Web UI для Vassista-клиентов — другие агенты.
