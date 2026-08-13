@@ -26,8 +26,6 @@ pub use search::{RankWeights, SearchHit, SearchService};
 pub use seat::SeatManager;
 pub use storage::{DocFilter, DocSort, MetaPatch, SortDir, SortField, StorageBackend};
 
-use std::path::Path;
-
 /// Which storage backend to open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageKind {
@@ -133,6 +131,11 @@ impl SlcEngine {
 
     pub fn store(&self) -> &dyn StorageBackend {
         self.store.as_ref()
+    }
+
+    /// The active LLM provider (LM Studio or Ollama).
+    pub fn llm(&self) -> &dyn LlmClient {
+        self.llm.as_ref()
     }
 
     // ── knowledge base (RAG-eligible) ────────────────────────────

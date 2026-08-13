@@ -81,13 +81,13 @@ fn bm25(query_terms: &[String], doc_tokens: &[String], df: &HashMap<String, usiz
     let b = 0.75f32;
     let mut score = 0.0f32;
     let mut seen = std::collections::HashSet::new();
-    for t in query_terms {
-        if !seen.insert(t.clone()) {
+    for term in query_terms {
+        if !seen.insert(term.clone()) {
             continue;
         }
-        let n = df.get(t).copied().unwrap_or(0);
+        let n = df.get(term).copied().unwrap_or(0);
         let idf = ((total_docs.max(1) as f32 - n as f32 + 0.5) / (n as f32 + 0.5) + 1.0).ln();
-        let f = *tf.get(t).unwrap_or(&0) as f32;
+        let f = *tf.get(term).unwrap_or(&0) as f32;
         score += idf * (f * (k1 + 1.0)) / (f + k1 * (1.0 - b + b * doc_len / avg_len));
     }
     score
@@ -169,12 +169,12 @@ pub fn rerank_inverted(mut hits: Vec<SearchHit>, weights: &RankWeights, limit: u
         hits.truncate(limit);
         return hits;
     }
-    let mut rel: Vec<f32> = hits.iter().map(|h| h.score).collect();
+    let rel: Vec<f32> = hits.iter().map(|h| h.score).collect();
     let min = rel.iter().cloned().fold(f32::INFINITY, f32::min);
     let max = rel.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let range = max - min;
-    for (i, h) in hits.iter_mut().enumerate() {
-        let relevance = if range <= f32::EPSILON { 1.0 } else { (rel[i] - min) / range };
+    for (idx, h) in hits.iter_mut().enumerate() {
+        let relevance = if range <= f32::EPSILON { 1.0 } else { (rel[idx] - min) / range };
         let imp = importance(&h.document);
         let rec = recency(&h.document, weights.recency_half_life_days);
         let mt = mem_type(&h.document);
@@ -252,7 +252,6 @@ impl SearchService {
     async fn semantic_search(&self, query: &str, filter: &DocFilter, limit: usize) -> SlcResult<Vec<SearchHit>> {
         let qv = self.llm.generate_embedding(query).await?;
 
-        let mut candidates: Vec<(String, f32)> = Vec::new();
         let mut by_doc: HashMap<String, f32> = HashMap::new();
         for scope in [EmbeddingScope::Public, EmbeddingScope::Private] {
             let seat = if scope == EmbeddingScope::Private { filter.visible_to.clone() } else { None };

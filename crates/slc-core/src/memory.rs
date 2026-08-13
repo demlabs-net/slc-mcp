@@ -279,7 +279,7 @@ impl<S: StorageBackend, L: LlmClient> MemoryConsolidator<S, L> {
             ..Default::default()
         };
         // L2/L3 sources, newest first, ≤20.
-        let mut sources = self
+        let sources = self
             .store
             .episodic_find(&filter, &DocSort::by_created(SortDir::Desc), 20)
             .await?

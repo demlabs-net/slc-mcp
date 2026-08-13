@@ -40,7 +40,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 /// Resolve the seat from the `X-Seat-ID` header (auto-provision on miss).
-fn seat_from_request(headers: &axum::http::HeaderMap, engine: &SlcEngine) -> Option<String> {
+fn seat_from_request(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get("x-seat-id")
         .and_then(|v| v.to_str().ok())
@@ -58,7 +58,7 @@ async fn mcp(
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
     let engine = state.engine.as_ref();
-    let seat_id = seat_from_request(&headers, engine);
+    let seat_id = seat_from_request(&headers);
     // Tool calls need a seat (legacy_seat_id mode); initialize/list don't.
     if !matches!(method, "initialize" | "tools/list" | "ping") && seat_id.is_none() {
         return (
