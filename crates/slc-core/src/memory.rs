@@ -36,6 +36,7 @@ Summaries:
 // ─────────────────────────── progressive summarization ───────────────────────────
 
 /// Progressive summarization: L1 raw → L2 daily → L3 weekly → L4 insights.
+#[derive(Clone)]
 pub struct HistoryCompressor<S: StorageBackend, L: LlmClient> {
     store: S,
     llm: L,
@@ -261,6 +262,7 @@ pub struct CompressionReport {
 // ─────────────────────────────── consolidation ───────────────────────────────
 
 /// Extracts LEARNED_FACTs from episodic L2/L3 into the KB (semantic memory).
+#[derive(Clone)]
 pub struct MemoryConsolidator<S: StorageBackend, L: LlmClient> {
     store: S,
     llm: L,
@@ -439,7 +441,6 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Datelike;
     use crate::llm::MockLlm;
     use crate::storage::sqlite::SqliteStore;
 

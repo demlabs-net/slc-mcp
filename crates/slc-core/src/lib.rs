@@ -10,21 +10,42 @@
 //! - Ships as `rlib` (embedded in Rust apps, e.g. vs-memory) + `staticlib`
 //!   (C ABI) + consumed by the standalone `slc-mcp` binary (MCP server/CLI).
 
+pub mod auth;
 pub mod error;
+pub mod focus;
+pub mod ideas;
 pub mod llm;
 pub mod memory;
 pub mod model;
+pub mod notifications;
+pub mod pagination;
+pub mod proactivity;
+pub mod profiles;
+pub mod reflection;
+pub mod reminders;
 pub mod search;
 pub mod seat;
 pub mod storage;
+pub mod tasks;
+pub mod timer;
 
 pub use error::{SlcError, SlcResult};
+pub use auth::{authenticate, auth_mode_from_env, Principal, AuthMode};pub use focus::{FocusItem, FocusManager};
+pub use ideas::{IdeaItem, IdeaPool};
 pub use llm::{LlmClient, LmStudioClient, MockLlm, OllamaClient};
 pub use memory::{ConsolidationReport, CompressionReport, HistoryCompressor, MemoryConsolidator};
 pub use model::*;
+pub use notifications::NotificationQueue;
+pub use pagination::Paginator;
+pub use proactivity::{mind_matches, normalize_write_mind_type, MindType};
+pub use profiles::ProfileManager;
+pub use reflection::{parse_ideas, ReflectionEngine};
+pub use reminders::{parse_remind_at, ReminderManager};
 pub use search::{RankWeights, SearchHit, SearchService};
 pub use seat::SeatManager;
+pub use timer::{TimerHandler, TimerRegistry};
 pub use storage::{DocFilter, DocSort, MetaPatch, SortDir, SortField, StorageBackend};
+pub use tasks::{ProjectInfo, TaskInfo, WorkItemManager};
 
 /// Which storage backend to open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,9 +104,10 @@ pub struct SlcEngine {
     search: SearchService,
     compressor: HistoryCompressor<std::sync::Arc<dyn StorageBackend>, std::sync::Arc<dyn LlmClient>>,
     consolidator: MemoryConsolidator<std::sync::Arc<dyn StorageBackend>, std::sync::Arc<dyn LlmClient>>,
+    reflection: ReflectionEngine<std::sync::Arc<dyn StorageBackend>, std::sync::Arc<dyn LlmClient>>,
     pub config: SlcConfig,
+    scheduler: std::sync::Mutex<Option<timer::TimerRegistry>>,
 }
-
 impl SlcEngine {
     pub fn open(config: SlcConfig) -> SlcResult<Self> {
         let store: std::sync::Arc<dyn StorageBackend> = match config.storage {
@@ -126,7 +148,8 @@ impl SlcEngine {
         let search = SearchService::new(store.clone(), llm.clone(), config.semantic_weight, config.text_weight);
         let compressor = HistoryCompressor::new(store.clone(), llm.clone());
         let consolidator = MemoryConsolidator::new(store.clone(), llm.clone());
-        SlcEngine { store, llm, seats, search, compressor, consolidator, config }
+        let reflection = ReflectionEngine::new(store.clone(), llm.clone());
+        SlcEngine { store, llm, seats, search, compressor, consolidator, reflection, config, scheduler: std::sync::Mutex::new(None) }
     }
 
     pub fn store(&self) -> &dyn StorageBackend {
@@ -187,6 +210,274 @@ impl SlcEngine {
         self.store.episodic_find(&f, &DocSort::by_created(SortDir::Desc), limit).await
     }
 
+    // ── proactive loop: focuses + ideas ─────────────────────────
+
+    /// Add a focus; returns the created item.
+    pub async fn focus_add(
+        &self,
+        seat_id: &str,
+        title: &str,
+        description: &str,
+        priority: i64,
+        depends_on: &[String],
+        mind_type: Option<&str>,
+    ) -> SlcResult<FocusItem> {
+        let fm = FocusManager::new(self.store.clone());
+        fm.add(seat_id, title, description, priority, depends_on, mind_type).await
+    }
+
+    pub async fn focus_remove(&self, seat_id: &str, focus_id: &str) -> SlcResult<bool> {
+        let fm = FocusManager::new(self.store.clone());
+        fm.remove(focus_id, Some(seat_id)).await
+    }
+
+    pub async fn focus_update(
+        &self,
+        seat_id: &str,
+        focus_id: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        priority: Option<i64>,
+        depends_on: Option<&[String]>,
+    ) -> SlcResult<bool> {
+        let fm = FocusManager::new(self.store.clone());
+        fm.update(focus_id, title, description, priority, depends_on, Some(seat_id)).await
+    }
+
+    pub async fn focus_list(&self, seat_id: &str, mind_type: Option<MindType>) -> SlcResult<Vec<FocusItem>> {
+        let fm = FocusManager::new(self.store.clone());
+        fm.get_active(seat_id, mind_type).await
+    }
+
+    /// Add an idea (source `manual`); optional pre-computed embedding.
+    pub async fn idea_add(
+        &self,
+        seat_id: &str,
+        content: &str,
+        source: &str,
+        embedding: Option<Vec<f32>>,
+        mind_type: Option<&str>,
+    ) -> SlcResult<IdeaItem> {
+        let pool = IdeaPool::new(self.store.clone());
+        pool.add(seat_id, content, source, embedding, mind_type).await
+    }
+
+    pub async fn idea_remove(&self, seat_id: &str, idea_id: &str) -> SlcResult<bool> {
+        let pool = IdeaPool::new(self.store.clone());
+        pool.remove(idea_id, Some(seat_id)).await
+    }
+
+    pub async fn idea_list(&self, seat_id: &str, limit: usize, mind_type: Option<MindType>) -> SlcResult<Vec<IdeaItem>> {
+        let pool = IdeaPool::new(self.store.clone());
+        pool.list_active(seat_id, limit, mind_type).await
+    }
+
+    pub async fn idea_random(&self, seat_id: &str, mind_type: Option<MindType>) -> SlcResult<Option<IdeaItem>> {
+        let pool = IdeaPool::new(self.store.clone());
+        pool.get_weighted_random(seat_id, mind_type).await
+    }
+
+    /// Run one reflection pass for a seat (the `REFLECTION` timer handler).
+    pub async fn reflect(&self, seat_id: &str) -> SlcResult<()> {
+        let timer = model::PersistedTimer {
+            timer_id: format!("reflect_{seat_id}"),
+            seat_id: seat_id.into(),
+            timer_type: model::TimerType::Reflection,
+            interval_seconds: None,
+            last_fired_at: None,
+            next_fire_at: chrono::Utc::now(),
+            is_active: true,
+            metadata: Default::default(),
+            created_at: chrono::Utc::now(),
+        };
+        self.reflection.handle_timer(&timer).await
+    }
+
+    // ── reminders + notifications ────────────────────────────────
+
+    /// Create a reminder; schedules a one-shot `REMINDER` timer.
+    pub async fn reminder_create(
+        &self,
+        seat_id: &str,
+        content: &str,
+        remind_at: chrono::DateTime<chrono::Utc>,
+        mind_type: Option<&str>,
+    ) -> SlcResult<model::Reminder> {
+        let registry = self.scheduler().unwrap_or_else(|| timer::TimerRegistry::new(self.store.clone()));
+        let manager = ReminderManager::new(self.store.clone(), registry);
+        manager.create(seat_id, content, remind_at, None, None, false, mind_type).await
+    }
+
+    pub async fn reminder_list(&self, seat_id: &str) -> SlcResult<Vec<model::Reminder>> {
+        let registry = timer::TimerRegistry::new(self.store.clone());
+        let manager = ReminderManager::new(self.store.clone(), registry);
+        manager.list(seat_id, None, None).await
+    }
+
+    pub async fn reminder_cancel(&self, seat_id: &str, reminder_id: &str) -> SlcResult<bool> {
+        let registry = self.scheduler().unwrap_or_else(|| timer::TimerRegistry::new(self.store.clone()));
+        let manager = ReminderManager::new(self.store.clone(), registry);
+        manager.cancel(reminder_id, Some(seat_id)).await
+    }
+
+    /// Pop pending notifications for the seat (marks them delivered).
+    pub async fn pop_notifications(&self, seat_id: &str, limit: usize) -> SlcResult<Vec<model::Notification>> {
+        let queue = NotificationQueue::new(self.store.clone());
+        queue.pop_pending(seat_id, limit).await
+    }
+
+    pub async fn pending_notification_count(&self, seat_id: &str) -> SlcResult<usize> {
+        let queue = NotificationQueue::new(self.store.clone());
+        queue.count_pending(seat_id).await
+    }
+
+    // ── pagination ───────────────────────────────────────────────
+
+    pub async fn paginate(&self, seat_id: &str, response_id: &str, data: &serde_json::Value) -> SlcResult<serde_json::Value> {
+        let p = Paginator::new(self.store.clone());
+        p.paginate(seat_id, response_id, data).await
+    }
+
+    pub async fn get_page(&self, seat_id: &str, response_id: &str, page: usize) -> SlcResult<serde_json::Value> {
+        let p = Paginator::new(self.store.clone());
+        p.get_page(seat_id, response_id, page).await
+    }
+
+    pub async fn delete_response(&self, response_id: &str) -> SlcResult<serde_json::Value> {
+        let p = Paginator::new(self.store.clone());
+        p.delete_response(response_id).await
+    }
+
+    pub async fn set_page_limit(&self, tokens: usize) -> SlcResult<serde_json::Value> {
+        let p = Paginator::new(self.store.clone());
+        p.set_page_limit(tokens).await
+    }
+
+    pub async fn page_settings(&self) -> SlcResult<serde_json::Value> {
+        let p = Paginator::new(self.store.clone());
+        p.get_settings().await
+    }
+
+    // ── tasks + projects (unified Documents) ─────────────────────
+
+    pub async fn task_create(
+        &self,
+        seat_id: &str,
+        name: &str,
+        description: &str,
+        project_id: Option<&str>,
+        auto_load: &[String],
+        metadata: &serde_json::Value,
+    ) -> SlcResult<tasks::TaskInfo> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.create_task(seat_id, name, description, project_id, auto_load, metadata).await
+    }
+
+    pub async fn task_get(&self, seat_id: &str, task_id: &str) -> SlcResult<Option<tasks::TaskInfo>> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.get_task(seat_id, task_id).await
+    }
+
+    pub async fn task_update(
+        &self,
+        seat_id: &str,
+        task_id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        project_id: Option<Option<&str>>,
+        auto_load: Option<&[String]>,
+        status: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+    ) -> SlcResult<Option<tasks::TaskInfo>> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.update_task(seat_id, task_id, name, description, project_id, auto_load, status, metadata).await
+    }
+
+    pub async fn task_delete(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.delete_task(seat_id, task_id).await
+    }
+
+    pub async fn task_list(&self, seat_id: &str, project_id: Option<&str>, status: Option<&str>, limit: usize) -> SlcResult<Vec<tasks::TaskInfo>> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.list_tasks(seat_id, project_id, status, limit).await
+    }
+
+    pub async fn task_activate(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.set_active_task(seat_id, task_id).await
+    }
+
+    pub async fn task_get_active(&self, seat_id: &str) -> SlcResult<Option<tasks::TaskInfo>> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.get_active_task(seat_id).await
+    }
+
+    pub async fn project_create(
+        &self,
+        seat_id: &str,
+        name: &str,
+        description: &str,
+        auto_load: &[String],
+        metadata: &serde_json::Value,
+    ) -> SlcResult<tasks::ProjectInfo> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.create_project(seat_id, name, description, auto_load, metadata).await
+    }
+
+    pub async fn project_get(&self, seat_id: &str, project_id: &str) -> SlcResult<Option<tasks::ProjectInfo>> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.get_project(seat_id, project_id).await
+    }
+
+    pub async fn project_update(
+        &self,
+        seat_id: &str,
+        project_id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        auto_load: Option<&[String]>,
+        status: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+    ) -> SlcResult<Option<tasks::ProjectInfo>> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.update_project(seat_id, project_id, name, description, auto_load, status, metadata).await
+    }
+
+    pub async fn project_delete(&self, seat_id: &str, project_id: &str) -> SlcResult<bool> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.delete_project(seat_id, project_id).await
+    }
+
+    pub async fn project_list(&self, seat_id: &str, status: Option<&str>, limit: usize) -> SlcResult<Vec<tasks::ProjectInfo>> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.list_projects(seat_id, status, limit).await
+    }
+
+    // ── profiles ─────────────────────────────────────────────────
+
+    pub async fn get_user_profile(&self, seat_id: &str) -> SlcResult<Option<String>> {
+        let pm = ProfileManager::new(self.store.clone());
+        let user_id = pm.resolve_user_id(seat_id).await?;
+        pm.get_user_profile(&user_id, seat_id).await
+    }
+
+    pub async fn upsert_user_profile(&self, seat_id: &str, content: &str) -> SlcResult<bool> {
+        let pm = ProfileManager::new(self.store.clone());
+        let user_id = pm.resolve_user_id(seat_id).await?;
+        pm.upsert_user_profile(&user_id, content, seat_id).await
+    }
+
+    pub async fn get_seat_profile(&self, seat_id: &str) -> SlcResult<Option<(String, String)>> {
+        let pm = ProfileManager::new(self.store.clone());
+        pm.get_seat_profile(seat_id).await
+    }
+
+    pub async fn upsert_seat_profile(&self, seat_id: &str, content: &str, timezone: Option<&str>) -> SlcResult<bool> {
+        let pm = ProfileManager::new(self.store.clone());
+        pm.upsert_seat_profile(seat_id, content, timezone).await
+    }
+
     // ── seats ────────────────────────────────────────────────────
 
     pub async fn ensure_seat(&self, seat_id: &str) -> SlcResult<Seat> {
@@ -204,6 +495,159 @@ impl SlcEngine {
     pub async fn health(&self) -> bool {
         self.store.health_check().await
     }
+
+    /// Start the background timer scheduler: default per-seat timers +
+    /// compression/consolidation handlers. Idempotent. The MCP server calls
+    /// this on startup.
+    pub async fn start_background(&self) -> SlcResult<()> {
+        let mut guard = self.scheduler.lock().unwrap();
+        if guard.is_some() {
+            return Ok(());
+        }
+        let registry = timer::TimerRegistry::new(self.store.clone());
+
+        let compressor = self.compressor.clone();
+        registry.set_handler(
+            model::TimerType::HistoryCompression,
+            std::sync::Arc::new(timer::AsyncFnHandler::new(move |t| {
+                let compressor = compressor.clone();
+                let seat = t.seat_id.clone();
+                Box::pin(async move {
+                    let report = compressor.compress(&seat).await?;
+                    tracing::info!("history compression [{seat}]: L1→L2 {}, L2→L3 {}, L3→L4 {}", report.l1_to_l2, report.l2_to_l3, report.l3_to_l4);
+                    Ok(())
+                })
+            })),
+        );
+        let consolidator = self.consolidator.clone();
+        registry.set_handler(
+            model::TimerType::Consolidation,
+            std::sync::Arc::new(timer::AsyncFnHandler::new(move |t| {
+                let consolidator = consolidator.clone();
+                let seat = t.seat_id.clone();
+                Box::pin(async move {
+                    let report = consolidator.consolidate(&seat).await?;
+                    tracing::info!("consolidation [{seat}]: +{} facts", report.facts_added);
+                    Ok(())
+                })
+            })),
+        );
+        let reflection = self.reflection.clone();
+        registry.set_handler(
+            model::TimerType::Reflection,
+            std::sync::Arc::new(timer::AsyncFnHandler::new(move |t| {
+                let reflection = reflection.clone();
+                let timer = t.clone();
+                Box::pin(async move {
+                    reflection.handle_timer(&timer).await?;
+                    Ok(())
+                })
+            })),
+        );
+        let store_for_handlers = self.store.clone();
+        registry.set_handler(
+            model::TimerType::Reminder,
+            std::sync::Arc::new(timer::AsyncFnHandler::new(move |t| {
+                let store = store_for_handlers.clone();
+                let timer = t.clone();
+                Box::pin(async move {
+                    handle_reminder(&store, &timer).await?;
+                    Ok(())
+                })
+            })),
+        );
+        let store_for_handlers = self.store.clone();
+        registry.set_handler(
+            model::TimerType::FocusReminder,
+            std::sync::Arc::new(timer::AsyncFnHandler::new(move |t| {
+                let store = store_for_handlers.clone();
+                let timer = t.clone();
+                Box::pin(async move {
+                    handle_focus_reminder(&store, &timer).await?;
+                    Ok(())
+                })
+            })),
+        );
+        let store_for_handlers = self.store.clone();
+        registry.set_handler(
+            model::TimerType::IdeaReminder,
+            std::sync::Arc::new(timer::AsyncFnHandler::new(move |t| {
+                let store = store_for_handlers.clone();
+                let timer = t.clone();
+                Box::pin(async move {
+                    handle_idea_reminder(&store, &timer).await?;
+                    Ok(())
+                })
+            })),
+        );
+
+        // Defaults for every active seat, then start the loops.
+        for seat in self.store.list_active_seats(1000).await? {
+            let created = registry.create_defaults(&seat.seat_id).await?;
+            if !created.is_empty() {
+                tracing::debug!("seat {}: default timers {}", seat.seat_id, created.join(","));
+            }
+        }
+        registry.start().await?;
+        *guard = Some(registry);
+        Ok(())
+    }
+
+    pub fn scheduler(&self) -> Option<timer::TimerRegistry> {
+        self.scheduler.lock().unwrap().clone()
+    }
+}
+
+/// Timer handler for a user-created `REMINDER`: mark fired + push a
+/// notification (mirrors `ReminderHandler` in the legacy).
+async fn handle_reminder(store: &std::sync::Arc<dyn StorageBackend>, timer: &model::PersistedTimer) -> SlcResult<()> {
+    let Some(reminder_id) = timer.metadata.get("reminder_id").and_then(|v| v.as_str()) else {
+        tracing::warn!("REMINDER timer {} has no reminder_id in metadata", timer.timer_id);
+        return Ok(());
+    };
+    let manager = ReminderManager::new(store.clone(), timer::TimerRegistry::new(store.clone()));
+    let Some(reminder) = manager.get(reminder_id, Some(&timer.seat_id)).await? else {
+        tracing::warn!("Reminder {reminder_id} not found in DB");
+        return Ok(());
+    };
+    manager.mark_fired(reminder_id, Some(&timer.seat_id)).await?;
+    let queue = NotificationQueue::new(store.clone());
+    let mut meta = serde_json::Map::new();
+    meta.insert("reminder_id".into(), serde_json::Value::String(reminder_id.into()));
+    queue
+        .push(&timer.seat_id, "REMINDER", "⏰ Напоминание", &reminder.content, meta)
+        .await?;
+    Ok(())
+}
+
+/// Periodic nudge about active focuses (`FocusReminderHandler`).
+async fn handle_focus_reminder(store: &std::sync::Arc<dyn StorageBackend>, timer: &model::PersistedTimer) -> SlcResult<()> {
+    let focuses = FocusManager::new(store.clone()).get_active(&timer.seat_id, None).await?;
+    if focuses.is_empty() {
+        return Ok(());
+    }
+    let mut body = format!("У вас {} активных фокусов:\n", focuses.len());
+    for f in focuses.iter().take(5) {
+        body.push_str(&format!("- {} (priority {})\n", f.title, f.priority));
+    }
+    if focuses.len() > 5 {
+        body.push_str(&format!("...и ещё {}", focuses.len() - 5));
+    }
+    let queue = NotificationQueue::new(store.clone());
+    queue.push(&timer.seat_id, "FOCUS_REMINDER", "🎯 Текущие фокусы", &body, Default::default()).await?;
+    Ok(())
+}
+
+/// Periodic surfacing of an idea from the pool (`IdeaReminderHandler`).
+async fn handle_idea_reminder(store: &std::sync::Arc<dyn StorageBackend>, timer: &model::PersistedTimer) -> SlcResult<()> {
+    let Some(idea) = IdeaPool::new(store.clone()).get_weighted_random(&timer.seat_id, None).await? else {
+        return Ok(());
+    };
+    let mut meta = serde_json::Map::new();
+    meta.insert("idea_id".into(), serde_json::Value::String(idea.idea_id));
+    let queue = NotificationQueue::new(store.clone());
+    queue.push(&timer.seat_id, "IDEA_REMINDER", "💡 Идея из пула", &idea.content, meta).await?;
+    Ok(())
 }
 
 fn expand_tilde(path: &str) -> String {

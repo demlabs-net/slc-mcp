@@ -402,7 +402,7 @@ mod tests {
 
     #[tokio::test]
     async fn reranker_importance_recency() {
-        let mut hits = sample_docs()
+        let hits = sample_docs()
             .into_iter()
             .enumerate()
             .map(|(i, d)| SearchHit { document: d, score: 0.5 - i as f32 * 0.1, rank_score: 0.0 })
