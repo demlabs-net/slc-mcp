@@ -19,7 +19,7 @@ pub mod seat;
 pub mod storage;
 
 pub use error::{SlcError, SlcResult};
-pub use llm::{LlmClient, MockLlm, OllamaClient};
+pub use llm::{LlmClient, LmStudioClient, MockLlm, OllamaClient};
 pub use memory::{ConsolidationReport, CompressionReport, HistoryCompressor, MemoryConsolidator};
 pub use model::*;
 pub use search::{RankWeights, SearchHit, SearchService};
@@ -47,6 +47,11 @@ pub struct SlcConfig {
     pub ollama_endpoint: String,
     pub ollama_reasoning_model: String,
     pub ollama_embedding_model: String,
+    /// LM Studio (OpenAI-compatible) — preferred when set.
+    pub lmstudio_url: Option<String>,
+    /// Agentic/reasoning model (compression, consolidation, subagents).
+    pub lmstudio_model: String,
+    pub lmstudio_embed_model: String,
     pub semantic_weight: f32,
     pub text_weight: f32,
     pub seat_ttl_seconds: i64,
@@ -61,6 +66,10 @@ impl Default for SlcConfig {
             ollama_endpoint: std::env::var("OLLAMA_ENDPOINT").unwrap_or_else(|_| "http://localhost:11434".into()),
             ollama_reasoning_model: std::env::var("OLLAMA_REASONING_MODEL").unwrap_or_else(|_| "gemma3:latest".into()),
             ollama_embedding_model: std::env::var("OLLAMA_EMBEDDING_MODEL").unwrap_or_else(|_| "bge-m3".into()),
+            lmstudio_url: std::env::var("LMSTUDIO_URL").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
+            lmstudio_model: std::env::var("LMSTUDIO_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".into()),
+            lmstudio_embed_model: std::env::var("LMSTUDIO_EMBED_MODEL")
+                .unwrap_or_else(|_| "text-embedding-nomic-embed-text-v1.5".into()),
             semantic_weight: 0.7,
             text_weight: 0.3,
             seat_ttl_seconds: 86400,
@@ -91,11 +100,20 @@ impl SlcEngine {
                 std::sync::Arc::new(storage::sqlite::SqliteStore::open(path)?)
             }
         };
-        let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(OllamaClient::new(
-            &config.ollama_endpoint,
-            &config.ollama_reasoning_model,
-            &config.ollama_embedding_model,
-        ));
+        // Provider auto-select: LM Studio (OpenAI-compatible) when
+        // configured, else Ollama — same rule as the Python legacy.
+        let llm: std::sync::Arc<dyn LlmClient> = match &config.lmstudio_url {
+            Some(url) => std::sync::Arc::new(LmStudioClient::new(
+                url,
+                &config.lmstudio_model,
+                &config.lmstudio_embed_model,
+            )),
+            None => std::sync::Arc::new(OllamaClient::new(
+                &config.ollama_endpoint,
+                &config.ollama_reasoning_model,
+                &config.ollama_embedding_model,
+            )),
+        };
         Ok(Self::with(store, llm, config))
     }
 
