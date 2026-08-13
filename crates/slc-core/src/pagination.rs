@@ -19,9 +19,7 @@ pub const COLLECTION: &str = "paginated_responses";
 /// Min / max page sizes in tokens (legacy constants).
 pub const MIN_PAGE_TOKEN_LIMIT: usize = 500;
 pub const MAX_PAGE_TOKEN_LIMIT: usize = 100_000;
-/// 5000 токенов ≈ 20K симв ≈ 20-40K байт: страница гарантированно влезает
-/// в типовой resultBudget харнеса (50K байт на вывод одного тула).
-pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 5_000;
+pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 16_000;
 
 /// Rough chars-per-token estimate (legacy CHARS_PER_TOKEN=4).
 pub const CHARS_PER_TOKEN: usize = 4;
@@ -213,7 +211,7 @@ fn estimate_chars(v: &Value) -> usize {
 /// First key whose value is a non-empty list.
 fn find_list_key(result: &Value) -> Option<String> {
     let obj = result.as_object()?;
-    for key in ["results", "content", "items", "focuses", "reminders", "notifications", "tasks", "projects", "docs", "events"] {
+    for key in ["results", "content", "items", "focuses", "ideas", "reminders", "notifications", "tasks", "projects", "docs", "events"] {
         if let Some(v) = obj.get(key) {
             if v.is_array() {
                 return Some(key.to_string());

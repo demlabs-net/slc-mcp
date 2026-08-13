@@ -330,6 +330,39 @@ impl TimerType {
     }
 }
 
+/// A user-created reminder — surfaces a message at `remind_at`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reminder {
+    pub reminder_id: String,
+    pub seat_id: String,
+    pub mind_type: crate::proactivity::MindType,
+    pub user_id: Option<String>,
+    pub content: String,
+    pub remind_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    /// `pending` | `fired` | `cancelled`.
+    pub status: String,
+    /// Optional cron string (unused for now; future recurrence).
+    pub recurrence: Option<String>,
+    pub created_by_agent: bool,
+}
+
+/// A queued notification destined for a seat/agent (the UX channel).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    pub notification_id: String,
+    pub seat_id: String,
+    /// `REMINDER` | `FOCUS_REMINDER` | `IDEA_REMINDER` | `REFLECTION` | …
+    pub source: String,
+    pub title: String,
+    pub body: String,
+    /// `pending` | `delivered` | `dismissed`.
+    pub status: String,
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
 /// sha256 hex of the document content — dedup / content identity only.
 pub fn content_hash(content: &str) -> String {
     use sha2::{Digest, Sha256};

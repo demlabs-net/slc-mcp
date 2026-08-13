@@ -107,6 +107,9 @@ pub trait StorageBackend: Send + Sync {
     async fn kb_update_content(&self, document_id: &str, content: &str) -> SlcResult<bool>;
     /// Insert if absent, else update content (upsert semantics).
     async fn kb_upsert(&self, doc: &Document) -> SlcResult<bool>;
+    /// Full replace: insert or overwrite the whole document (metadata, tags,
+    /// auto_load, content — everything). Returns true if it replaced existing.
+    async fn kb_replace(&self, doc: &Document) -> SlcResult<bool>;
     async fn kb_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>>;
     async fn kb_count(&self, filter: &DocFilter) -> SlcResult<u64>;
     /// Apply a metadata patch to all matching KB docs.
@@ -143,16 +146,23 @@ pub trait StorageBackend: Send + Sync {
     async fn list_active_seats(&self, limit: usize) -> SlcResult<Vec<Seat>>;
     async fn touch_seat(&self, seat_id: &str) -> SlcResult<bool>;
     async fn set_seat_status(&self, seat_id: &str, status: SeatStatus) -> SlcResult<bool>;
+    /// Set the seat's active-task pointer (working-memory context).
+    async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool>;
     async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool>;
 
     // ── Timers ──────────────────────────────────────────────────
     async fn insert_timer(&self, timer: &PersistedTimer) -> SlcResult<()>;
+    async fn get_timer(&self, timer_id: &str) -> SlcResult<Option<PersistedTimer>>;
     async fn active_timers(&self, seat_id: Option<&str>) -> SlcResult<Vec<PersistedTimer>>;
     async fn set_timer_fired(&self, timer_id: &str, now: DateTime<Utc>) -> SlcResult<()>;
 
     /// Free-form JSON records (task/project extras, notifications, …).
     async fn put_record(&self, collection: &str, key: &str, value: &Value) -> SlcResult<()>;
     async fn get_record(&self, collection: &str, key: &str) -> SlcResult<Option<Value>>;
+    /// Delete a record if present; returns true if it existed.
+    async fn delete_record(&self, collection: &str, key: &str) -> SlcResult<bool>;
+    /// Enumerate all records in a collection as `(key, value)` pairs.
+    async fn list_records(&self, collection: &str) -> SlcResult<Vec<(String, Value)>>;
 
     async fn health_check(&self) -> bool;
     async fn close(&self) -> SlcResult<()>;
@@ -166,6 +176,7 @@ impl StorageBackend for Arc<dyn StorageBackend> {
     async fn kb_get(&self, document_id: &str) -> SlcResult<Option<Document>> { self.as_ref().kb_get(document_id).await }
     async fn kb_update_content(&self, document_id: &str, content: &str) -> SlcResult<bool> { self.as_ref().kb_update_content(document_id, content).await }
     async fn kb_upsert(&self, doc: &Document) -> SlcResult<bool> { self.as_ref().kb_upsert(doc).await }
+    async fn kb_replace(&self, doc: &Document) -> SlcResult<bool> { self.as_ref().kb_replace(doc).await }
     async fn kb_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>> { self.as_ref().kb_find(filter, sort, limit).await }
     async fn kb_count(&self, filter: &DocFilter) -> SlcResult<u64> { self.as_ref().kb_count(filter).await }
     async fn kb_patch_meta(&self, filter: &DocFilter, patch: &MetaPatch) -> SlcResult<usize> { self.as_ref().kb_patch_meta(filter, patch).await }
@@ -193,14 +204,18 @@ impl StorageBackend for Arc<dyn StorageBackend> {
     async fn list_active_seats(&self, limit: usize) -> SlcResult<Vec<Seat>> { self.as_ref().list_active_seats(limit).await }
     async fn touch_seat(&self, seat_id: &str) -> SlcResult<bool> { self.as_ref().touch_seat(seat_id).await }
     async fn set_seat_status(&self, seat_id: &str, status: SeatStatus) -> SlcResult<bool> { self.as_ref().set_seat_status(seat_id, status).await }
+    async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> { self.as_ref().set_seat_active_task(seat_id, task_id).await }
     async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool> { self.as_ref().incr_seat_stats(seat_id, tool_name, tokens_used).await }
 
     async fn insert_timer(&self, timer: &PersistedTimer) -> SlcResult<()> { self.as_ref().insert_timer(timer).await }
+    async fn get_timer(&self, timer_id: &str) -> SlcResult<Option<PersistedTimer>> { self.as_ref().get_timer(timer_id).await }
     async fn active_timers(&self, seat_id: Option<&str>) -> SlcResult<Vec<PersistedTimer>> { self.as_ref().active_timers(seat_id).await }
     async fn set_timer_fired(&self, timer_id: &str, now: DateTime<Utc>) -> SlcResult<()> { self.as_ref().set_timer_fired(timer_id, now).await }
 
     async fn put_record(&self, collection: &str, key: &str, value: &Value) -> SlcResult<()> { self.as_ref().put_record(collection, key, value).await }
     async fn get_record(&self, collection: &str, key: &str) -> SlcResult<Option<Value>> { self.as_ref().get_record(collection, key).await }
+    async fn delete_record(&self, collection: &str, key: &str) -> SlcResult<bool> { self.as_ref().delete_record(collection, key).await }
+    async fn list_records(&self, collection: &str) -> SlcResult<Vec<(String, Value)>> { self.as_ref().list_records(collection).await }
 
     async fn health_check(&self) -> bool { self.as_ref().health_check().await }
     async fn close(&self) -> SlcResult<()> { self.as_ref().close().await }

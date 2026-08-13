@@ -599,6 +599,17 @@ impl StorageBackend for ObsidianVaultStore {
         Ok(false)
     }
 
+    async fn kb_replace(&self, doc: &Document) -> SlcResult<bool> {
+        if !doc.category.is_kb() {
+            return Err(SlcError::Storage("history docs go to the episodic store, not the KB".into()));
+        }
+        let exists = self.index.lock().unwrap().contains_key(&doc.document_id);
+        let doc = doc.clone();
+        self.write_note(&doc)?;
+        self.git_commit().await;
+        Ok(exists)
+    }
+
     async fn kb_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>> {
         let entries = self.select(Table::Kb, filter, sort, limit);
         let mut out = Vec::with_capacity(entries.len());
@@ -867,6 +878,16 @@ impl StorageBackend for ObsidianVaultStore {
         Ok(true)
     }
 
+    async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
+        let mut seats = self.seats.lock().unwrap();
+        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+        seat.active_task_id = Some(task_id.into());
+        let seat = seat.clone();
+        drop(seats);
+        self.persist_seat(&seat)?;
+        Ok(true)
+    }
+
     async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool> {
         let mut seats = self.seats.lock().unwrap();
         let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
@@ -886,6 +907,10 @@ impl StorageBackend for ObsidianVaultStore {
     async fn insert_timer(&self, timer: &PersistedTimer) -> SlcResult<()> {
         self.timers.lock().unwrap().insert(timer.timer_id.clone(), timer.clone());
         self.persist_timers()
+    }
+
+    async fn get_timer(&self, timer_id: &str) -> SlcResult<Option<PersistedTimer>> {
+        Ok(self.timers.lock().unwrap().get(timer_id).cloned())
     }
 
     async fn active_timers(&self, seat_id: Option<&str>) -> SlcResult<Vec<PersistedTimer>> {
@@ -917,6 +942,25 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn get_record(&self, collection: &str, key: &str) -> SlcResult<Option<Value>> {
         Ok(self.records.lock().unwrap().get(&(collection.to_string(), key.to_string())).cloned())
+    }
+
+    async fn delete_record(&self, collection: &str, key: &str) -> SlcResult<bool> {
+        let existed = self.records.lock().unwrap().remove(&(collection.to_string(), key.to_string())).is_some();
+        if existed {
+            self.persist_records()?;
+        }
+        Ok(existed)
+    }
+
+    async fn list_records(&self, collection: &str) -> SlcResult<Vec<(String, Value)>> {
+        let records = self.records.lock().unwrap();
+        let mut out: Vec<(String, Value)> = records
+            .iter()
+            .filter(|((c, _), _)| c == collection)
+            .map(|((_, k), v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
     }
 
     async fn health_check(&self) -> bool {

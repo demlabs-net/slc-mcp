@@ -51,46 +51,18 @@
 - [ ] SSE-транспорт (streamable HTTP) — отдельно, P3.5
 
 ## P4 — KB-доводка
-- [ ] **diff-обновления документов**: `kb_patch` принимает **diff** (отдельные
-      поля/фрагменты: append/insert/replace по ключам или линейным меткам),
-      а НЕ всё тело заново. Целостность версии/updated_at; оптимистичный
-      конфликт-контроль (version-match). Применяется и к task/project update.
 - [ ] link/unlink (auto_load|references) + get_document_with_references (BFS)
 - [ ] search_and_replace (regex, dry-run)
 - [ ] чанкинг эмбеддингов 1800/200 + generate_for_all_missing
 - [ ] backup/restore (JSON-экспорт/импорт KB+embeddings+seats+tasks)
 - [ ] list с пагинацией/превью/tags_match
 
-## P4.1 — Истории (эпизодическая память) — неизменяемые
-- [ ] **read-only эпизодический API**: отдельные тулы/ф-ии поиска и чтения
-      историй (`history_search`, `history_read`, `history_recall`). Своя
-      retrieval-схема, НЕ входит в RAG/KB-поиск (инвариант типов уже есть).
-- [ ] **запрет изменения/перезаписи историй**: нет update; есть только
-      `history_archive` (мягкий архив). Удаление (`history_purge`) — только
-      с правами **admin** (пермишен `history:admin:purge`); обычный агент
-      получает отказ.
-- [ ] прогрессивная суммаризация (L1→L4) и консолидация не «редактируют»
-      источники — они их только архивируют/помечают (уже так, закрепить в тестах).
-
 ## P5 — Остальное
 - [ ] personalization: UserProfile/SeatProfile (procedural-память, doc-ссылки)
 - [ ] observability: ActivityRecorder + MemoryMetrics (легковесные)
 - [ ] External sync (Obsidian ↔ git-remote) — по возможности
-- [ ] **агентская система — УБРАТЬ** (субагенты/многошаговые runs вне скоупа);
-      остаётся только **агентский поиск** (agentic search на gemma-4-e4b:
-      multi-hop retrieve → answer, в рамках `search`/RAG).
-
-## P6 — Web UI (Rust, standalone)
-- [ ] **Web UI портируем на Rust** как отдельный standalone-сервер
-      (crate `slc-webui`, консолидированная точка доступа к движку через
-      `slc-core`/REST).
-- [ ] REST API слой (роуты: docs/history/search/seats/tasks/projects/
-      profiles/focus/ideas/reminders/notifications; auth как в MCP).
-- [ ] фронтенд (статика + интерактив) обслуживается тем же сервером.
-- [ ] деплой: **отдельный Docker** для `slc-webui` (не с MCP-сервером).
+- [ ] REST API + Web UI — НЕ портируем (Vassista clients/ — другие агенты)
 
 ## Вне скоупа (другие агенты)
-REST/Web UI для Vassista-клиентов (помимо нашего standalone `slc-webui`),
-wake/VAD/STT/TTS/LLM, s2s, Metal TTS, e2e talk. Агентская система
-(LangGraph-эквивалент, субагенты, runs) — **не портируем**; только агентский
-поиск.
+Агентская система (LangGraph-эквивалент), REST/Web UI, wake/VAD/STT/TTS/LLM,
+s2s, Metal TTS, e2e talk.

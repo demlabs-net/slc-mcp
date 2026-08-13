@@ -7,45 +7,18 @@
 //! Legacy equivalent: the Mongo `tasks` / `projects` collections behind
 //! `src/slc_mcp/tools/http/tasks.py` and `projects.py`.
 
-use crate::error::{SlcError, SlcResult};
+use crate::error::SlcResult;
 use crate::model::{DocMeta, Document, DocumentCategory, content_hash};
 use crate::storage::{DocFilter, DocSort, SortDir, StorageBackend};
 use chrono::Utc;
 use serde_json::{json, Value};
 
-/// Canonical status values shared by tasks and projects (SCREAMING_SNAKE,
-/// same set the Mongo migration normalizes legacy statuses into).
-pub const STATUS_PENDING: &str = "PENDING";
-pub const STATUS_ACTIVE: &str = "IN_WORK";
-pub const STATUS_COMPLETED: &str = "COMPLETED";
-pub const STATUS_CANCELLED: &str = "CANCELLED";
-pub const STATUS_ARCHIVED: &str = "ARCHIVED";
-
-/// Project lifecycle statuses (separate from task statuses).
-pub const STATUS_PROJECT_ACTIVE: &str = "active";
-pub const STATUS_PROJECT_ARCHIVED: &str = "archived";
-
-/// Normalize a raw task status into the canonical set; unknown → `None`.
-pub fn normalize_task_status(raw: &str) -> Option<&'static str> {
-    let norm: String = raw
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
-    match norm.as_str() {
-        "active" | "inprogress" | "inwork" | "running" | "started" | "wip" | "doing" => {
-            Some(STATUS_ACTIVE)
-        }
-        "pending" | "planned" | "backlog" | "queued" | "scheduled" | "open" | "new" => {
-            Some(STATUS_PENDING)
-        }
-        "completed" | "done" | "closed" | "finished" | "resolved" | "merged" | "released" => {
-            Some(STATUS_COMPLETED)
-        }
-        "cancelled" | "canceled" | "rejected" | "abandoned" | "wontfix" => Some(STATUS_CANCELLED),
-        _ => None,
-    }
-}
+/// Status values shared by tasks and projects.
+pub const STATUS_PENDING: &str = "pending";
+pub const STATUS_ACTIVE: &str = "active";
+pub const STATUS_COMPLETED: &str = "completed";
+pub const STATUS_CANCELLED: &str = "cancelled";
+pub const STATUS_ARCHIVED: &str = "archived";
 
 /// Task/Project shape returned by the CRUD tools.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -81,8 +54,7 @@ fn doc_to_task(doc: &Document) -> TaskInfo {
         name: extra_field(doc, "name").unwrap_or_else(|| doc.document_id.clone()),
         description: doc.content.clone(),
         status: extra_field(doc, "status").unwrap_or_else(|| STATUS_PENDING.into()),
-        // Канонический ключ — "project"; "project_id" остаётся для старых доков.
-        project_id: extra_field(doc, "project").or_else(|| extra_field(doc, "project_id")),
+        project_id: extra_field(doc, "project_id"),
         auto_load: doc.auto_load.clone(),
         created_at: doc.created_at.to_rfc3339(),
         updated_at: doc.updated_at.to_rfc3339(),
@@ -94,7 +66,7 @@ fn doc_to_project(doc: &Document) -> ProjectInfo {
         project_id: doc.document_id.clone(),
         name: extra_field(doc, "name").unwrap_or_else(|| doc.document_id.clone()),
         description: doc.content.clone(),
-        status: extra_field(doc, "status").unwrap_or_else(|| STATUS_PROJECT_ACTIVE.into()),
+        status: extra_field(doc, "status").unwrap_or_else(|| STATUS_ACTIVE.into()),
         auto_load: doc.auto_load.clone(),
         created_at: doc.created_at.to_rfc3339(),
         updated_at: doc.updated_at.to_rfc3339(),
@@ -118,9 +90,7 @@ fn build_doc(
     meta.extra.insert("name".into(), json!(name));
     meta.extra.insert("status".into(), json!(status));
     if let Some(pid) = project_id {
-        // "project" — канонический ключ: из него вычисляется папка
-        // (docs/projects/<p>/tasks/) и он же отдаётся в TaskInfo.
-        meta.extra.insert("project".into(), json!(pid));
+        meta.extra.insert("project_id".into(), json!(pid));
     }
     if let Some(obj) = metadata.as_object() {
         for (k, v) in obj {
@@ -162,7 +132,7 @@ impl<S: StorageBackend> WorkItemManager<S> {
         auto_load: &[String],
         metadata: &Value,
     ) -> SlcResult<TaskInfo> {
-        let task_id = self.speaking_id(name).await;
+        let task_id = crate::model::unique_id("task");
         let doc = build_doc(
             task_id.clone(),
             DocumentCategory::Task,
@@ -176,26 +146,6 @@ impl<S: StorageBackend> WorkItemManager<S> {
         );
         self.store.kb_insert(&doc).await?;
         Ok(doc_to_task(&doc))
-    }
-
-    /// Говорящий id — транслит названия БЕЗ категорийного префикса
-    /// (папка уже несёт категорию: `tasks/`, `docs/projects/<p>/tasks/`),
-    /// при коллизии — `_2`, `_3`…; пустой слаг — unique_id fallback.
-    async fn speaking_id(&self, name: &str) -> String {
-        let slug = crate::model::slug_name(name);
-        if slug.is_empty() {
-            return crate::model::unique_id("task");
-        }
-        let mut id = slug.clone();
-        let mut n = 1usize;
-        while self.store.kb_get(&id).await.map(|d| d.is_some()).unwrap_or(true) {
-            n += 1;
-            id = format!("{slug}_{n}");
-            if n > 100 {
-                return crate::model::unique_id("task");
-            }
-        }
-        id
     }
 
     pub async fn get_task(&self, seat_id: &str, task_id: &str) -> SlcResult<Option<TaskInfo>> {
@@ -212,7 +162,6 @@ impl<S: StorageBackend> WorkItemManager<S> {
         task_id: &str,
         name: Option<&str>,
         description: Option<&str>,
-        description_patch: Option<&Value>,
         project_id: Option<Option<&str>>,
         auto_load: Option<&[String]>,
         status: Option<&str>,
@@ -229,18 +178,11 @@ impl<S: StorageBackend> WorkItemManager<S> {
             doc.content = d.into();
             doc.content_hash = content_hash(&doc.content);
         }
-        if let Some(patch) = description_patch {
-            // Инкрементальное обновление вместо пересылки всего тела.
-            doc.content = apply_description_patch(&doc.content, patch)
-                .map_err(SlcError::InvalidInput)?;
-            doc.content_hash = content_hash(&doc.content);
-        }
         if let Some(Some(pid)) = project_id {
-            doc.metadata.extra.insert("project".into(), json!(pid));
+            doc.metadata.extra.insert("project_id".into(), json!(pid));
         }
         if let Some(pid) = project_id {
             if pid.is_none() {
-                doc.metadata.extra.remove("project");
                 doc.metadata.extra.remove("project_id");
             }
         }
@@ -248,10 +190,7 @@ impl<S: StorageBackend> WorkItemManager<S> {
             doc.auto_load = al.to_vec();
         }
         if let Some(st) = status {
-            // Статус нормализуется в канонический набор; неизвестный — не трогаем.
-            if let Some(norm) = normalize_task_status(st) {
-                doc.metadata.extra.insert("status".into(), json!(norm));
-            }
+            doc.metadata.extra.insert("status".into(), json!(st));
         }
         if let Some(obj) = metadata.and_then(|m| m.as_object()) {
             for (k, v) in obj {
@@ -313,13 +252,13 @@ impl<S: StorageBackend> WorkItemManager<S> {
         auto_load: &[String],
         metadata: &Value,
     ) -> SlcResult<ProjectInfo> {
-        let project_id = self.speaking_id(name).await;
+        let project_id = crate::model::unique_id("project");
         let doc = build_doc(
             project_id.clone(),
             DocumentCategory::Project,
             name,
             description,
-            STATUS_PROJECT_ACTIVE,
+            STATUS_ACTIVE,
             None,
             auto_load,
             metadata,
@@ -343,7 +282,6 @@ impl<S: StorageBackend> WorkItemManager<S> {
         project_id: &str,
         name: Option<&str>,
         description: Option<&str>,
-        description_patch: Option<&Value>,
         auto_load: Option<&[String]>,
         status: Option<&str>,
         metadata: Option<&Value>,
@@ -357,11 +295,6 @@ impl<S: StorageBackend> WorkItemManager<S> {
         }
         if let Some(d) = description {
             doc.content = d.into();
-            doc.content_hash = content_hash(&doc.content);
-        }
-        if let Some(patch) = description_patch {
-            doc.content = apply_description_patch(&doc.content, patch)
-                .map_err(SlcError::InvalidInput)?;
             doc.content_hash = content_hash(&doc.content);
         }
         if let Some(al) = auto_load {
@@ -417,118 +350,6 @@ impl crate::model::Document {
     }
 }
 
-/// Инкрементальное обновление markdown-тела (задача/проект) без пересылки
-/// всего текста. Операции применяются по порядку:
-/// - `{"op":"append","content":"…"}` — добавить в конец;
-/// - `{"op":"prepend","content":"…"}` — добавить в начало;
-/// - `{"op":"replace_section","heading":"### Фаза 2","content":"…"}` —
-///   заменить КОНТЕНТ секции (от заголовка до следующего заголовка того же
-///   или более высокого уровня); заголовок сохраняется;
-/// - `{"op":"remove_section","heading":"…"}` — удалить секцию целиком
-///   (вместе с заголовком).
-pub fn apply_description_patch(body: &str, patch: &Value) -> Result<String, String> {
-    let Some(ops) = patch.as_array() else {
-        return Err("description_patch must be an array of operations".into());
-    };
-    let mut out = body.to_string();
-    for (i, op) in ops.iter().enumerate() {
-        let kind = op.get("op").and_then(|v| v.as_str()).unwrap_or("");
-        let content = op.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        match kind {
-            "append" => {
-                if !out.trim_end().is_empty() {
-                    out.push_str("\n\n");
-                }
-                out.push_str(content.trim());
-            }
-            "prepend" => {
-                let c = content.trim();
-                if !c.is_empty() {
-                    out = if out.trim().is_empty() {
-                        c.to_string()
-                    } else {
-                        format!("{c}\n\n{out}")
-                    };
-                }
-            }
-            "replace_section" => {
-                let heading = op
-                    .get("heading")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| format!("op[{i}]: replace_section requires heading"))?;
-                out = apply_section_op(&out, heading, content, true)?;
-            }
-            "remove_section" => {
-                let heading = op
-                    .get("heading")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| format!("op[{i}]: remove_section requires heading"))?;
-                out = apply_section_op(&out, heading, "", false)?;
-            }
-            other => return Err(format!("op[{i}]: unknown patch op `{other}`")),
-        }
-    }
-    Ok(out)
-}
-
-/// Замена/удаление markdown-секции по заголовку. Секция тянется от
-/// заголовка до следующего заголовка ТОГО ЖЕ или более высокого уровня
-/// (или конца текста). `keep_heading=false` удаляет и заголовок.
-fn apply_section_op(
-    body: &str,
-    heading: &str,
-    new_content: &str,
-    keep_heading: bool,
-) -> Result<String, String> {
-    let target = heading.trim();
-    let h_level = target.chars().take_while(|c| *c == '#').count();
-    if h_level == 0 || !target[h_level..].starts_with(char::is_whitespace) {
-        return Err(format!("heading must be a markdown heading: `{heading}`"));
-    }
-    let heading_level = |line: &str| -> Option<usize> {
-        let t = line.trim_start();
-        let lvl = t.chars().take_while(|c| *c == '#').count();
-        if lvl > 0 && (t.len() == lvl || t[lvl..].starts_with(char::is_whitespace)) {
-            Some(lvl)
-        } else {
-            None
-        }
-    };
-    let mut out = String::with_capacity(body.len());
-    let mut skipping = false;
-    let mut found = false;
-    for line in body.lines() {
-        if let Some(lvl) = heading_level(line) {
-            if lvl <= h_level {
-                // Заголовок того же/высшего уровня закрывает любую секцию.
-                skipping = false;
-                if line.trim_start() == target {
-                    found = true;
-                    skipping = true;
-                    if keep_heading {
-                        out.push_str(line);
-                        out.push('\n');
-                        let c = new_content.trim();
-                        if !c.is_empty() {
-                            out.push_str(c);
-                            out.push('\n');
-                        }
-                    }
-                    continue;
-                }
-            }
-        }
-        if !skipping {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !found {
-        return Err(format!("heading not found: `{target}`"));
-    }
-    Ok(out.trim_end_matches('\n').to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,129 +360,17 @@ mod tests {
         (WorkItemManager::new(store.clone()), store)
     }
 
-    fn engine(store: std::sync::Arc<dyn StorageBackend>) -> crate::SlcEngine {
-        let llm: std::sync::Arc<dyn crate::LlmClient> =
-            std::sync::Arc::new(crate::MockLlm::new(vec![]));
-        crate::SlcEngine::with(store, llm, crate::SlcConfig::default())
-    }
-
-    /// Activation works for ANY document (skill, project, task) — the
-    /// unified context anchor — and Skill is a first-class category.
-    #[tokio::test]
-    async fn document_activation_any_category_and_skill() {
-        let (_, store) = mgr();
-        let engine = engine(store);
-        engine.seats.ensure_seat("seat_a").await.unwrap();
-
-        // Skill is a document: parse + folder + RAG-eligible.
-        assert_eq!(crate::model::DocumentCategory::parse("skill"), Some(crate::model::DocumentCategory::Skill));
-        assert_eq!(crate::model::DocumentCategory::parse("skills"), Some(crate::model::DocumentCategory::Skill));
-        assert!(crate::model::DocumentCategory::Skill.is_kb());
-        let skill_doc = crate::model::Document::new(
-            "skill_demo",
-            crate::model::DocumentCategory::Skill,
-            "demo",
-            Default::default(),
-            vec![],
-            None,
-        );
-        assert_eq!(skill_doc.default_folder(), "docs/skills");
-
-        // Activate a skill document.
-        let mut skill = crate::model::Document::new(
-            "skill_rust",
-            crate::model::DocumentCategory::Skill,
-            "Rust basics: borrow checker",
-            Default::default(),
-            vec![],
-            Some("seat_a".into()),
-        );
-        engine.add_document(&mut skill).await.unwrap();
-        assert!(engine.document_activate("seat_a", "skill_rust").await.unwrap());
-        let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
-        assert_eq!(active.document_id, "skill_rust");
-        assert_eq!(active.category, crate::model::DocumentCategory::Skill);
-
-        // Activate a project — same effect.
-        let mut proj = crate::model::Document::new(
-            "project_vassista",
-            crate::model::DocumentCategory::Project,
-            "Vassista voice platform",
-            Default::default(),
-            vec![],
-            Some("seat_a".into()),
-        );
-        engine.add_document(&mut proj).await.unwrap();
-        assert!(engine.document_activate("seat_a", "project_vassista").await.unwrap());
-        let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
-        assert_eq!(active.category, crate::model::DocumentCategory::Project);
-
-        // Task activation keeps the unified pointer AND the legacy task one.
-        let mut task = crate::model::Document::new(
-            "task_x",
-            crate::model::DocumentCategory::Task,
-            "do things",
-            Default::default(),
-            vec![],
-            Some("seat_a".into()),
-        );
-        engine.add_document(&mut task).await.unwrap();
-        assert!(engine.document_activate("seat_a", "task_x").await.unwrap());
-        let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
-        assert_eq!(active.category, crate::model::DocumentCategory::Task);
-        let t = engine.task_get_active("seat_a").await.unwrap().unwrap();
-        assert_eq!(t.task_id, "task_x");
-
-        // Unknown document → false; deactivate clears both pointers.
-        assert!(!engine.document_activate("seat_a", "missing_doc").await.unwrap());
-        engine.document_deactivate("seat_a").await.unwrap();
-        assert!(engine.document_get_active("seat_a").await.unwrap().is_none());
-        assert!(engine.task_get_active("seat_a").await.unwrap().is_none());
-    }
-
-    /// Legacy task activation (activate_task tool) also lands in the
-    /// unified active-document pointer.
-    #[tokio::test]
-    async fn speaking_task_ids_with_collision_suffix() {
-        let (m, _store) = mgr();
-        let t1 = m
-            .create_task("seat_a", "Миграция БД", "", None, &[], &json!({}))
-            .await
-            .unwrap();
-        assert_eq!(t1.task_id, "migratsiya_bd");
-        let t2 = m
-            .create_task("seat_a", "Миграция БД", "", None, &[], &json!({}))
-            .await
-            .unwrap();
-        assert_eq!(t2.task_id, "migratsiya_bd_2");
-        let t3 = m.create_task("seat_a", "!!!", "", None, &[], &json!({})).await.unwrap();
-        assert!(t3.task_id.starts_with("task_")); // fallback: unique_id
-        assert_ne!(t3.task_id, "task_");
-    }
-
-    #[tokio::test]
-    async fn task_activation_sets_unified_pointer() {
-        let (m, store) = mgr();
-        let sm = crate::seat::SeatManager::new(store.clone(), 3600);
-        sm.ensure_seat("seat_a").await.unwrap();
-        let t = m.create_task("seat_a", "Task A", "", None, &[], &json!({})).await.unwrap();
-        assert!(m.set_active_task("seat_a", &t.task_id).await.unwrap());
-        let engine = engine(store);
-        let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
-        assert_eq!(active.document_id, t.task_id);
-    }
-
     #[tokio::test]
     async fn task_crud_and_visibility() {
         let (m, _) = mgr();
         let t = m.create_task("seat_t", "Fix audio", "do it", None, &[], &json!({})).await.unwrap();
-        assert_eq!(t.task_id, "fix_audio"); // без категорийного префикса
+        assert!(t.task_id.starts_with("task_"));
         assert_eq!(t.status, STATUS_PENDING);
 
         let got = m.get_task("seat_t", &t.task_id).await.unwrap().unwrap();
         assert_eq!(got.name, "Fix audio");
 
-        let upd = m.update_task("seat_t", &t.task_id, Some("Fixed"), Some("done"), None, Some(None), None, Some(STATUS_COMPLETED), None).await.unwrap().unwrap();
+        let upd = m.update_task("seat_t", &t.task_id, Some("Fixed"), Some("done"), Some(None), None, Some(STATUS_COMPLETED), None).await.unwrap().unwrap();
         assert_eq!(upd.status, STATUS_COMPLETED);
         assert_eq!(upd.description, "done");
 
@@ -678,7 +387,7 @@ mod tests {
     async fn project_crud_and_task_link() {
         let (m, _) = mgr();
         let p = m.create_project("seat_p", "Vassista", "voice assistant", &["core_manifest".into()], &json!({})).await.unwrap();
-        assert_eq!(p.project_id, "vassista"); // без категорийного префикса
+        assert!(p.project_id.starts_with("project_"));
         assert_eq!(p.auto_load, vec!["core_manifest".to_string()]);
 
         let t = m.create_task("seat_p", "STT", "stt plugin", Some(&p.project_id), &[], &json!({})).await.unwrap();
@@ -687,8 +396,8 @@ mod tests {
         let projects = m.list_projects("seat_p", None, 10).await.unwrap();
         assert_eq!(projects.len(), 1);
 
-        let upd = m.update_project("seat_p", &p.project_id, None, None, None, None, Some(STATUS_PROJECT_ARCHIVED), None).await.unwrap().unwrap();
-        assert_eq!(upd.status, STATUS_PROJECT_ARCHIVED);
+        let upd = m.update_project("seat_p", &p.project_id, None, None, None, Some(STATUS_ARCHIVED), None).await.unwrap().unwrap();
+        assert_eq!(upd.status, STATUS_ARCHIVED);
         assert!(m.delete_project("seat_p", &p.project_id).await.unwrap());
     }
 
@@ -703,72 +412,5 @@ mod tests {
         let active = m.get_active_task("seat_a").await.unwrap().unwrap();
         assert_eq!(active.task_id, t.task_id);
         assert!(m.get_active_task("no_seat").await.unwrap().is_none());
-    }
-}
-
-#[cfg(test)]
-mod patch_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn slug_name_transliterates_russian() {
-        assert_eq!(
-            crate::model::slug_name("Phase 8 M3: Mobile — ПОЛНЫЙ клиент"),
-            "phase_8_m3_mobile_polnyy_klient"
-        );
-        assert_eq!(crate::model::slug_name("Миграция БД"), "migratsiya_bd");
-        // Только мусор → пустой слаг (caller сделает unique_id fallback).
-        assert_eq!(crate::model::slug_name("!!! ???"), "");
-    }
-
-    #[test]
-    fn patch_append_prepend() {
-        let out = apply_description_patch(
-            "# План\n\nтело",
-            &json!([{"op":"append","content":"## Итоги\nготово"},{"op":"prepend","content":"шапка"}]),
-        )
-        .unwrap();
-        assert!(out.starts_with("шапка\n\n# План"));
-        assert!(out.ends_with("## Итоги\nготово"));
-    }
-
-    #[test]
-    fn patch_replace_and_remove_section() {
-        let body = "# Задача\n\nвводная\n\n## Фаза 1\n\nстарый шаг\n\n### Подшаг\n\nдетали\n\n## Фаза 2\n\nфинал\n";
-        // replace_section меняет только контент до следующего заголовка ТОГО ЖЕ
-        // уровня (подшаги внутри — тоже затрагиваются).
-        let out = apply_description_patch(
-            body,
-            &json!([{"op":"replace_section","heading":"## Фаза 1","content":"новый шаг"}]),
-        )
-        .unwrap();
-        assert!(out.contains("## Фаза 1\nновый шаг"));
-        assert!(!out.contains("старый шаг"));
-        assert!(!out.contains("Подшаг"));
-        assert!(out.contains("## Фаза 2\n\nфинал"));
-        // remove_section убирает и заголовок.
-        let out2 = apply_description_patch(
-            body,
-            &json!([{"op":"remove_section","heading":"## Фаза 2"}]),
-        )
-        .unwrap();
-        assert!(!out2.contains("Фаза 2"));
-        assert!(!out2.contains("финал"));
-        assert!(out2.contains("## Фаза 1"));
-    }
-
-    #[test]
-    fn patch_errors_are_explicit() {
-        let e = apply_description_patch("x", &json!("not array")).unwrap_err();
-        assert!(e.contains("array"));
-        let e = apply_description_patch("x", &json!([{"op":"noop"}])).unwrap_err();
-        assert!(e.contains("unknown patch op"));
-        let e = apply_description_patch(
-            "# A\n\nтекст",
-            &json!([{"op":"replace_section","heading":"## Нет такого","content":"y"}]),
-        )
-        .unwrap_err();
-        assert!(e.contains("not found"));
     }
 }
