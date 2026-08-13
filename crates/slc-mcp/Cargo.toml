@@ -1,0 +1,24 @@
+[package]
+name = "slc-mcp"
+description = "SLC MCP — standalone memory server binary: MCP (JSON-RPC over HTTP) + CLI over the slc-core engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "slc-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+slc-core = { workspace = true }
+
+[dev-dependencies]
+slc-core = { workspace = true }

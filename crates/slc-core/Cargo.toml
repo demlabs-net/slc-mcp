@@ -1,0 +1,28 @@
+[package]
+name = "slc-core"
+description = "SLC (Smart Layered Context) — agent memory engine: 4-level memory model, progressive summarization, fact consolidation, knowledge base + hybrid search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# rlib  — for embedding into Rust apps (vs-memory) and the slc-mcp bin
+# staticlib — C ABI static library, linkable into the host application (vassista)
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
