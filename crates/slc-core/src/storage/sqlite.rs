@@ -236,7 +236,7 @@ fn build_where(f: &DocFilter) -> (String, Vec<String>) {
         let ors: Vec<String> = f
             .tags_any
             .iter()
-            .map(|t| format!("EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})", params.len() + 1))
+            .map(|_| format!("EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})", params.len() + 1))
             .collect();
         clauses.push(format!("({})", ors.join(" OR ")));
         params.extend(f.tags_any.iter().cloned());
@@ -245,7 +245,7 @@ fn build_where(f: &DocFilter) -> (String, Vec<String>) {
         let ands: Vec<String> = f
             .tags_all
             .iter()
-            .map(|t| format!("EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})", params.len() + 1))
+            .map(|_| format!("EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})", params.len() + 1))
             .collect();
         clauses.push(format!("({})", ands.join(" AND ")));
         params.extend(f.tags_all.iter().cloned());
