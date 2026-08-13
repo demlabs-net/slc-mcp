@@ -16,8 +16,6 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-mongodb = { version = "3", default-features = false, features = ["rustls-tls", "bson-3", "compat-3-3-0"] }
-bson = { version = "3", default-features = false, features = ["compat-3-0-0", "serde", "chrono-0_4"] }
 chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
@@ -25,32 +23,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 rusqlite = { workspace = true }
-rand = { workspace = true }
-candle-core = { version = "0.11", default-features = false, optional = true }
-candle-nn = { version = "0.11", optional = true }
-candle-transformers = { version = "0.11", optional = true }
-hf-hub = { version = "1", features = ["blocking", "rustls-tls"], optional = true }
-tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"], optional = true }
-
-# On macOS, Accelerate (CPU BLAS) + the experimental Metal backend; on other
-# platforms candle builds CPU-only by default (CUDA needs a manual `cuda`
-# feature — it requires the CUDA toolkit at build time).
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.11", default-features = false, features = ["accelerate", "metal"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-
-[features]
-default = ["candle-emb"]
-# Onboard embeddings: candle inference (bge-m3 on GPU / e5-small on CPU),
-# auto-downloaded from Hugging Face via hf-hub.
-candle-emb = [
-    "dep:candle-core",
-    "dep:candle-nn",
-    "dep:candle-transformers",
-    "dep:hf-hub",
-    "dep:tokenizers",
-]
-# NVIDIA/CUDA backend for candle (Linux+Windows, requires the CUDA toolkit).
-cuda = ["candle-emb", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]

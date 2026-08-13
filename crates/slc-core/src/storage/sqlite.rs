@@ -79,8 +79,7 @@ CREATE TABLE IF NOT EXISTS seats (
     metadata       TEXT NOT NULL,
     active_task_id TEXT,
     context        TEXT NOT NULL,
-    usage_stats    TEXT NOT NULL,
-    active_document_id TEXT
+    usage_stats    TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS timers (
@@ -116,16 +115,6 @@ impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> SlcResult<Self> {
         let conn = Connection::open(path.as_ref())?;
         conn.execute_batch(SCHEMA)?;
-        // Migration: older vaults lack the unified active-document column.
-        let has_col: bool = conn
-            .prepare("PRAGMA table_info(seats)")?
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?
-            .iter()
-            .any(|name| name == "active_document_id");
-        if !has_col {
-            conn.execute("ALTER TABLE seats ADD COLUMN active_document_id TEXT", [])?;
-        }
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -207,17 +196,6 @@ fn build_where(f: &DocFilter) -> (String, Vec<String>) {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<String> = Vec::new();
 
-    if let Some(ids) = &f.document_ids {
-        if ids.is_empty() {
-            clauses.push("0 = 1".to_string()); // empty allowlist matches nothing
-        } else {
-            let placeholders: Vec<String> = (1..=ids.len())
-                .map(|i| format!("?{i}"))
-                .collect();
-            clauses.push(format!("document_id IN ({})", placeholders.join(", ")));
-            params.extend(ids.iter().cloned());
-        }
-    }
     if let Some(cat) = f.category {
         clauses.push("category = ?".to_string());
         params.push(cat.as_str().to_string());
@@ -258,7 +236,7 @@ fn build_where(f: &DocFilter) -> (String, Vec<String>) {
         let ors: Vec<String> = f
             .tags_any
             .iter()
-            .map(|_| format!("EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})", params.len() + 1))
+            .map(|t| format!("EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})", params.len() + 1))
             .collect();
         clauses.push(format!("({})", ors.join(" OR ")));
         params.extend(f.tags_any.iter().cloned());
@@ -267,7 +245,7 @@ fn build_where(f: &DocFilter) -> (String, Vec<String>) {
         let ands: Vec<String> = f
             .tags_all
             .iter()
-            .map(|_| format!("EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})", params.len() + 1))
+            .map(|t| format!("EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})", params.len() + 1))
             .collect();
         clauses.push(format!("({})", ands.join(" AND ")));
         params.extend(f.tags_all.iter().cloned());
@@ -321,7 +299,7 @@ impl StorageBackend for SqliteStore {
         let row = doc_to_row(doc)?;
         self.blocking(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO documents (document_id, category, folder, content, content_hash, metadata, tags, auto_load, refs, seat_id, created_at, updated_at, version, deleted_at)
+                "INSERT INTO documents (document_id, category, folder, content, content_hash, metadata, tags, auto_load, refs, seat_id, created_at, updated_at, version, deleted_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11, row.12, row.13],
             )?;
@@ -365,32 +343,6 @@ impl StorageBackend for SqliteStore {
         }
         self.kb_insert(doc).await?;
         Ok(false)
-    }
-
-    async fn kb_replace(&self, doc: &Document) -> SlcResult<bool> {
-        if !doc.category.is_kb() {
-            return Err(SlcError::Storage(format!(
-                "history docs go to the episodic store, not the KB: {}",
-                doc.document_id
-            )));
-        }
-        let row = doc_to_row(doc)?;
-        let existed = self.kb_get(&doc.document_id).await?.is_some();
-        self.blocking(move |conn| {
-            conn.execute(
-                "INSERT INTO documents (document_id, category, folder, content, content_hash, metadata, tags, auto_load, refs, seat_id, created_at, updated_at, version, deleted_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
-                 ON CONFLICT(document_id) DO UPDATE SET
-                    category=excluded.category, folder=excluded.folder, content=excluded.content,
-                    content_hash=excluded.content_hash, metadata=excluded.metadata, tags=excluded.tags,
-                    auto_load=excluded.auto_load, refs=excluded.refs, seat_id=excluded.seat_id,
-                    updated_at=excluded.updated_at, version=excluded.version, deleted_at=excluded.deleted_at",
-                params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11, row.12, row.13],
-            )?;
-            Ok(())
-        })
-        .await?;
-        Ok(existed)
     }
 
     async fn kb_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>> {
@@ -531,8 +483,9 @@ impl StorageBackend for SqliteStore {
                 doc.document_id, doc.category
             )));
         }
-        // Seat-less episodic docs are allowed (legacy import): they are not
-        // picked up by any per-seat pipeline, just stored as diary.
+        if doc.seat_id.is_none() {
+            return Err(SlcError::Storage("episodic docs must be seat-scoped".into()));
+        }
         let row = doc_to_row(doc)?;
         self.blocking(move |conn| {
             conn.execute(
@@ -554,9 +507,9 @@ impl StorageBackend for SqliteStore {
         let _ = existing;
         self.blocking(move |conn| {
             let n = conn.execute(
-                "UPDATE episodic SET folder = ?2, content = ?3, content_hash = ?4, metadata = ?5, tags = ?6, version = version + 1, updated_at = ?7
+                "UPDATE episodic SET folder = ?3, content = ?4, content_hash = ?5, metadata = ?6, tags = ?7, version = version + 1, updated_at = ?12
                  WHERE document_id = ?1",
-                params![row.0, row.2, row.3, row.4, row.5, row.6, row.11],
+                params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11, row.12, row.13],
             )?;
             if n > 0 {
                 return Ok(true);
@@ -752,7 +705,7 @@ impl StorageBackend for SqliteStore {
     // ── seats ───────────────────────────────────────────────────
 
     async fn insert_seat(&self, seat: &Seat) -> SlcResult<()> {
-        let (seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats, active_document_id) = (
+        let (seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats) = (
             seat.seat_id.clone(),
             seat.name.clone(),
             seat.status.as_str().to_string(),
@@ -763,13 +716,12 @@ impl StorageBackend for SqliteStore {
             seat.active_task_id.clone(),
             serde_json::to_string(&seat.context)?,
             serde_json::to_string(&seat.usage_stats)?,
-            seat.active_document_id.clone(),
         );
         self.blocking(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO seats (seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats, active_document_id)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-                params![seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats, active_document_id],
+                "INSERT OR REPLACE INTO seats (seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats],
             )?;
             Ok(())
         })
@@ -822,46 +774,6 @@ impl StorageBackend for SqliteStore {
         .await
     }
 
-    async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
-        let (id, task) = (seat_id.to_string(), task_id.to_string());
-        self.blocking(move |conn| {
-            // Task activation is document activation too (unified anchor).
-            let n = conn.execute(
-                "UPDATE seats SET active_task_id = ?2, active_document_id = ?2 WHERE seat_id = ?1",
-                params![id, task],
-            )?;
-            Ok(n > 0)
-        })
-        .await
-    }
-
-    async fn set_seat_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool> {
-        let (id, doc) = (seat_id.to_string(), document_id.map(String::from));
-        self.blocking(move |conn| {
-            let n = conn.execute(
-                "UPDATE seats SET active_document_id = ?2 WHERE seat_id = ?1",
-                params![id, doc],
-            )?;
-            Ok(n > 0)
-        })
-        .await
-    }
-
-    async fn get_seat_active_document(&self, seat_id: &str) -> SlcResult<Option<String>> {
-        let id = seat_id.to_string();
-        self.blocking(move |conn| {
-            let row = conn.query_row(
-                "SELECT active_document_id, active_task_id FROM seats WHERE seat_id = ?1",
-                params![id],
-                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
-            ).optional()?;
-            // Unified field first; fall back to the legacy task pointer so
-            // seats activated before the migration keep working.
-            Ok(row.and_then(|(doc, task)| doc.or(task)))
-        })
-        .await
-    }
-
     async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool> {
         let id = seat_id.to_string();
         let tool = tool_name.to_string();
@@ -910,17 +822,6 @@ impl StorageBackend for SqliteStore {
                 params![timer_id, seat_id, timer_type, interval_seconds, last_fired_at, next_fire_at, is_active, metadata, created_at],
             )?;
             Ok(())
-        })
-        .await
-    }
-
-    async fn get_timer(&self, timer_id: &str) -> SlcResult<Option<PersistedTimer>> {
-        let id = timer_id.to_string();
-        self.blocking(move |conn| {
-            let row = conn
-                .query_row("SELECT * FROM timers WHERE timer_id = ?1", params![id], row_to_timer)
-                .optional()?;
-            Ok(row)
         })
         .await
     }
@@ -979,32 +880,6 @@ impl StorageBackend for SqliteStore {
         .await
     }
 
-    async fn list_records(&self, collection: &str) -> SlcResult<Vec<(String, Value)>> {
-        let c = collection.to_string();
-        self.blocking(move |conn| {
-            let mut stmt = conn.prepare("SELECT key, value FROM records WHERE collection = ?1 ORDER BY key")?;
-            let rows = stmt.query_map(params![c], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-            let mut out = Vec::new();
-            for row in rows {
-                let (k, v) = row?;
-                if let Ok(value) = serde_json::from_str(&v) {
-                    out.push((k, value));
-                }
-            }
-            Ok(out)
-        })
-        .await
-    }
-
-    async fn delete_record(&self, collection: &str, key: &str) -> SlcResult<bool> {
-        let (c, k) = (collection.to_string(), key.to_string());
-        self.blocking(move |conn| {
-            let n = conn.execute("DELETE FROM records WHERE collection = ?1 AND key = ?2", params![c, k])?;
-            Ok(n > 0)
-        })
-        .await
-    }
-
     async fn health_check(&self) -> bool {
         self.blocking(|conn| {
             conn.query_row("SELECT 1", [], |_| Ok(())).map_err(|e| SlcError::Storage(e.to_string()))?;
@@ -1050,27 +925,28 @@ fn row_to_seat(row: &Row) -> rusqlite::Result<Seat> {
         active_task_id: row.get(7)?,
         context: row.get::<_, String>(8).map(|s| serde_json::from_str(&s).unwrap_or_default())?,
         usage_stats: row.get::<_, String>(9).map(|s| serde_json::from_str(&s).unwrap_or_default())?,
-        active_document_id: row.get(10)?,
     })
 }
 
 fn row_to_timer(row: &Row) -> rusqlite::Result<PersistedTimer> {
-    let timer_type: String = row.get(2)?;
+    let timer_type: String = row.get(3)?;
     Ok(PersistedTimer {
         timer_id: row.get(0)?,
         seat_id: row.get(1)?,
         timer_type: match timer_type.as_str() {
             "CONSOLIDATION" => TimerType::Consolidation,
             "HISTORY_COMPRESSION" => TimerType::HistoryCompression,
+            "REFLECTION" => TimerType::Reflection,
             "FOCUS_REMINDER" => TimerType::FocusReminder,
+            "IDEA_REMINDER" => TimerType::IdeaReminder,
             _ => TimerType::Reminder,
         },
-        interval_seconds: row.get(3)?,
-        last_fired_at: row.get::<_, Option<String>>(4)?.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|d| d.with_timezone(&Utc)),
-        next_fire_at: dt(row.get::<_, String>(5)?),
-        is_active: row.get::<_, i64>(6)? != 0,
-        metadata: row.get::<_, String>(7).map(|s| serde_json::from_str(&s).unwrap_or_default())?,
-        created_at: dt(row.get::<_, String>(8)?),
+        interval_seconds: row.get(4)?,
+        last_fired_at: row.get::<_, Option<String>>(5)?.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|d| d.with_timezone(&Utc)),
+        next_fire_at: dt(row.get::<_, String>(6)?),
+        is_active: row.get::<_, i64>(7)? != 0,
+        metadata: row.get::<_, String>(8).map(|s| serde_json::from_str(&s).unwrap_or_default())?,
+        created_at: dt(row.get::<_, String>(9)?),
     })
 }
 
@@ -1215,7 +1091,6 @@ mod tests {
             expires_at: None,
             metadata: Default::default(),
             active_task_id: None,
-            active_document_id: None,
             context: Default::default(),
             usage_stats: Default::default(),
         };

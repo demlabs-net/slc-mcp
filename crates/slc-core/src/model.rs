@@ -28,9 +28,6 @@ pub enum DocumentCategory {
     History,
     CodeSnippet,
     Documentation,
-    /// A skill — the same unified `Document`, just named a skill
-    /// (procedural knowledge: how to do things).
-    Skill,
     Custom,
     System,
 }
@@ -45,7 +42,6 @@ impl DocumentCategory {
             DocumentCategory::History => "history",
             DocumentCategory::CodeSnippet => "code_snippet",
             DocumentCategory::Documentation => "documentation",
-            DocumentCategory::Skill => "skill",
             DocumentCategory::Custom => "custom",
             DocumentCategory::System => "system",
         }
@@ -60,7 +56,6 @@ impl DocumentCategory {
             "history" | "episodic" => Some(Self::History),
             "code_snippet" => Some(Self::CodeSnippet),
             "documentation" => Some(Self::Documentation),
-            "skill" | "skills" => Some(Self::Skill),
             "custom" => Some(Self::Custom),
             "system" => Some(Self::System),
             _ => None,
@@ -205,84 +200,23 @@ impl Document {
         }
     }
 
-    /// Default folder for a document (used when `folder` is `None`).
-    ///
-    /// Hierarchical layout (user-approved): knowledge categories live under
-    /// `docs/`, projects are folders `docs/projects/<project>/` with their
-    /// own note and per-category subfolders, tasks outside projects go to
-    /// `tasks/`. A document bound to a project
-    /// (`metadata.extra["project"] = <slug>`) is placed inside that project's
-    /// folder. The vault stays human-organized; indexing/RAG are separate
-    /// sidecars (`.slc/`), never mixed into the notes tree.
+    /// Default folder for a category (used when `folder` is `None`).
     pub fn default_folder(&self) -> String {
-        if self.category == DocumentCategory::History {
-            // Human diary layout: history/YYYY/MM/
-            let d = self.created_at;
-            return format!("history/{:04}/{:02}", d.year(), d.month());
-        }
-        if self.category == DocumentCategory::Project {
-            // The project note itself: docs/projects/<slug>/ — the slug comes
-            // from the document id (legacy `project_` prefix stripped).
-            let slug = self
-                .project_slug()
-                .or_else(|| {
-                    slugify_ascii(self.document_id.strip_prefix("project_").unwrap_or(&self.document_id))
-                })
-                .unwrap_or_else(|| "project".into());
-            return format!("docs/projects/{slug}");
-        }
-        if let Some(project) = self.project_slug() {
-            // Document of a project (tasks, docs, custom notes, …) → inside
-            // the project folder, per-category subfolder.
-            return format!("docs/projects/{project}/{}", self.category_dir());
-        }
-        self.category_folder()
-    }
-
-    /// The `docs/<category>` folder for non-project documents.
-    fn category_folder(&self) -> String {
         match self.category {
-            DocumentCategory::Core => "docs/core".into(),
-            DocumentCategory::Module => "docs/modules".into(),
+            DocumentCategory::History => {
+                // Human diary layout: history/YYYY/MM/
+                let d = self.created_at;
+                format!("history/{:04}/{:02}", d.year(), d.month())
+            }
+            DocumentCategory::Core => "core".into(),
+            DocumentCategory::Module => "modules".into(),
             DocumentCategory::Task => "tasks".into(),
+            DocumentCategory::Project => "projects".into(),
             DocumentCategory::CodeSnippet => "code".into(),
             DocumentCategory::Documentation => "docs".into(),
-            DocumentCategory::Skill => "docs/skills".into(),
-            DocumentCategory::Custom => "docs/custom".into(),
+            DocumentCategory::Custom => "custom".into(),
             DocumentCategory::System => "system".into(),
-            DocumentCategory::Project | DocumentCategory::History => {
-                unreachable!("project/history folders handled in default_folder")
-            }
         }
-    }
-
-    /// Leaf directory used INSIDE a project folder (`docs/projects/<p>/<leaf>`).
-    fn category_dir(&self) -> &'static str {
-        match self.category {
-            DocumentCategory::Core => "core",
-            DocumentCategory::Module => "modules",
-            DocumentCategory::Task => "tasks",
-            DocumentCategory::CodeSnippet => "code",
-            DocumentCategory::Documentation => "docs",
-            DocumentCategory::Skill => "skills",
-            DocumentCategory::Custom => "custom",
-            DocumentCategory::System => "system",
-            DocumentCategory::Project | DocumentCategory::History => {
-                unreachable!("project/history folders handled in default_folder")
-            }
-        }
-    }
-
-    /// Project binding from `metadata.extra["project"]` (a lowercase slug,
-    /// e.g. `slc`, `confcall`) — sanitized so it can never escape the
-    /// `docs/projects/` tree.
-    pub fn project_slug(&self) -> Option<String> {
-        slugify_ascii(
-            self.metadata
-                .extra
-                .get("project")
-                .and_then(|v| v.as_str())?,
-        )
     }
 }
 
@@ -318,10 +252,6 @@ pub struct Seat {
     pub expires_at: Option<DateTime<Utc>>,
     pub metadata: serde_json::Map<String, serde_json::Value>,
     pub active_task_id: Option<String>,
-    /// The active document (any category) — the "context anchor" of the
-    /// seat: it is included in `update_context` and its auto_load links are
-    /// followed. Task activation also writes this field (unified).
-    pub active_document_id: Option<String>,
     pub context: serde_json::Map<String, serde_json::Value>,
     pub usage_stats: UsageStats,
 }
@@ -380,6 +310,8 @@ pub struct PersistedTimer {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TimerType {
     FocusReminder,
+    IdeaReminder,
+    Reflection,
     Consolidation,
     HistoryCompression,
     Reminder,
@@ -389,64 +321,12 @@ impl TimerType {
     pub fn as_str(self) -> &'static str {
         match self {
             TimerType::FocusReminder => "FOCUS_REMINDER",
+            TimerType::IdeaReminder => "IDEA_REMINDER",
+            TimerType::Reflection => "REFLECTION",
             TimerType::Consolidation => "CONSOLIDATION",
             TimerType::HistoryCompression => "HISTORY_COMPRESSION",
             TimerType::Reminder => "REMINDER",
         }
-    }
-}
-
-/// A user-created reminder — surfaces a message at `remind_at`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Reminder {
-    pub reminder_id: String,
-    pub seat_id: String,
-    pub mind_type: crate::proactivity::MindType,
-    pub user_id: Option<String>,
-    pub content: String,
-    pub remind_at: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
-    /// `pending` | `fired` | `cancelled`.
-    pub status: String,
-    /// Optional cron string (unused for now; future recurrence).
-    pub recurrence: Option<String>,
-    pub created_by_agent: bool,
-}
-
-/// A queued notification destined for a seat/agent (the UX channel).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Notification {
-    pub notification_id: String,
-    pub seat_id: String,
-    /// `REMINDER` | `FOCUS_REMINDER` | `IDEA_REMINDER` | `REFLECTION` | …
-    pub source: String,
-    pub title: String,
-    pub body: String,
-    /// `pending` | `delivered` | `dismissed`.
-    pub status: String,
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-    pub created_at: DateTime<Utc>,
-    pub delivered_at: Option<DateTime<Utc>>,
-}
-
-/// Lowercase ascii slug (words joined with `_`, ≤48 chars); `None` when the
-/// result would be empty. Used for folder segments so user/LLM-supplied
-/// project names can never escape the intended tree.
-pub fn slugify_ascii(raw: &str) -> Option<String> {
-    let slug: String = raw
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect::<String>()
-        .split('_')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("_");
-    let slug = slug.chars().take(48).collect::<String>();
-    if slug.is_empty() {
-        None
-    } else {
-        Some(slug)
     }
 }
 
@@ -464,55 +344,4 @@ pub fn content_hash(content: &str) -> String {
 pub fn unique_id(prefix: &str) -> String {
     let u = uuid::Uuid::new_v4().simple().to_string();
     format!("{prefix}_{}", &u[..12])
-}
-
-/// Кириллица → латиница (для говорящих id из русских названий).
-fn translit_char(c: char, upper: bool) -> Option<String> {
-    const LOWER: &[(&str, &str)] = &[
-        ("а", "a"), ("б", "b"), ("в", "v"), ("г", "g"), ("д", "d"), ("е", "e"),
-        ("ё", "yo"), ("ж", "zh"), ("з", "z"), ("и", "i"), ("й", "y"), ("к", "k"),
-        ("л", "l"), ("м", "m"), ("н", "n"), ("о", "o"), ("п", "p"), ("р", "r"),
-        ("с", "s"), ("т", "t"), ("у", "u"), ("ф", "f"), ("х", "h"), ("ц", "ts"),
-        ("ч", "ch"), ("ш", "sh"), ("щ", "sch"), ("ъ", ""), ("ы", "y"), ("ь", ""),
-        ("э", "e"), ("ю", "yu"), ("я", "ya"),
-    ];
-    let lower: String = c.to_lowercase().collect();
-    for (ru, lat) in LOWER {
-        if ru == &lower {
-            let out = if upper {
-                let mut ch = lat.chars();
-                match ch.next() {
-                    Some(f) => f.to_uppercase().collect::<String>() + ch.as_str(),
-                    None => String::new(),
-                }
-            } else {
-                (*lat).to_string()
-            };
-            return Some(out);
-        }
-    }
-    None
-}
-
-/// Говорящий слаг из названия: транслит кириллицы, lowercase, не-буквы → `_`,
-/// пустые сегменты схлопываются, до 48 символов. Пустой результат → `task`-
-/// стиль callers должен заменить на unique_id.
-pub fn slug_name(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for c in raw.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-        } else if let Some(t) = translit_char(c, c.is_uppercase()) {
-            out.push_str(&t);
-        } else {
-            out.push('_');
-        }
-    }
-    let slug: String = out
-        .to_lowercase()
-        .split('_')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("_");
-    slug.chars().take(48).collect()
 }

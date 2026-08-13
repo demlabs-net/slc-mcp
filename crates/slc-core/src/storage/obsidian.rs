@@ -40,33 +40,6 @@ use std::sync::Mutex;
 
 /// Human-readable file name from a unique document id.
 /// Keeps letters/digits/`-`/`_`/`.`/space; path-hostile chars → `-`.
-/// Validate a vault folder path from an untrusted document. Nested
-/// relative paths are fine (`projects/vassista`, `history/2026/08` —
-/// `default_folder` builds those from categories and ids); anything that
-/// could escape the vault root is rejected: absolute paths, `..`
-/// components, backslashes, colons and control characters.
-pub fn sanitize_folder(folder: &str) -> SlcResult<String> {
-    let folder = folder.trim();
-    if folder.is_empty() {
-        return Err(SlcError::Storage("folder must not be empty".into()));
-    }
-    if folder.starts_with('/') {
-        return Err(SlcError::Storage(format!("folder must be relative to the vault: {folder}")));
-    }
-    for part in folder.split('/') {
-        if part.is_empty() || part == "." || part == ".." {
-            return Err(SlcError::Storage(format!("folder contains an invalid component: {folder}")));
-        }
-        if part
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '\\' | ':'))
-        {
-            return Err(SlcError::Storage(format!("folder contains invalid characters: {folder}")));
-        }
-    }
-    Ok(folder.to_string())
-}
-
 pub fn safe_file_name(document_id: &str) -> String {
     let mut out = String::with_capacity(document_id.len());
     for c in document_id.chars() {
@@ -144,11 +117,6 @@ impl IndexEntry {
         }
         if let Some(level) = f.doc_level {
             if self.doc_level.as_deref() != Some(level.as_str()) {
-                return false;
-            }
-        }
-        if let Some(ids) = &f.document_ids {
-            if !ids.iter().any(|id| id == &self.id) {
                 return false;
             }
         }
@@ -425,7 +393,6 @@ impl ObsidianVaultStore {
     /// Write a document note: `{folder}/{safe_name}.md` (frontmatter + body).
     fn write_note(&self, doc: &Document) -> SlcResult<()> {
         let folder = doc.folder.clone().unwrap_or_else(|| doc.default_folder());
-        let folder = sanitize_folder(&folder)?;
         let dir = self.root.join(&folder);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.md", safe_file_name(&doc.document_id)));
@@ -438,8 +405,7 @@ impl ObsidianVaultStore {
 
     /// Read + parse a note into a Document (files are the source of truth).
     fn read_note(&self, entry: &IndexEntry) -> SlcResult<Document> {
-        let path = self.root.join(&sanitize_folder(&entry.folder)?)
-            .join(format!("{}.md", safe_file_name(&entry.id)));
+        let path = self.root.join(&entry.folder).join(format!("{}.md", safe_file_name(&entry.id)));
         let text = std::fs::read_to_string(&path)?;
         let (meta, body) = frontmatter_parse(&text);
         let meta = meta.unwrap_or_default();
@@ -633,17 +599,6 @@ impl StorageBackend for ObsidianVaultStore {
         Ok(false)
     }
 
-    async fn kb_replace(&self, doc: &Document) -> SlcResult<bool> {
-        if !doc.category.is_kb() {
-            return Err(SlcError::Storage("history docs go to the episodic store, not the KB".into()));
-        }
-        let exists = self.index.lock().unwrap().contains_key(&doc.document_id);
-        let doc = doc.clone();
-        self.write_note(&doc)?;
-        self.git_commit().await;
-        Ok(exists)
-    }
-
     async fn kb_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>> {
         let entries = self.select(Table::Kb, filter, sort, limit);
         let mut out = Vec::with_capacity(entries.len());
@@ -714,8 +669,7 @@ impl StorageBackend for ObsidianVaultStore {
     async fn kb_purge(&self, document_id: &str) -> SlcResult<bool> {
         let entry = self.index.lock().unwrap().remove(document_id);
         let Some(e) = entry else { return Ok(false) };
-        let path = self.root.join(&sanitize_folder(&e.folder)?)
-            .join(format!("{}.md", safe_file_name(&e.id)));
+        let path = self.root.join(&e.folder).join(format!("{}.md", safe_file_name(&e.id)));
         let _ = tokio::fs::remove_file(path).await;
         self.delete_embeddings(document_id).await?;
         self.persist_index()?;
@@ -755,8 +709,9 @@ impl StorageBackend for ObsidianVaultStore {
         if doc.category != DocumentCategory::History {
             return Err(SlcError::Storage("only history docs go to the episodic store".into()));
         }
-        // Seat-less episodic docs are allowed (legacy import): they are not
-        // picked up by any per-seat pipeline, just stored as diary.
+        if doc.seat_id.is_none() {
+            return Err(SlcError::Storage("episodic docs must be seat-scoped".into()));
+        }
         if self.index.lock().unwrap().contains_key(&doc.document_id) {
             return Err(SlcError::Storage(format!("document already exists: {}", doc.document_id)));
         }
@@ -815,8 +770,7 @@ impl StorageBackend for ObsidianVaultStore {
     async fn episodic_purge(&self, document_id: &str) -> SlcResult<bool> {
         let entry = self.index.lock().unwrap().remove(document_id);
         let Some(e) = entry else { return Ok(false) };
-        let path = self.root.join(&sanitize_folder(&e.folder)?)
-            .join(format!("{}.md", safe_file_name(&e.id)));
+        let path = self.root.join(&e.folder).join(format!("{}.md", safe_file_name(&e.id)));
         let _ = tokio::fs::remove_file(path).await;
         self.persist_index()?;
         self.git_commit().await;
@@ -913,35 +867,6 @@ impl StorageBackend for ObsidianVaultStore {
         Ok(true)
     }
 
-    async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
-        let mut seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
-        seat.active_task_id = Some(task_id.into());
-        // Task activation is document activation too (unified anchor).
-        seat.active_document_id = Some(task_id.into());
-        let seat = seat.clone();
-        drop(seats);
-        self.persist_seat(&seat)?;
-        Ok(true)
-    }
-
-    async fn set_seat_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool> {
-        let mut seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
-        seat.active_document_id = document_id.map(String::from);
-        let seat = seat.clone();
-        drop(seats);
-        self.persist_seat(&seat)?;
-        Ok(true)
-    }
-
-    async fn get_seat_active_document(&self, seat_id: &str) -> SlcResult<Option<String>> {
-        let seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get(seat_id) else { return Ok(None) };
-        // Unified field first; fall back to the legacy task pointer.
-        Ok(seat.active_document_id.clone().or_else(|| seat.active_task_id.clone()))
-    }
-
     async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool> {
         let mut seats = self.seats.lock().unwrap();
         let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
@@ -961,10 +886,6 @@ impl StorageBackend for ObsidianVaultStore {
     async fn insert_timer(&self, timer: &PersistedTimer) -> SlcResult<()> {
         self.timers.lock().unwrap().insert(timer.timer_id.clone(), timer.clone());
         self.persist_timers()
-    }
-
-    async fn get_timer(&self, timer_id: &str) -> SlcResult<Option<PersistedTimer>> {
-        Ok(self.timers.lock().unwrap().get(timer_id).cloned())
     }
 
     async fn active_timers(&self, seat_id: Option<&str>) -> SlcResult<Vec<PersistedTimer>> {
@@ -996,25 +917,6 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn get_record(&self, collection: &str, key: &str) -> SlcResult<Option<Value>> {
         Ok(self.records.lock().unwrap().get(&(collection.to_string(), key.to_string())).cloned())
-    }
-
-    async fn delete_record(&self, collection: &str, key: &str) -> SlcResult<bool> {
-        let existed = self.records.lock().unwrap().remove(&(collection.to_string(), key.to_string())).is_some();
-        if existed {
-            self.persist_records()?;
-        }
-        Ok(existed)
-    }
-
-    async fn list_records(&self, collection: &str) -> SlcResult<Vec<(String, Value)>> {
-        let records = self.records.lock().unwrap();
-        let mut out: Vec<(String, Value)> = records
-            .iter()
-            .filter(|((c, _), _)| c == collection)
-            .map(|((_, k), v)| (k.clone(), v.clone()))
-            .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(out)
     }
 
     async fn health_check(&self) -> bool {
@@ -1156,25 +1058,4 @@ mod tests {
             .unwrap();
         assert_eq!(store.get_embedding("doc-a").await.unwrap(), Some(vec![0.5, 0.25]));
     }
-    #[test]
-    fn sanitize_folder_accepts_nested_relative_and_rejects_escapes() {
-        // Valid Obsidian layouts.
-        assert_eq!(sanitize_folder("projects/vassista").unwrap(), "projects/vassista");
-        assert_eq!(sanitize_folder("history/2026/08").unwrap(), "history/2026/08");
-        // Escapes must be rejected (path traversal / absolute / windows).
-        for bad in [
-            "../../tmp/x",
-            "projects/../..",
-            "/etc",
-            "a/b/../../c",
-            "..",
-            "a\\..\\b",
-            "a:b",
-            "",
-            "  ",
-        ] {
-            assert!(sanitize_folder(bad).is_err(), "must reject {bad:?}");
-        }
-    }
-
 }

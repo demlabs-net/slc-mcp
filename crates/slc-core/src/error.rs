@@ -14,10 +14,6 @@ pub enum SlcError {
     Llm(String),
     #[error("parse error: {0}")]
     Parse(String),
-    #[error("invalid input: {0}")]
-    InvalidInput(String),
-    #[error("limit reached: {0}")]
-    Limit(String),
     #[error("config error: {0}")]
     Config(String),
     #[error(transparent)]
