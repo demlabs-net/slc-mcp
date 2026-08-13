@@ -63,31 +63,10 @@
 | Фича | Легаси | Rust | Примечание |
 |---|---|---|---|
 | PersistedTimer (модель + storage) | ✅ | ✅ | |
-| TimerRegistry (планировщик, tokio) | ✅ | ✅ | фоновый цикл + дефолтные таймеры + handlers, start_background() в serve; register() спавнит таск |
-| Дефолтные таймеры на seat (900/2700/7200/86400/86400) | ✅ | ✅ | create_defaults + env-интервалы |
-| cancel / cancel_by_metadata / pause / resume / restart | ✅ | 🟡 | cancel + cancel_by_metadata есть; pause/resume/restart — нет |
-| Хендлеры: compression/consolidation/reflection/reminder/focus/idea | ✅ | ✅ | все 6 в start_background → push Notification |
-
-## Proactive loop (focus / ideas / reflection)
-
-| Фича | Легаси | Rust | Примечание |
-|---|---|---|---|
-| FocusItem + FocusManager (CRUD, decay, depends_on+cycle, auto_archive) | ✅ | ✅ | MAX 7 |
-| MindType scoping (front/planner/executor/critic/shared) | ✅ | ✅ | proactivity.rs: normalize_write_mind_type / mind_matches |
-| IdeaItem + IdeaPool (weighted random, activation ≥0.75, reminded_count) | ✅ | ✅ | MAX 50 |
-| ReflectionEngine (history+focuses → LLM → ideas) | ✅ | ✅ | JSON-парсер, ≤5 идей |
-| MCP-тулы focus/idea/reflect | ✅ | 🟡 | add/list/remove/update/random/reflect_now есть; активация по контексту не в тулах |
-
-## Reminders + Notifications (UX-канал)
-
-| Фича | Легаси | Rust | Примечание |
-|---|---|---|---|
-| Reminder + ReminderManager (CRUD, limit 100, schedule) | ✅ | ✅ | one-shot REMINDER-таймер |
-| Парсер remind_at (ISO + NL) | ✅ | 🟡 | ISO/RFC3339 портирован; NL dateparser — нет (ошибка) |
-| Notification + очередь (pending→delivered) | ✅ | ✅ | TTL 24h cleanup |
-| Handler'ы REMINDER/FOCUS/IDEA → Notification | ✅ | ✅ | |
-| MCP-тулы reminders + pop_notifications + prompts | ✅ | 🟡 | create/list/cancel + pop_notifications + check_notifications prompt + инъекция в ответы |
-
+| TimerRegistry (планировщик, tokio) | ✅ | ⛔ | есть storage-методы, нет фонового цикла |
+| Дефолтные таймеры на seat (900/2700/7200/86400/86400) | ✅ | ⛔ | |
+| cancel/pause/resume/restart | ✅ | ⛔ | |
+| Хендлеры: compression/consolidation/reflection/reminder | ✅ | 🟡 | compression+consolidation — run-now; авто-расписание — нет |
 
 ## Seat'ы
 
@@ -117,7 +96,7 @@
 |---|---|---|---|
 | AgentRegistry + runs (LangGraph) | ✅ | ⛔ | Phase 7 «агент» — большой блок, отдельно |
 | REST API (/api/*) | ✅ | ⛔ | admin/auth/kb/seats/tasks/agents/activity… |
-| Web UI (Svelte 5) | ✅ | 🔶 | решено портировать на Rust: standalone `slc-webui`, отдельный Docker (P6) |
+| Web UI (Svelte 5) | ✅ | ⛔ | в плане Vassista — clients/ позже |
 | Observability (ActivityRecorder, MemoryMetrics) | ✅ | ⛔ | |
 
 ## LLM
@@ -135,13 +114,12 @@
 консолидация (с фиксом), seat'ы, MCP-скелет, оба LLM-провайдера.
 
 **Не портировано (по приоритету для Phase 7):**
-1. MCP: остальные ~32 тула, пагинация, auth-режимы/пермишены, SSE; NL-парсер
-   remind_at (dateparser), recurrence (cron).
-2. Backup/restore, link/unlink + auto_load traversal, search_and_replace,
-   чанкинг эмбеддингов 1800/200; **diff-обновления документов** (P4).
-3. Истории: read-only API + archive/purge (только admin) (P4.1).
-4. Personalization (профили), observability, External sync.
-5. **Агентская система (registry/runs/субагенты) — НЕ портируем**; только
-   агентский поиск (agentic search на gemma-4-e4b).
-6. **Web UI — портируем на Rust** как standalone `slc-webui` в отдельном
-   Docker (P6). REST API + Web UI для Vassista-клиентов — другие агенты.
+1. TimerRegistry (авто-расписание compression/consolidation) — движок памяти
+   без него не «живёт» сам.
+2. Reflection + Focus + Idea pool — второй контур памяти (идеи/фокусы).
+3. Reminders + Notifications — UX-канал памяти.
+4. MCP: остальные ~32 тула, пагинация, auth-режимы/пермишены, prompts, SSE.
+5. Backup/restore, link/unlink + auto_load traversal, search_and_replace,
+   чанкинг эмбеддингов 1800/200.
+6. Personalization (профили), observability, External sync.
+7. Агенты (registry/runs), REST API, Web UI — отдельные крупные блоки.
