@@ -81,12 +81,23 @@ enum Cmd {
         #[command(subcommand)]
         action: GraveyardAction,
     },
-    /// Migrate a legacy Python SLC vault into the current storage
-    /// (id → human-readable names, folders by category in Obsidian).
+    /// Migrate legacy Python SLC data into the current storage.
     Migrate {
         /// Legacy vault root (vault/<collection>/<stem>.md layout).
+        #[arg(long, conflicts_with = "from_mongo")]
+        from: Option<PathBuf>,
+        /// Legacy MongoDB URI (e.g. mongodb://127.0.0.1:27017).
+        #[arg(long, value_name = "URI", conflicts_with = "from")]
+        from_mongo: Option<String>,
+        /// Legacy MongoDB database (default: slc_mcp).
+        #[arg(long, default_value = "slc_mcp")]
+        db: String,
+        /// Переименовать id документов БЗ в осмысленные с помощью reasoning-LLM
+        /// из .env (SLC_LLM/LMSTUDIO_URL/OLLAMA) и переписать auto_load/
+        /// references под новые id. History-доки (дневник) получают
+        /// детерминированные id (дата + хвост старого id).
         #[arg(long)]
-        from: PathBuf,
+        rename_with_ai: bool,
         /// Target Obsidian vault (default: $SLC_VAULT_PATH).
         #[arg(long)]
         to_vault: Option<PathBuf>,
@@ -180,10 +191,30 @@ async fn main() -> anyhow::Result<()> {
                 server::run(engine, port, None, pending).await
             }
         }
-        Cmd::Migrate { from, to_vault } => {
+        Cmd::Migrate {
+            from,
+            from_mongo,
+            db,
+            rename_with_ai,
+            to_vault,
+        } => {
+            if let Some(v) = to_vault.clone() {
+                config.path = v.to_string_lossy().to_string();
+            }
             let engine = SlcEngine::open_async(config).await?;
-            let report = slc_core::migrate::migrate_legacy_vault(&from, engine.store()).await?;
-            println!("migration complete: {report:?}");
+            if let Some(uri) = from_mongo {
+                let opts = slc_core::migrate::MongoMigrateOptions { uri, database: db };
+                let llm = if rename_with_ai { Some(engine.llm()) } else { None };
+                let report =
+                    slc_core::migrate::migrate_legacy_mongo(&opts, engine.store(), llm, rename_with_ai)
+                        .await?;
+                println!("mongo migration complete: {report:?}");
+            } else if let Some(from) = from {
+                let report = slc_core::migrate::migrate_legacy_vault(&from, engine.store()).await?;
+                println!("migration complete: {report:?}");
+            } else {
+                anyhow::bail!("укажи источник: --from <legacy-vault> или --from-mongo [URI]");
+            }
             if let Some(v) = to_vault {
                 println!("target vault: {}", v.display());
             }

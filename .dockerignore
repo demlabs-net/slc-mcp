@@ -1,0 +1,16 @@
+# Build context: only what the Dockerfile needs.
+target/
+.git
+.gitignore
+data/
+docs/
+hooks/
+tests/
+slc-mcp.legacy
+deploy/
+*.md
+.env
+.env.*
+!.env.example
+docker-compose*.yml
+deploy.sh
