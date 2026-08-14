@@ -308,10 +308,10 @@ let params = req.get("params").cloned().unwrap_or(Value::Null);
                 if let Some(seat) = seat_hdr.as_deref() {
                     // The seat may not exist yet — create it first.
                     let _ = engine.seats.ensure_seat(seat).await;
-                    // SLC budget = 50% of the client's model window (the rest
+                    // SLC budget = 80% of the client's model window (the rest
                     // is left for the conversation itself), capped at the
                     // configured limit (SLC_CONTEXT_LIMIT_CHARS).
-                    let limit = (window / 2).min(engine.config.context_limit_chars as u64);
+                    let limit = (window * 4 / 5).min(engine.config.context_limit_chars as u64);
                     let _ = engine
                         .seats
                         .set_context_key(seat, "context_limit_chars", json!(limit))
@@ -910,16 +910,12 @@ async fn build_context(
     }
     let mut base_blocks: Vec<Value> = Vec::new();
     if include_base {
-        // ВСЕ core-документы (манифест, стандарты, методология…), в порядке
-        // приоритета: важнейшие первыми, дропаются последними.
+        // All core documents (manifest, behavior rules, methodology, best practices).
         for base in [
             "core_slc_manifest",
-            "core_standards",
-            "core_development_standards",
+            "core_ai_behavior",
             "core_methodology",
-            "core_ai_behavior_correction",
-            "core_reflection_system",
-            "core_project",
+            "core_slc_best_practice",
         ] {
             if let Ok(Some(d)) = engine.get_document(base).await {
                 used += d.content.chars().count();
@@ -931,6 +927,8 @@ async fn build_context(
     // Compression: drop whole blocks by priority until it fits — по одному,
     // начиная с наименее важных (последних), чтобы манифест и стандарты
     // остались в контексте даже при жёстком лимите.
+    // Core-документы НИКОГДА не дропаются — они являются системным знанием,
+    // без которого модель не может корректно работать.
     let mut omitted: Vec<String> = Vec::new();
     let mut drop_while_overflow = |blocks: &mut Vec<Value>, omitted: &mut Vec<String>| {
         while used > limit {
@@ -948,7 +946,7 @@ async fn build_context(
             }
         }
     };
-    drop_while_overflow(&mut base_blocks, &mut omitted);
+    // Only profile blocks are droppable; base (core) docs are mandatory.
     drop_while_overflow(&mut profile_blocks, &mut omitted);
     let compressed = !omitted.is_empty();
 
