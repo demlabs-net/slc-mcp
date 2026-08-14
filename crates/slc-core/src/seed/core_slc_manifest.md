@@ -22,15 +22,13 @@ Context is assembled from blocks by priority (highest → lowest):
 
 Compression on budget overflow:
 - Documents are NEVER truncated — only dropped whole or LLM-summarized.
-- Overflow = token budget exceeded OR tool output over the byte cap
-  (`SLC_TOOL_OUTPUT_MAX_BYTES`, default 48000 — harnesses truncate larger
-  tool outputs silently).
+- Overflow = the seat's TOKEN budget is exceeded.
 - Profiles drop first, then core docs one by one from the least important.
 - If still over — LLM summarization of remaining docs.
 - Response includes `compressed: true` + `warning`.
 
 Budget: `/limit N` (TOKENS; ~3 chars per token) or
-`SLC_CONTEXT_LIMIT_TOKENS` env var. Default: 100000 tokens (≈300000 chars).
+`SLC_CONTEXT_LIMIT_TOKENS` env var. Default: 100000 tokens.
 
 ## Documents
 
@@ -160,7 +158,6 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 |----------|---------|-------------|
 | `SLC_VAULT_PATH` | `~/.slc/vault` | Vault path |
 | `SLC_CONTEXT_LIMIT_TOKENS` | `100000` | Context limit (tokens; ~3 chars each) |
-| `SLC_TOOL_OUTPUT_MAX_BYTES` | `48000` | Byte cap on tool output vs harness truncation (0 = off) |
 | `SLC_LLM` | auto | Provider: hash/ollama/lmstudio/candle |
 | `LMSTUDIO_URL` | — | LM Studio URL |
 | `LMSTUDIO_MODEL` | `google/gemma-4-e4b` | Reasoning model |

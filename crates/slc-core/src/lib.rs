@@ -154,8 +154,8 @@ pub struct SlcConfig {
     pub seat_ttl_seconds: i64,
     /// Total context budget in TOKENS handed to the model per
     /// `update_context` call. Per-seat override: `/limit N` (tokens) or the
-    /// client's window from `initialize` (tokens). The compression works in
-    /// characters internally: budget_chars = tokens * CHARS_PER_TOKEN.
+    /// client's window from `initialize` (tokens). The compression counts
+    /// usage in tokens too (~3 chars per token via CHARS_PER_TOKEN).
     pub context_limit_tokens: usize,
     /// MongoDB connection URI (used when `storage = MongoDB`).
     pub mongodb_uri: Option<String>,
@@ -193,16 +193,10 @@ impl Default for SlcConfig {
             semantic_weight: 0.7,
             text_weight: 0.3,
             seat_ttl_seconds: 86400,
-            // Токены. Легаси- env в символах конвертируем (≈3 симв/токен).
+            // Бюджет контекста — ТОКЕНЫ (~3 симв/токен внутри компрессии).
             context_limit_tokens: std::env::var("SLC_CONTEXT_LIMIT_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .or_else(|| {
-                    std::env::var("SLC_CONTEXT_LIMIT_CHARS")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .map(|chars| chars / CHARS_PER_TOKEN)
-                })
                 .unwrap_or(100_000),
             mongodb_uri: std::env::var("SLC_MONGODB_URI").ok(),
             mcp_sampling: std::env::var("SLC_MCP_SAMPLING").is_ok_and(|v| v == "true" || v == "1"),
@@ -450,11 +444,12 @@ impl SlcEngine {
     }
 
     /// Intelligent compression of a text via the reasoning LLM: keep the key
-    /// facts within `budget_chars`. Best-effort — on LLM failure the original
+    /// facts within `max_chars` (размер сжатого текста для LLM-промпта, не
+    /// контекстный бюджет). Best-effort — on LLM failure the original
     /// text is returned unchanged (callers never truncate by hand).
-    pub async fn summarize_text(&self, text: &str, budget_chars: usize) -> SlcResult<String> {
+    pub async fn summarize_text(&self, text: &str, max_chars: usize) -> SlcResult<String> {
         let prompt = format!(
-            "Сожми следующий текст до ключевых фактов (не более {budget_chars} символов).              Только факты, без воды, сохрани имена и цифры:\n\n{text}"
+            "Сожми следующий текст до ключевых фактов (не более {max_chars} символов).              Только факты, без воды, сохрани имена и цифры:\n\n{text}"
         );
         let out = self.llm.reason(&prompt).await?.trim().to_string();
         if out.is_empty() {
