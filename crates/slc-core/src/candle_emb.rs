@@ -438,10 +438,11 @@ impl CandleEmbeddingLlm {
             let mut ids: Vec<u32> = Vec::with_capacity(batch * max_len);
             let mut mask: Vec<u32> = Vec::with_capacity(batch * max_len);
             for e in &encodings {
+                let pad = max_len - e.len();
                 ids.extend(e.iter());
-                ids.extend(std::iter::repeat(loaded.pad_id).take(max_len - e.len()));
-                mask.extend(std::iter::repeat(1u32).take(e.len()));
-                mask.extend(std::iter::repeat(0u32).take(max_len - e.len()));
+                ids.resize(ids.len() + pad, loaded.pad_id);
+                mask.resize(mask.len() + e.len(), 1u32);
+                mask.resize(mask.len() + pad, 0u32);
             }
             let ids = Tensor::new(ids, &loaded.device)
                 .map_err(|e| e.to_string())?
