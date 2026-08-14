@@ -7,12 +7,14 @@ use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
-    response::{IntoResponse, sse::{Event, KeepAlive, Sse}},
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
-use futures::stream::Stream;
-use serde_json::{json, Value};
-use slc_core::{DocumentCategory, DocMeta, Document, SlcEngine};
+use serde_json::{Value, json};
+use slc_core::{DocMeta, Document, DocumentCategory, SlcEngine};
 use std::sync::Arc;
 
 pub struct AppState {
@@ -21,14 +23,18 @@ pub struct AppState {
     pub events: tokio::sync::broadcast::Sender<Value>,
     /// Pending MCP sampling requests (id → answer channel); the sampling
     /// LlmClient registers here and the client's response resolves it.
-    pub sampling: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+    pub sampling: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
+    >,
 }
 
 pub async fn run(
     engine: SlcEngine,
     port: u16,
     sampling_out: Option<tokio::sync::mpsc::Receiver<Value>>,
-    sampling: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+    sampling: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
+    >,
 ) -> anyhow::Result<()> {
     if let Err(e) = engine.start_background().await {
         tracing::warn!("failed to start background timers: {e}");
@@ -43,7 +49,11 @@ pub async fn run(
             }
         });
     }
-    let state = Arc::new(AppState { engine: Arc::new(engine), events: tx, sampling });
+    let state = Arc::new(AppState {
+        engine: Arc::new(engine),
+        events: tx,
+        sampling,
+    });
     let app = Router::new()
         .route("/mcp", post(mcp))
         .route("/sse", get(sse_endpoint))
@@ -69,17 +79,37 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
 /// Streamable-HTTP SSE endpoint. Emits an `endpoint` event pointing the
 /// client at `/messages`, then streams server→client notifications for the
 /// seat supplied via `X-Seat-ID` (or `?seat=`).
+///
+/// Authentication: in `bearer_plus_seat` mode a valid `Authorization: Bearer`
+/// is required (same rule as `/mcp`); otherwise any non-empty seat is
+/// accepted (legacy behaviour).
 async fn sse_endpoint(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+) -> axum::response::Response {
     let seat = seat_from_request(&headers)
         .or_else(|| params.get("seat").cloned())
         .unwrap_or_default();
+    let mode = slc_core::auth_mode_from_env();
+    let bearer = bearer_from_request(&headers);
+    if mode == slc_core::AuthMode::BearerPlusSeat {
+        match slc_core::authenticate(mode, Some(&seat), bearer.as_deref()) {
+            Ok(Some(_)) => {}
+            _ => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "missing/invalid Authorization: Bearer token"})),
+                )
+                    .into_response();
+            }
+        }
+    }
     let rx = state.events.subscribe();
 
-    let stream = async_stream::stream! {
+    let stream: std::pin::Pin<
+        Box<dyn futures::stream::Stream<Item = Result<Event, std::convert::Infallible>> + Send>,
+    > = Box::pin(async_stream::stream! {
         // Tell the client where to POST JSON-RPC.
         yield Ok(Event::default()
             .event("endpoint")
@@ -99,8 +129,10 @@ async fn sse_endpoint(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    };
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response()
 }
 
 /// Streamable-HTTP messages endpoint — accepts JSON-RPC and returns the
@@ -111,7 +143,10 @@ async fn messages(
     headers: axum::http::HeaderMap,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    let sid = headers.get("sessionId").and_then(|v| v.to_str().ok()).map(String::from);
+    let sid = headers
+        .get("sessionId")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     let (status, Json(body)) = mcp(State(state), headers, Json(req)).await;
     if let Some(sid) = sid {
         if body.get("result").is_some() {
@@ -182,20 +217,27 @@ async fn mcp(
     let bearer = bearer_from_request(&headers);
 
     // Tool calls need a seat; initialize/list/ping are unauthenticated.
-    if !matches!(method, "initialize" | "tools/list" | "prompts/list" | "prompts/get" | "ping") {
+    if !matches!(
+        method,
+        "initialize" | "tools/list" | "prompts/list" | "prompts/get" | "ping"
+    ) {
         let mode = slc_core::auth_mode_from_env();
         match slc_core::authenticate(mode, seat_hdr.as_deref(), bearer.as_deref()) {
             Ok(Some(_)) => {}
             Ok(None) => {
                 return (
                     StatusCode::UNAUTHORIZED,
-                    Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32001,"message":"missing/invalid X-Seat-ID header"}})),
+                    Json(
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32001,"message":"missing/invalid X-Seat-ID header"}}),
+                    ),
                 );
             }
             Err(e) => {
                 return (
                     StatusCode::UNAUTHORIZED,
-                    Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32001,"message":e.to_string()}})),
+                    Json(
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32001,"message":e.to_string()}}),
+                    ),
                 );
             }
         }
@@ -216,7 +258,10 @@ async fn mcp(
                     // SLC budget = 50% of the client's model window: the rest
                     // is left for the conversation itself.
                     let limit = window / 2;
-                    let _ = engine.seats.set_context_key(seat, "context_limit_chars", json!(limit)).await;
+                    let _ = engine
+                        .seats
+                        .set_context_key(seat, "context_limit_chars", json!(limit))
+                        .await;
                 }
             }
             Ok(json!({
@@ -224,7 +269,7 @@ async fn mcp(
                 "capabilities": { "tools": {}, "prompts": {} },
                 "serverInfo": { "name": "slc-mcp", "version": env!("CARGO_PKG_VERSION") },
             }))
-        },
+        }
         "ping" => Ok(Value::Null),
         "tools/list" => Ok(json!({ "tools": tools() })),
         "prompts/list" => Ok(json!({ "prompts": prompts() })),
@@ -247,7 +292,10 @@ async fn mcp(
         }
         "tools/call" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let seat = seat_hdr.clone().unwrap_or_default();
             call_tool(engine, &seat, name, &args, &state.events).await
         }
@@ -255,355 +303,356 @@ async fn mcp(
     };
 
     match result {
-        Ok(result) => (StatusCode::OK, Json(json!({"jsonrpc":"2.0","id":id,"result":result}))),
-        Err(error) => (StatusCode::OK, Json(json!({"jsonrpc":"2.0","id":id,"error":error}))),
+        Ok(result) => (
+            StatusCode::OK,
+            Json(json!({"jsonrpc":"2.0","id":id,"result":result})),
+        ),
+        Err(error) => (
+            StatusCode::OK,
+            Json(json!({"jsonrpc":"2.0","id":id,"error":error})),
+        ),
     }
 }
 
 fn tools() -> Vec<Value> {
     vec![
-    json!({
-        "name": "search",
-        "description": "Hybrid search over the knowledge base (semantic + BM25)",
-        "inputSchema": {"type":"object","properties":{
-            "query": {"type":"string","description":"search query"},
-            "limit": {"type":"number","default":10}
-        },"required":["query"]}
-    }),
-    json!({
-        "name": "get_document",
-        "description": "Load a document by its unique name id",
-        "inputSchema": {"type":"object","properties":{
-            "document_id": {"type":"string"}
-        },"required":["document_id"]}
-    }),
-    json!({
-        "name": "add_document",
-        "description": "Add a knowledge document (projects/tasks/docs are all documents)",
-        "inputSchema": {"type":"object","properties":{
-            "document_id": {"type":"string"},
-            "category": {"type":"string","enum":["core","module","task","project","code_snippet","documentation","skill","custom","system"]},
-            "content": {"type":"string"},
-            "folder": {"type":"string","description":"vault folder, e.g. projects/vassista"}
-        },"required":["document_id","category","content"]}
-    }),
-    json!({
-        "name": "remember",
-        "description": "Record an episodic event (L1) — the diary entry, NOT part of the RAG store",
-        "inputSchema": {"type":"object","properties":{
-            "event_id": {"type":"string"},
-            "content": {"type":"string"}
-        },"required":["event_id","content"]}
-    }),
-    json!({
-        "name": "recall",
-        "description": "Recent episodic history for the seat (separate from KB search)",
-        "inputSchema": {"type":"object","properties":{
-            "limit": {"type":"number","default":10}
-        },"required":[]}
-    }),
-    json!({
-        "name": "seat_info",
-        "description": "Current seat info + usage stats",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
-    json!({
-        "name": "compress_now",
-        "description": "Run progressive summarization L1→L4 for the seat",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
-    json!({
-        "name": "consolidate_now",
-        "description": "Extract learned facts from episodic memory",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
-    json!({
-        "name": "focus_add",
-        "description": "Add a focus item (something the user is concentrating on)",
-        "inputSchema": {"type":"object","properties":{
-            "title": {"type":"string"},
-            "description": {"type":"string","default":""},
-            "priority": {"type":"number","minimum":1,"maximum":10,"default":5},
-            "depends_on": {"type":"array","items":{"type":"string"},"description":"focus ids this depends on"},
-            "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]}
-        },"required":["title"]}
-    }),
-    json!({
-        "name": "focus_list",
-        "description": "List active focus items for the seat",
-        "inputSchema": {"type":"object","properties":{
-            "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]}
-        },"required":[]}
-    }),
-    json!({
-        "name": "focus_update",
-        "description": "Update a focus item's title/description/priority/dependencies",
-        "inputSchema": {"type":"object","properties":{
-            "focus_id": {"type":"string"},
-            "title": {"type":"string"},
-            "description": {"type":"string"},
-            "priority": {"type":"number","minimum":1,"maximum":10},
-            "depends_on": {"type":"array","items":{"type":"string"}}
-        },"required":["focus_id"]}
-    }),
-    json!({
-        "name": "focus_remove",
-        "description": "Remove a focus item (cleans up dependencies)",
-        "inputSchema": {"type":"object","properties":{
-            "focus_id": {"type":"string"}
-        },"required":["focus_id"]}
-    }),
-    
-    
-    
-    
-    
-    json!({
-        "name": "reminder_create",
-        "description": "Create a reminder; schedules a one-shot timer (ISO time)",
-        "inputSchema": {"type":"object","properties":{
-            "content": {"type":"string"},
-            "remind_at": {"type":"string","description":"ISO-8601/RFC3339 time, e.g. 2026-08-13T15:30:00Z"},
-            "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]}
-        },"required":["content","remind_at"]}
-    }),
-    json!({
-        "name": "reminder_list",
-        "description": "List reminders for the seat",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
-    json!({
-        "name": "reminder_cancel",
-        "description": "Cancel a pending reminder",
-        "inputSchema": {"type":"object","properties":{
-            "reminder_id": {"type":"string"}
-        },"required":["reminder_id"]}
-    }),
-    json!({
-        "name": "pop_notifications",
-        "description": "Pop pending notifications for the seat (marks them delivered)",
-        "inputSchema": {"type":"object","properties":{
-            "limit": {"type":"number","default":5}
-        },"required":[]}
-    }),
-    json!({
-        "name": "info",
-        "description": "Current session info: seat, active task",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
-    // tasks
-    json!({
-        "name": "create_task",
-        "description": "Create a new task (private to current seat)",
-        "inputSchema": {"type":"object","properties":{
-            "name": {"type":"string"},
-            "description": {"type":"string","default":""},
-            "project_id": {"type":"string"},
-            "auto_load": {"type":"array","items":{"type":"string"}},
-            "metadata": {"type":"object"}
-        },"required":["name"]}
-    }),
-    json!({
-        "name": "update_task",
-        "description": "Update an existing task",
-        "inputSchema": {"type":"object","properties":{
-            "task_id": {"type":"string"},
-            "name": {"type":"string"},
-            "description": {"type":"string"},
-            "project_id": {"type":"string"},
-            "auto_load": {"type":"array","items":{"type":"string"}},
-            "status": {"type":"string","enum":["pending","active","completed","cancelled"]},
-            "metadata": {"type":"object"}
-        },"required":["task_id"]}
-    }),
-    json!({
-        "name": "delete_task",
-        "description": "Delete a task",
-        "inputSchema": {"type":"object","properties":{
-            "task_id": {"type":"string"}
-        },"required":["task_id"]}
-    }),
-    json!({
-        "name": "activate_task",
-        "description": "Activate a task (included in update_context)",
-        "inputSchema": {"type":"object","properties":{
-            "task_id": {"type":"string"}
-        },"required":["task_id"]}
-    }),
-    json!({
-        "name": "deactivate_task",
-        "description": "Deactivate the current active task",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
-    json!({
-        "name": "get_active_task",
-        "description": "Get the currently active task",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
-    json!({
-        "name": "activate_document",
-        "description": "Activate ANY document (task, project, skill, knowledge doc…) as the seat's context anchor — it is included in update_context and its auto_load links are followed on updates. The effect is identical to activate_task, but for every category.",
-        "inputSchema": {"type":"object","properties":{
-            "document_id": {"type":"string"}
-        },"required":["document_id"]}
-    }),
-    json!({
-        "name": "deactivate_document",
-        "description": "Clear the seat's active document (any category)",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
-    json!({
-        "name": "get_active_document",
-        "description": "Get the currently active document (any category)",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
-    json!({
-        "name": "list_tasks",
-        "description": "List your tasks with optional filters",
-        "inputSchema": {"type":"object","properties":{
-            "project_id": {"type":"string"},
-            "status": {"type":"string","enum":["pending","active","completed","cancelled"]},
-            "limit": {"type":"number","default":50}
-        },"required":[]}
-    }),
-    // projects
-    json!({
-        "name": "create_project",
-        "description": "Create a new project",
-        "inputSchema": {"type":"object","properties":{
-            "name": {"type":"string"},
-            "description": {"type":"string","default":""},
-            "auto_load": {"type":"array","items":{"type":"string"}},
-            "metadata": {"type":"object"}
-        },"required":["name"]}
-    }),
-    json!({
-        "name": "update_project",
-        "description": "Update an existing project",
-        "inputSchema": {"type":"object","properties":{
-            "project_id": {"type":"string"},
-            "name": {"type":"string"},
-            "description": {"type":"string"},
-            "auto_load": {"type":"array","items":{"type":"string"}},
-            "status": {"type":"string","enum":["active","archived"]},
-            "metadata": {"type":"object"}
-        },"required":["project_id"]}
-    }),
-    json!({
-        "name": "delete_project",
-        "description": "Delete a project",
-        "inputSchema": {"type":"object","properties":{
-            "project_id": {"type":"string"}
-        },"required":["project_id"]}
-    }),
-    json!({
-        "name": "get_project",
-        "description": "Get project details",
-        "inputSchema": {"type":"object","properties":{
-            "project_id": {"type":"string"}
-        },"required":["project_id"]}
-    }),
-    json!({
-        "name": "list_projects",
-        "description": "List all projects",
-        "inputSchema": {"type":"object","properties":{
-            "status": {"type":"string","enum":["active","archived"]},
-            "limit": {"type":"number","default":50}
-        },"required":[]}
-    }),
-    // profiles
-    json!({
-        "name": "get_user_profile",
-        "description": "Get the current user's behavioural profile",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
-    json!({
-        "name": "update_user_profile",
-        "description": "Create or update the user's behavioural profile",
-        "inputSchema": {"type":"object","properties":{
-            "content": {"type":"string"}
-        },"required":["content"]}
-    }),
-    json!({
-        "name": "get_seat_profile",
-        "description": "Get the current seat's workspace profile",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
-    json!({
-        "name": "update_seat_profile",
-        "description": "Create or update the seat's workspace profile",
-        "inputSchema": {"type":"object","properties":{
-            "content": {"type":"string"},
-            "timezone": {"type":"string","description":"IANA timezone, e.g. Europe/Moscow"}
-        },"required":["content"]}
-    }),
-    // pagination
-    json!({
-        "name": "get_page",
-        "description": "Retrieve a page of a paginated response",
-        "inputSchema": {"type":"object","properties":{
-            "response_id": {"type":"string"},
-            "page": {"type":"number"}
-        },"required":["response_id","page"]}
-    }),
-    json!({
-        "name": "delete_response",
-        "description": "Delete a cached paginated response",
-        "inputSchema": {"type":"object","properties":{
-            "response_id": {"type":"string"}
-        },"required":["response_id"]}
-    }),
-    json!({
-        "name": "set_page_limit",
-        "description": "Set the maximum page size (in tokens) for response pagination",
-        "inputSchema": {"type":"object","properties":{
-            "page_token_limit": {"type":"number"}
-        },"required":["page_token_limit"]}
-    }),
-    json!({
-        "name": "get_page_settings",
-        "description": "Get current pagination settings",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
-    // context
-    json!({
-        "name": "update_context",
-        "description": "Load (and optionally save) project context: base docs + active task + profiles + focuses",
-        "inputSchema": {"type":"object","properties":{
-            "summary": {"type":"string","description":"persists a context snapshot when provided"},
-            "changes": {"type":"array","items":{"type":"string"}},
-            "decisions": {"type":"array","items":{"type":"string"}},
-            "next_steps": {"type":"array","items":{"type":"string"}},
-            "include_base_docs": {"type":"boolean","default":true}
-        },"required":[]}
-    }),
-    json!({
-        "name": "load_module",
-        "description": "Load a public knowledge module (requires knowledge:public:write)",
-        "inputSchema": {"type":"object","properties":{
-            "module_name": {"type":"string"}
-        },"required":["module_name"]}
-    }),
-    json!({
-        "name": "command",
-        "description": "Slash-команды для управления памятью: `/limit N` — лимит контекста, `/ctx` — текущий срез, `/update_context [summary]` / `/save_context <summary>` — как MCP-тулы, `/help` — список. Вызывай, когда пользователь пишет сообщение, начинающееся с '/'.",
-        "inputSchema": {"type":"object","properties":{
-            "input": {"type":"string","description":"строка, начинающаяся с /"}
-        },"required":["input"]}
-    }),
-]
+        json!({
+            "name": "search",
+            "description": "Hybrid search over the knowledge base (semantic + BM25)",
+            "inputSchema": {"type":"object","properties":{
+                "query": {"type":"string","description":"search query"},
+                "limit": {"type":"number","default":10}
+            },"required":["query"]}
+        }),
+        json!({
+            "name": "get_document",
+            "description": "Load a document by its unique name id",
+            "inputSchema": {"type":"object","properties":{
+                "document_id": {"type":"string"}
+            },"required":["document_id"]}
+        }),
+        json!({
+            "name": "add_document",
+            "description": "Add a knowledge document (projects/tasks/docs are all documents)",
+            "inputSchema": {"type":"object","properties":{
+                "document_id": {"type":"string"},
+                "category": {"type":"string","enum":["core","module","task","project","code_snippet","documentation","skill","custom","system"]},
+                "content": {"type":"string"},
+                "folder": {"type":"string","description":"vault folder, e.g. projects/vassista"}
+            },"required":["document_id","category","content"]}
+        }),
+        json!({
+            "name": "remember",
+            "description": "Record an episodic event (L1) — the diary entry, NOT part of the RAG store",
+            "inputSchema": {"type":"object","properties":{
+                "event_id": {"type":"string"},
+                "content": {"type":"string"}
+            },"required":["event_id","content"]}
+        }),
+        json!({
+            "name": "recall",
+            "description": "Recent episodic history for the seat (separate from KB search)",
+            "inputSchema": {"type":"object","properties":{
+                "limit": {"type":"number","default":10}
+            },"required":[]}
+        }),
+        json!({
+            "name": "seat_info",
+            "description": "Current seat info + usage stats",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        json!({
+            "name": "compress_now",
+            "description": "Run progressive summarization L1→L4 for the seat",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        json!({
+            "name": "consolidate_now",
+            "description": "Extract learned facts from episodic memory",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        json!({
+            "name": "focus_add",
+            "description": "Add a focus item (something the user is concentrating on)",
+            "inputSchema": {"type":"object","properties":{
+                "title": {"type":"string"},
+                "description": {"type":"string","default":""},
+                "priority": {"type":"number","minimum":1,"maximum":10,"default":5},
+                "depends_on": {"type":"array","items":{"type":"string"},"description":"focus ids this depends on"},
+                "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]}
+            },"required":["title"]}
+        }),
+        json!({
+            "name": "focus_list",
+            "description": "List active focus items for the seat",
+            "inputSchema": {"type":"object","properties":{
+                "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]}
+            },"required":[]}
+        }),
+        json!({
+            "name": "focus_update",
+            "description": "Update a focus item's title/description/priority/dependencies",
+            "inputSchema": {"type":"object","properties":{
+                "focus_id": {"type":"string"},
+                "title": {"type":"string"},
+                "description": {"type":"string"},
+                "priority": {"type":"number","minimum":1,"maximum":10},
+                "depends_on": {"type":"array","items":{"type":"string"}}
+            },"required":["focus_id"]}
+        }),
+        json!({
+            "name": "focus_remove",
+            "description": "Remove a focus item (cleans up dependencies)",
+            "inputSchema": {"type":"object","properties":{
+                "focus_id": {"type":"string"}
+            },"required":["focus_id"]}
+        }),
+        json!({
+            "name": "reminder_create",
+            "description": "Create a reminder; schedules a one-shot timer (ISO time)",
+            "inputSchema": {"type":"object","properties":{
+                "content": {"type":"string"},
+                "remind_at": {"type":"string","description":"ISO-8601/RFC3339 time, e.g. 2026-08-13T15:30:00Z"},
+                "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]}
+            },"required":["content","remind_at"]}
+        }),
+        json!({
+            "name": "reminder_list",
+            "description": "List reminders for the seat",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        json!({
+            "name": "reminder_cancel",
+            "description": "Cancel a pending reminder",
+            "inputSchema": {"type":"object","properties":{
+                "reminder_id": {"type":"string"}
+            },"required":["reminder_id"]}
+        }),
+        json!({
+            "name": "pop_notifications",
+            "description": "Pop pending notifications for the seat (marks them delivered)",
+            "inputSchema": {"type":"object","properties":{
+                "limit": {"type":"number","default":5}
+            },"required":[]}
+        }),
+        json!({
+            "name": "info",
+            "description": "Current session info: seat, active task",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        // tasks
+        json!({
+            "name": "create_task",
+            "description": "Create a new task (private to current seat)",
+            "inputSchema": {"type":"object","properties":{
+                "name": {"type":"string"},
+                "description": {"type":"string","default":""},
+                "project_id": {"type":"string"},
+                "auto_load": {"type":"array","items":{"type":"string"}},
+                "metadata": {"type":"object"}
+            },"required":["name"]}
+        }),
+        json!({
+            "name": "update_task",
+            "description": "Update an existing task",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"},
+                "name": {"type":"string"},
+                "description": {"type":"string"},
+                "project_id": {"type":"string"},
+                "auto_load": {"type":"array","items":{"type":"string"}},
+                "status": {"type":"string","enum":["pending","active","completed","cancelled"]},
+                "metadata": {"type":"object"}
+            },"required":["task_id"]}
+        }),
+        json!({
+            "name": "delete_task",
+            "description": "Delete a task",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"}
+            },"required":["task_id"]}
+        }),
+        json!({
+            "name": "activate_task",
+            "description": "Activate a task (included in update_context)",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"}
+            },"required":["task_id"]}
+        }),
+        json!({
+            "name": "deactivate_task",
+            "description": "Deactivate the current active task",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        json!({
+            "name": "get_active_task",
+            "description": "Get the currently active task",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        json!({
+            "name": "activate_document",
+            "description": "Activate ANY document (task, project, skill, knowledge doc…) as the seat's context anchor — it is included in update_context and its auto_load links are followed on updates. The effect is identical to activate_task, but for every category.",
+            "inputSchema": {"type":"object","properties":{
+                "document_id": {"type":"string"}
+            },"required":["document_id"]}
+        }),
+        json!({
+            "name": "deactivate_document",
+            "description": "Clear the seat's active document (any category)",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        json!({
+            "name": "get_active_document",
+            "description": "Get the currently active document (any category)",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        json!({
+            "name": "list_tasks",
+            "description": "List your tasks with optional filters",
+            "inputSchema": {"type":"object","properties":{
+                "project_id": {"type":"string"},
+                "status": {"type":"string","enum":["pending","active","completed","cancelled"]},
+                "limit": {"type":"number","default":50}
+            },"required":[]}
+        }),
+        // projects
+        json!({
+            "name": "create_project",
+            "description": "Create a new project",
+            "inputSchema": {"type":"object","properties":{
+                "name": {"type":"string"},
+                "description": {"type":"string","default":""},
+                "auto_load": {"type":"array","items":{"type":"string"}},
+                "metadata": {"type":"object"}
+            },"required":["name"]}
+        }),
+        json!({
+            "name": "update_project",
+            "description": "Update an existing project",
+            "inputSchema": {"type":"object","properties":{
+                "project_id": {"type":"string"},
+                "name": {"type":"string"},
+                "description": {"type":"string"},
+                "auto_load": {"type":"array","items":{"type":"string"}},
+                "status": {"type":"string","enum":["active","archived"]},
+                "metadata": {"type":"object"}
+            },"required":["project_id"]}
+        }),
+        json!({
+            "name": "delete_project",
+            "description": "Delete a project",
+            "inputSchema": {"type":"object","properties":{
+                "project_id": {"type":"string"}
+            },"required":["project_id"]}
+        }),
+        json!({
+            "name": "get_project",
+            "description": "Get project details",
+            "inputSchema": {"type":"object","properties":{
+                "project_id": {"type":"string"}
+            },"required":["project_id"]}
+        }),
+        json!({
+            "name": "list_projects",
+            "description": "List all projects",
+            "inputSchema": {"type":"object","properties":{
+                "status": {"type":"string","enum":["active","archived"]},
+                "limit": {"type":"number","default":50}
+            },"required":[]}
+        }),
+        // profiles
+        json!({
+            "name": "get_user_profile",
+            "description": "Get the current user's behavioural profile",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        json!({
+            "name": "update_user_profile",
+            "description": "Create or update the user's behavioural profile",
+            "inputSchema": {"type":"object","properties":{
+                "content": {"type":"string"}
+            },"required":["content"]}
+        }),
+        json!({
+            "name": "get_seat_profile",
+            "description": "Get the current seat's workspace profile",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        json!({
+            "name": "update_seat_profile",
+            "description": "Create or update the seat's workspace profile",
+            "inputSchema": {"type":"object","properties":{
+                "content": {"type":"string"},
+                "timezone": {"type":"string","description":"IANA timezone, e.g. Europe/Moscow"}
+            },"required":["content"]}
+        }),
+        // pagination
+        json!({
+            "name": "get_page",
+            "description": "Retrieve a page of a paginated response",
+            "inputSchema": {"type":"object","properties":{
+                "response_id": {"type":"string"},
+                "page": {"type":"number"}
+            },"required":["response_id","page"]}
+        }),
+        json!({
+            "name": "delete_response",
+            "description": "Delete a cached paginated response",
+            "inputSchema": {"type":"object","properties":{
+                "response_id": {"type":"string"}
+            },"required":["response_id"]}
+        }),
+        json!({
+            "name": "set_page_limit",
+            "description": "Set the maximum page size (in tokens) for response pagination",
+            "inputSchema": {"type":"object","properties":{
+                "page_token_limit": {"type":"number"}
+            },"required":["page_token_limit"]}
+        }),
+        json!({
+            "name": "get_page_settings",
+            "description": "Get current pagination settings",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        // context
+        json!({
+            "name": "update_context",
+            "description": "Load (and optionally save) project context: base docs + active task + profiles + focuses",
+            "inputSchema": {"type":"object","properties":{
+                "summary": {"type":"string","description":"persists a context snapshot when provided"},
+                "changes": {"type":"array","items":{"type":"string"}},
+                "decisions": {"type":"array","items":{"type":"string"}},
+                "next_steps": {"type":"array","items":{"type":"string"}},
+                "include_base_docs": {"type":"boolean","default":true}
+            },"required":[]}
+        }),
+        json!({
+            "name": "load_module",
+            "description": "Load a public knowledge module (requires knowledge:public:write)",
+            "inputSchema": {"type":"object","properties":{
+                "module_name": {"type":"string"}
+            },"required":["module_name"]}
+        }),
+        json!({
+            "name": "command",
+            "description": "Slash-команды для управления памятью: `/limit N` — лимит контекста, `/ctx` — текущий срез, `/update_context [summary]` / `/save_context <summary>` — как MCP-тулы, `/help` — список. Вызывай, когда пользователь пишет сообщение, начинающееся с '/'.",
+            "inputSchema": {"type":"object","properties":{
+                "input": {"type":"string","description":"строка, начинающаяся с /"}
+            },"required":["input"]}
+        }),
+    ]
 }
 
 fn prompts() -> Vec<Value> {
     vec![
-    json!({
-        "name": "instructions",
-        "description": "Полная рабочая инструкция агента: рабочий процесс, auto_load vs references, рефлексия через истории",
-    }),
-    json!({
-        "name": "check_notifications",
-        "description": "Pop pending notifications for this seat and report them to the user",
-    }),
+        json!({
+            "name": "instructions",
+            "description": "Полная рабочая инструкция агента: рабочий процесс, auto_load vs references, рефлексия через истории",
+        }),
+        json!({
+            "name": "check_notifications",
+            "description": "Pop pending notifications for this seat and report them to the user",
+        }),
     ]
 }
 
@@ -702,163 +751,234 @@ async fn build_context(
     engine: &SlcEngine,
     seat_id: &str,
     summary: &str,
+    changes: &[String],
+    decisions: &[String],
+    next_steps: &[String],
     include_base: bool,
     events: &tokio::sync::broadcast::Sender<Value>,
 ) -> Result<Value, Value> {
-                        let changes: Vec<String> = Vec::new();
-            let decisions: Vec<String> = Vec::new();
-            let next_steps: Vec<String> = Vec::new();
-                        // persist a context snapshot if summary provided
-            let mut save_info = None;
-            if !summary.is_empty() {
-                let mut content = format!("# Context Snapshot\n\n{summary}");
-                if !changes.is_empty() { content.push_str(&format!("\n\n## Changes\n{}", changes.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"))); }
-                if !decisions.is_empty() { content.push_str(&format!("\n\n## Decisions\n{}", decisions.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"))); }
-                if !next_steps.is_empty() { content.push_str(&format!("\n\n## Next Steps\n{}", next_steps.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"))); }
-                let mut meta = slc_core::DocMeta::default();
-                meta.doc_type = Some("CONTEXT_SNAPSHOT".into());
-                meta.seat_id = Some(seat_id.into());
-                let doc_id = uid("ctx");
-                let doc = slc_core::Document::new(doc_id.clone(), slc_core::DocumentCategory::History, content, meta, vec!["context_snapshot".into()], Some(seat_id.into()));
-                engine.store().episodic_insert(&doc).await.map_err(json_err)?;
-                save_info = Some(json!({"success": true, "document_id": doc_id, "message": "Context saved as history snapshot."}));
-            }
-            // Context assembly policy (user-approved):
-            // 1. Documents are NEVER truncated — every included document is
-            //    put in whole. No char-budget truncation, ever.
-            // 2. If the seat's context limit is exceeded, COMPRESSION kicks
-            //    in by dropping whole low-priority blocks (base docs first,
-            //    then profiles), keeping the active document and focuses.
-            // 3. The model is warned about the compression in the reply.
-            let limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
-            let mut docs: Vec<Value> = Vec::new();
-            let mut used = 0usize;
-            let mut push_doc = |docs: &mut Vec<Value>, used: &mut usize, id: &str, ty: &str, content: &str| {
-                *used += id.len() + ty.len() + content.len();
-                docs.push(json!({"id": id, "type": ty, "content": content}));
-            };
-
-            // Blocks in priority order: active document FIRST (never dropped),
-            // then focuses, then profiles, then base docs.
-            let mut active_block: Option<Value> = None;
-            if let Ok(Some(d)) = engine.document_get_active(seat_id).await {
-                used += d.document_id.len() + d.category.as_str().len() + d.content.len();
-                active_block = Some(json!({"id": d.document_id, "type": d.category.as_str(), "name": d.document_id, "content": d.content}));
-            }
-            let mut focus_block: Option<Value> = None;
-            if let Ok(items) = engine.focus_list(seat_id, None).await {
-                if !items.is_empty() {
-                    used += 32;
-                    focus_block = Some(json!({"id": "active_focuses", "type": "focuses", "count": items.len()}));
-                }
-            }
-            let mut profile_blocks: Vec<Value> = Vec::new();
-            if let Ok(Some((content, _))) = engine.get_seat_profile(seat_id).await {
-                used += content.len();
-                profile_blocks.push(json!({"id": format!("seat_profile:{seat_id}"), "type": "seat_profile", "content": content}));
-            }
-            if let Ok(Some(content)) = engine.get_user_profile(seat_id).await {
-                used += content.len();
-                profile_blocks.push(json!({"id": "user_profile", "type": "user_profile", "content": content}));
-            }
-            let mut base_blocks: Vec<Value> = Vec::new();
-            if include_base {
-                for base in ["core_slc_manifest", "core_standards"] {
-                    if let Ok(Some(d)) = engine.get_document(base).await {
-                        used += d.content.len();
-                        base_blocks.push(json!({"id": base, "type": "base", "content": d.content}));
-                    }
-                }
-            }
-
-            // Compression: drop whole blocks by priority until it fits.
-            let mut omitted: Vec<&str> = Vec::new();
-            if used > limit && !base_blocks.is_empty() {
-                for b in &base_blocks {
-                    used = used.saturating_sub(b["content"].as_str().map(str::len).unwrap_or(0));
-                }
-                omitted.push("base_docs");
-                base_blocks.clear();
-            }
-            if used > limit && !profile_blocks.is_empty() {
-                for b in &profile_blocks {
-                    used = used.saturating_sub(b["content"].as_str().map(str::len).unwrap_or(0));
-                }
-                omitted.push("profiles");
-                profile_blocks.clear();
-            }
-            let compressed = !omitted.is_empty();
-
-            if let Some(b) = active_block {
-                docs.push(b);
-            }
-            if let Some(b) = focus_block {
-                docs.push(b);
-            }
-            docs.extend(profile_blocks);
-            docs.extend(base_blocks);
-
-            // Step 2 — intelligent compression of the REMAINING documents
-            // via the reasoning LLM, ONLY when the budget still does not fit
-            // after dropping blocks. Documents are never truncated by hand;
-            // a failed LLM call leaves them whole.
-            let mut llm_compressed: Vec<String> = Vec::new();
-            if used > limit && !docs.is_empty() {
-                // Compress from the least important end (profiles → active).
-                let budget = (limit / 2).max(200);
-                for b in docs.iter_mut().rev() {
-                    if used <= limit {
-                        break;
-                    }
-                    let Some(content) = b["content"].as_str() else { continue };
-                    if content.chars().count() <= budget {
-                        continue;
-                    }
-                    if let Ok(summary) = engine.summarize_text(content, budget).await {
-                        if summary.len() < content.len() {
-                            used = used.saturating_sub(content.len()) + summary.len();
-                            b["content"] = json!(summary);
-                            b["llm_compressed"] = json!(true);
-                            llm_compressed.push(b["id"].as_str().unwrap_or("?").to_string());
-                        }
-                    }
-                }
-            }
-
-            // Warn the model about the compression (never silent).
-            let warning = if compressed || !llm_compressed.is_empty() {
-                let mut parts = Vec::new();
-                if !omitted.is_empty() {
-                    parts.push(format!("исключены целые блоки: {}", omitted.join(", ")));
-                }
-                if !llm_compressed.is_empty() {
-                    parts.push(format!("документы сжаты LLM: {}", llm_compressed.join(", ")));
-                }
-                Some(format!(
-                    "ВНИМАНИЕ: контекст сжат — {}.                      Используй save_context/обогащение, чтобы вернуть нужное.",
-                    parts.join("; ")
-                ))
-            } else {
-                None
-            };
-            // Hook: notify subscribers (SSE) after a context refresh/save so
-            // automation can react (e.g. persist the snapshot elsewhere).
-            if save_info.is_some() || compressed {
-                let _ = events.send(json!({
-                    "type": "context_updated", "seat_id": seat_id,
-                    "compressed": compressed, "used_chars": used, "limit_chars": limit,
-                    "omitted": omitted,
-                    "saved": save_info.as_ref().and_then(|v| v.get("document_id")).cloned(),
-                }));
-            }
-            Ok(json!({"docs": docs, "seat": seat_id, "save_info": save_info,
-                   "limit_chars": limit, "used_chars": used, "compressed": compressed,
-                   "warning": warning}))
+    // persist a context snapshot if summary provided
+    let mut save_info = None;
+    if !summary.is_empty() {
+        let mut content = format!("# Context Snapshot\n\n{summary}");
+        if !changes.is_empty() {
+            content.push_str(&format!(
+                "\n\n## Changes\n{}",
+                changes
+                    .iter()
+                    .map(|c| format!("- {c}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
         }
+        if !decisions.is_empty() {
+            content.push_str(&format!(
+                "\n\n## Decisions\n{}",
+                decisions
+                    .iter()
+                    .map(|c| format!("- {c}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        if !next_steps.is_empty() {
+            content.push_str(&format!(
+                "\n\n## Next Steps\n{}",
+                next_steps
+                    .iter()
+                    .map(|c| format!("- {c}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        let mut meta = slc_core::DocMeta::default();
+        meta.doc_type = Some("CONTEXT_SNAPSHOT".into());
+        meta.seat_id = Some(seat_id.into());
+        let doc_id = uid("ctx");
+        let doc = slc_core::Document::new(
+            doc_id.clone(),
+            slc_core::DocumentCategory::History,
+            content,
+            meta,
+            vec!["context_snapshot".into()],
+            Some(seat_id.into()),
+        );
+        engine
+            .store()
+            .episodic_insert(&doc)
+            .await
+            .map_err(json_err)?;
+        save_info = Some(
+            json!({"success": true, "document_id": doc_id, "message": "Context saved as history snapshot."}),
+        );
+    }
+    // Context assembly policy (user-approved):
+    // 1. Documents are NEVER truncated — every included document is
+    //    put in whole. No char-budget truncation, ever.
+    // 2. If the seat's context limit is exceeded, COMPRESSION kicks
+    //    in by dropping whole low-priority blocks (base docs first,
+    //    then profiles), keeping the active document and focuses.
+    // 3. The model is warned about the compression in the reply.
+    let limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
+    let mut docs: Vec<Value> = Vec::new();
+    // used считаем в СИМВОЛАХ — лимит тоже в символах; байты
+    // (str::len) для кириллицы завышали бы расход в ~2 раза.
+    let mut used = 0usize;
 
+    // Blocks in priority order: active document FIRST (never dropped),
+    // then focuses, then profiles, then base docs.
+    let mut active_block: Option<Value> = None;
+    if let Ok(Some(d)) = engine.document_get_active(seat_id).await {
+        used += d.document_id.chars().count()
+            + d.category.as_str().chars().count()
+            + d.content.chars().count();
+        active_block = Some(
+            json!({"id": d.document_id, "type": d.category.as_str(), "name": d.document_id, "content": d.content}),
+        );
+    }
+    let mut focus_block: Option<Value> = None;
+    if let Ok(items) = engine.focus_list(seat_id, None).await {
+        if !items.is_empty() {
+            used += 32;
+            focus_block =
+                Some(json!({"id": "active_focuses", "type": "focuses", "count": items.len()}));
+        }
+    }
+    let mut profile_blocks: Vec<Value> = Vec::new();
+    if let Ok(Some((content, _))) = engine.get_seat_profile(seat_id).await {
+        used += content.chars().count();
+        profile_blocks.push(json!({"id": format!("seat_profile:{seat_id}"), "type": "seat_profile", "content": content}));
+    }
+    if let Ok(Some(content)) = engine.get_user_profile(seat_id).await {
+        used += content.chars().count();
+        profile_blocks
+            .push(json!({"id": "user_profile", "type": "user_profile", "content": content}));
+    }
+    let mut base_blocks: Vec<Value> = Vec::new();
+    if include_base {
+        for base in ["core_slc_manifest", "core_standards"] {
+            if let Ok(Some(d)) = engine.get_document(base).await {
+                used += d.content.chars().count();
+                base_blocks.push(json!({"id": base, "type": "base", "content": d.content}));
+            }
+        }
+    }
 
-async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, events: &tokio::sync::broadcast::Sender<Value>) -> Result<Value, Value> {
-    engine.seats.ensure_seat(seat_id).await.map_err(|e| json!({"code": -32000, "message": e.to_string()}))?;
+    // Compression: drop whole blocks by priority until it fits.
+    let mut omitted: Vec<&str> = Vec::new();
+    if used > limit && !base_blocks.is_empty() {
+        for b in &base_blocks {
+            used = used.saturating_sub(
+                b["content"]
+                    .as_str()
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0),
+            );
+        }
+        omitted.push("base_docs");
+        base_blocks.clear();
+    }
+    if used > limit && !profile_blocks.is_empty() {
+        for b in &profile_blocks {
+            used = used.saturating_sub(
+                b["content"]
+                    .as_str()
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0),
+            );
+        }
+        omitted.push("profiles");
+        profile_blocks.clear();
+    }
+    let compressed = !omitted.is_empty();
+
+    if let Some(b) = active_block {
+        docs.push(b);
+    }
+    if let Some(b) = focus_block {
+        docs.push(b);
+    }
+    docs.extend(profile_blocks);
+    docs.extend(base_blocks);
+
+    // Step 2 — intelligent compression of the REMAINING documents
+    // via the reasoning LLM, ONLY when the budget still does not fit
+    // after dropping blocks. Documents are never truncated by hand;
+    // a failed LLM call leaves them whole.
+    let mut llm_compressed: Vec<String> = Vec::new();
+    if used > limit && !docs.is_empty() {
+        // Compress from the least important end (profiles → active).
+        let budget = (limit / 2).max(200);
+        for b in docs.iter_mut().rev() {
+            if used <= limit {
+                break;
+            }
+            let Some(content) = b["content"].as_str() else {
+                continue;
+            };
+            if content.chars().count() <= budget {
+                continue;
+            }
+            if let Ok(summary) = engine.summarize_text(content, budget).await {
+                let summary_chars = summary.chars().count();
+                if summary_chars < content.chars().count() {
+                    used = used.saturating_sub(content.chars().count()) + summary_chars;
+                    b["content"] = json!(summary);
+                    b["llm_compressed"] = json!(true);
+                    llm_compressed.push(b["id"].as_str().unwrap_or("?").to_string());
+                }
+            }
+        }
+    }
+
+    // Warn the model about the compression (never silent).
+    let warning = if compressed || !llm_compressed.is_empty() {
+        let mut parts = Vec::new();
+        if !omitted.is_empty() {
+            parts.push(format!("исключены целые блоки: {}", omitted.join(", ")));
+        }
+        if !llm_compressed.is_empty() {
+            parts.push(format!(
+                "документы сжаты LLM: {}",
+                llm_compressed.join(", ")
+            ));
+        }
+        Some(format!(
+            "ВНИМАНИЕ: контекст сжат — {}.                      Используй save_context/обогащение, чтобы вернуть нужное.",
+            parts.join("; ")
+        ))
+    } else {
+        None
+    };
+    // Hook: notify subscribers (SSE) after a context refresh/save so
+    // automation can react (e.g. persist the snapshot elsewhere).
+    if save_info.is_some() || compressed {
+        let _ = events.send(json!({
+            "type": "context_updated", "seat_id": seat_id,
+            "compressed": compressed, "used_chars": used, "limit_chars": limit,
+            "omitted": omitted,
+            "saved": save_info.as_ref().and_then(|v| v.get("document_id")).cloned(),
+        }));
+    }
+    Ok(
+        json!({"docs": docs, "seat": seat_id, "save_info": save_info,
+                   "limit_chars": limit, "used_chars": used, "compressed": compressed,
+                   "warning": warning}),
+    )
+}
+
+async fn call_tool(
+    engine: &SlcEngine,
+    seat_id: &str,
+    name: &str,
+    args: &Value,
+    events: &tokio::sync::broadcast::Sender<Value>,
+) -> Result<Value, Value> {
+    engine
+        .seats
+        .ensure_seat(seat_id)
+        .await
+        .map_err(|e| json!({"code": -32000, "message": e.to_string()}))?;
     let text = match name {
         "command" => {
             let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
@@ -873,30 +993,51 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, 
                     let Some(n) = n else {
                         return Err(json!({"code": -32602, "message": "usage: /limit <chars>"}));
                     };
-                    let ok = engine.seats.set_context_key(seat_id, "context_limit_chars", json!(n)).await.map_err(json_err)?;
-                    Ok(json!({"success": ok, "context_limit_chars": n, "message": "Context limit set"}))
+                    let ok = engine
+                        .seats
+                        .set_context_key(seat_id, "context_limit_chars", json!(n))
+                        .await
+                        .map_err(json_err)?;
+                    Ok(
+                        json!({"success": ok, "context_limit_chars": n, "message": "Context limit set"}),
+                    )
                 }
                 "ctx" => {
                     let limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
                     let seat = engine.seats.get_seat(seat_id).await.map_err(json_err)?;
-                    let active = engine.document_get_active(seat_id).await.map_err(json_err)?;
+                    let active = engine
+                        .document_get_active(seat_id)
+                        .await
+                        .map_err(json_err)?;
                     let focuses = engine.focus_list(seat_id, None).await.map_err(json_err)?;
-                    Ok(json!({"limit_chars": limit, "active_document": active.map(|d| d.document_id),
-                           "focus_count": focuses.len(), "seat_context": seat.map(|s| s.context)}))
+                    Ok(
+                        json!({"limit_chars": limit, "active_document": active.map(|d| d.document_id),
+                           "focus_count": focuses.len(), "seat_context": seat.map(|s| s.context)}),
+                    )
                 }
                 "update_context" => {
                     // Slash-команда = тот же MCP-тул update_context; summary
                     // берётся из остатка строки.
                     let summary = parts.collect::<Vec<_>>().join(" ");
-                    build_context(engine, seat_id, &summary, true, events).await
+                    let empty: Vec<String> = Vec::new();
+                    build_context(
+                        engine, seat_id, &summary, &empty, &empty, &empty, true, events,
+                    )
+                    .await
                 }
                 "save_context" => {
                     // Сохранить снимок = update_context со summary.
                     let summary = parts.collect::<Vec<_>>().join(" ");
                     if summary.is_empty() {
-                        return Err(json!({"code": -32602, "message": "usage: /save_context <summary>"}));
+                        return Err(
+                            json!({"code": -32602, "message": "usage: /save_context <summary>"}),
+                        );
                     }
-                    build_context(engine, seat_id, &summary, true, events).await
+                    let empty: Vec<String> = Vec::new();
+                    build_context(
+                        engine, seat_id, &summary, &empty, &empty, &empty, true, events,
+                    )
+                    .await
                 }
                 "help" => Ok(json!({"commands": [
                     "/limit <chars> — установить лимит контекста (символы)",
@@ -905,14 +1046,21 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, 
                     "/save_context <summary> — сохранить снимок контекста в историю",
                     "/help — этот список",
                 ]})),
-                other => return Err(json!({"code": -32602, "message": format!("unknown command: /{other} — use /help")})),
+                other => {
+                    return Err(
+                        json!({"code": -32602, "message": format!("unknown command: /{other} — use /help")}),
+                    );
+                }
             };
             cmd_result?
         }
         "search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-            let hits = engine.search(query, Some(seat_id), limit).await.map_err(json_err)?;
+            let hits = engine
+                .search(query, Some(seat_id), limit)
+                .await
+                .map_err(json_err)?;
             json!({"results": hits.iter().map(|h| json!({
                 "document_id": h.document.document_id,
                 "category": h.document.category.as_str(),
@@ -922,26 +1070,52 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, 
             })).collect::<Vec<_>>()})
         }
         "get_document" => {
-            let id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let id = args
+                .get("document_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             match engine.get_document(id).await.map_err(json_err)? {
-                Some(d) => json!({"document_id": d.document_id, "category": d.category.as_str(), "content": d.content, "tags": d.tags, "metadata": d.metadata}),
+                Some(d) => {
+                    json!({"document_id": d.document_id, "category": d.category.as_str(), "content": d.content, "tags": d.tags, "metadata": d.metadata})
+                }
                 None => json!({"error": format!("not found: {id}")}),
             }
         }
         "add_document" => {
-            let id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
-            let category = DocumentCategory::parse(args.get("category").and_then(|v| v.as_str()).unwrap_or("custom"))
-                .ok_or_else(|| json!({"code": -32602, "message": "bad category"}))?;
+            let id = args
+                .get("document_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let category = DocumentCategory::parse(
+                args.get("category")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("custom"),
+            )
+            .ok_or_else(|| json!({"code": -32602, "message": "bad category"}))?;
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let folder = args.get("folder").and_then(|v| v.as_str()).map(String::from);
-            let doc = Document::with_folder(id, category, folder, content, DocMeta::default(), vec![], Some(seat_id.into()));
+            let folder = args
+                .get("folder")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let doc = Document::with_folder(
+                id,
+                category,
+                folder,
+                content,
+                DocMeta::default(),
+                vec![],
+                Some(seat_id.into()),
+            );
             engine.add_document(&doc).await.map_err(json_err)?;
             json!({"document_id": doc.document_id})
         }
         "remember" => {
             let event_id = args.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            engine.remember(seat_id, event_id, content).await.map_err(json_err)?;
+            engine
+                .remember(seat_id, event_id, content)
+                .await
+                .map_err(json_err)?;
             json!({"recorded": event_id})
         }
         "recall" => {
@@ -953,12 +1127,12 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, 
                 "content": truncate(&d.content, 1000),
             })).collect::<Vec<_>>()})
         }
-        "seat_info" => {
-            match engine.seats.get_seat(seat_id).await.map_err(json_err)? {
-                Some(s) => json!({"seat_id": s.seat_id, "status": format!("{:?}", s.status), "usage_stats": s.usage_stats}),
-                None => json!({"seat_id": seat_id}),
+        "seat_info" => match engine.seats.get_seat(seat_id).await.map_err(json_err)? {
+            Some(s) => {
+                json!({"seat_id": s.seat_id, "status": format!("{:?}", s.status), "usage_stats": s.usage_stats})
             }
-        }
+            None => json!({"seat_id": seat_id}),
+        },
         "compress_now" => {
             let r = engine.compress(seat_id).await.map_err(json_err)?;
             json!({"l1_to_l2": r.l1_to_l2, "l2_to_l3": r.l2_to_l3, "l3_to_l4": r.l3_to_l4})
@@ -969,17 +1143,46 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, 
         }
         "focus_add" => {
             let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
-            let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let priority = args.get("priority").and_then(|v| v.as_i64()).unwrap_or(5);
-            let depends_on: Vec<String> = args.get("depends_on").and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-            let mind_type = args.get("mind_type").and_then(|v| v.as_str()).map(String::from);
-            let item = engine.focus_add(seat_id, title, description, priority, &depends_on, mind_type.as_deref()).await.map_err(json_err)?;
+            let depends_on: Vec<String> = args
+                .get("depends_on")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mind_type = args
+                .get("mind_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let item = engine
+                .focus_add(
+                    seat_id,
+                    title,
+                    description,
+                    priority,
+                    &depends_on,
+                    mind_type.as_deref(),
+                )
+                .await
+                .map_err(json_err)?;
             json!({"focus_id": item.focus_id, "priority": item.priority})
         }
         "focus_list" => {
-            let mind_type = args.get("mind_type").and_then(|v| v.as_str()).and_then(parse_mind);
-            let items = engine.focus_list(seat_id, mind_type).await.map_err(json_err)?;
+            let mind_type = args
+                .get("mind_type")
+                .and_then(|v| v.as_str())
+                .and_then(parse_mind);
+            let items = engine
+                .focus_list(seat_id, mind_type)
+                .await
+                .map_err(json_err)?;
             json!({"focuses": items.iter().map(|f| json!({
                 "focus_id": f.focus_id, "title": f.title, "description": f.description,
                 "priority": f.priority, "depends_on": f.depends_on,
@@ -988,29 +1191,48 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, 
         "focus_update" => {
             let focus_id = args.get("focus_id").and_then(|v| v.as_str()).unwrap_or("");
             let title = args.get("title").and_then(|v| v.as_str()).map(String::from);
-            let description = args.get("description").and_then(|v| v.as_str()).map(String::from);
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let priority = args.get("priority").and_then(|v| v.as_i64());
-            let depends_on: Option<Vec<String>> = args.get("depends_on").and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
-            let ok = engine.focus_update(seat_id, focus_id, title.as_deref(), description.as_deref(), priority, depends_on.as_deref()).await.map_err(json_err)?;
+            let depends_on: Option<Vec<String>> =
+                args.get("depends_on").and_then(|v| v.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                });
+            let ok = engine
+                .focus_update(
+                    seat_id,
+                    focus_id,
+                    title.as_deref(),
+                    description.as_deref(),
+                    priority,
+                    depends_on.as_deref(),
+                )
+                .await
+                .map_err(json_err)?;
             json!({"updated": ok})
         }
         "focus_remove" => {
             let focus_id = args.get("focus_id").and_then(|v| v.as_str()).unwrap_or("");
-            let ok = engine.focus_remove(seat_id, focus_id).await.map_err(json_err)?;
+            let ok = engine
+                .focus_remove(seat_id, focus_id)
+                .await
+                .map_err(json_err)?;
             json!({"removed": ok})
         }
-        
-        
-        
-        
-        
+
         "reminder_create" => {
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let remind_at = args.get("remind_at").and_then(|v| v.as_str()).unwrap_or("");
             let mind_type = args.get("mind_type").and_then(|v| v.as_str());
             let dt = slc_core::parse_remind_at(remind_at).map_err(json_err)?;
-            let r = engine.reminder_create(seat_id, content, dt, mind_type).await.map_err(json_err)?;
+            let r = engine
+                .reminder_create(seat_id, content, dt, mind_type)
+                .await
+                .map_err(json_err)?;
             json!({"reminder_id": r.reminder_id, "remind_at": r.remind_at.to_rfc3339()})
         }
         "reminder_list" => {
@@ -1021,13 +1243,22 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, 
             })).collect::<Vec<_>>()})
         }
         "reminder_cancel" => {
-            let reminder_id = args.get("reminder_id").and_then(|v| v.as_str()).unwrap_or("");
-            let ok = engine.reminder_cancel(seat_id, reminder_id).await.map_err(json_err)?;
+            let reminder_id = args
+                .get("reminder_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ok = engine
+                .reminder_cancel(seat_id, reminder_id)
+                .await
+                .map_err(json_err)?;
             json!({"cancelled": ok})
         }
         "pop_notifications" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-            let items = engine.pop_notifications(seat_id, limit).await.map_err(json_err)?;
+            let items = engine
+                .pop_notifications(seat_id, limit)
+                .await
+                .map_err(json_err)?;
             json!({"notifications": items.iter().map(|n| json!({
                 "notification_id": n.notification_id, "source": n.source,
                 "title": n.title, "body": n.body, "metadata": n.metadata,
@@ -1048,51 +1279,97 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, 
         // tasks
         "create_task" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let project_id = args.get("project_id").and_then(|v| v.as_str());
             let auto_load = str_array(args, "auto_load");
             let metadata = args.get("metadata").cloned().unwrap_or(json!({}));
-            let t = engine.task_create(seat_id, name, description, project_id, &auto_load, &metadata).await.map_err(json_err)?;
+            let t = engine
+                .task_create(
+                    seat_id,
+                    name,
+                    description,
+                    project_id,
+                    &auto_load,
+                    &metadata,
+                )
+                .await
+                .map_err(json_err)?;
             json!({"success": true, "task_id": t.task_id, "name": t.name, "project_id": t.project_id, "message": format!("Task '{}' created", t.name)})
         }
         "update_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
             let description = args.get("description").and_then(|v| v.as_str());
-            let project_id = args.get("project_id").and_then(|v| v.as_str()).map(|p| if p.is_empty() { None } else { Some(p) }).flatten();
+            let project_id = args
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .map(|p| if p.is_empty() { None } else { Some(p) })
+                .flatten();
             let project_id = project_id.map(Some);
             let auto_load = args.get("auto_load").map(|_| str_array(args, "auto_load"));
             let status = args.get("status").and_then(|v| v.as_str());
             let metadata = args.get("metadata").cloned();
-            match engine.task_update(seat_id, task_id, name, description, project_id, auto_load.as_deref(), status, metadata.as_ref()).await.map_err(json_err)? {
+            match engine
+                .task_update(
+                    seat_id,
+                    task_id,
+                    name,
+                    description,
+                    project_id,
+                    auto_load.as_deref(),
+                    status,
+                    metadata.as_ref(),
+                )
+                .await
+                .map_err(json_err)?
+            {
                 Some(_) => json!({"success": true, "task_id": task_id, "message": "Task updated"}),
                 None => json!({"success": false, "error": format!("Task not found: {task_id}")}),
             }
         }
         "delete_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            let ok = engine.task_delete(seat_id, task_id).await.map_err(json_err)?;
+            let ok = engine
+                .task_delete(seat_id, task_id)
+                .await
+                .map_err(json_err)?;
             json!({"success": ok, "task_id": task_id, "message": if ok { "Task deleted" } else { "Task not found" }})
         }
         "activate_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            let ok = engine.task_activate(seat_id, task_id).await.map_err(json_err)?;
+            let ok = engine
+                .task_activate(seat_id, task_id)
+                .await
+                .map_err(json_err)?;
             json!({"success": ok, "task_id": task_id, "message": "Task activated"})
         }
         "deactivate_task" => {
             // clear the active task pointer
-            engine.seats.set_active_task(seat_id, None, None).await.map_err(json_err)?;
+            engine
+                .seats
+                .set_active_task(seat_id, None, None)
+                .await
+                .map_err(json_err)?;
             json!({"success": true, "seat_id": seat_id, "message": "Task deactivated"})
         }
-        "get_active_task" => {
-            match engine.task_get_active(seat_id).await.map_err(json_err)? {
-                Some(t) => json!({"success": true, "has_active_task": true, "task_id": t.task_id, "name": t.name, "description": t.description, "status": t.status, "project_id": t.project_id}),
-                None => json!({"success": true, "has_active_task": false, "message": "No active task"}),
+        "get_active_task" => match engine.task_get_active(seat_id).await.map_err(json_err)? {
+            Some(t) => {
+                json!({"success": true, "has_active_task": true, "task_id": t.task_id, "name": t.name, "description": t.description, "status": t.status, "project_id": t.project_id})
             }
-        }
+            None => json!({"success": true, "has_active_task": false, "message": "No active task"}),
+        },
         "activate_document" => {
-            let document_id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
-            let ok = engine.document_activate(seat_id, document_id).await.map_err(json_err)?;
+            let document_id = args
+                .get("document_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ok = engine
+                .document_activate(seat_id, document_id)
+                .await
+                .map_err(json_err)?;
             if ok {
                 // Hook: notify subscribers (SSE) so automation can react.
                 let _ = events.send(json!({
@@ -1104,20 +1381,37 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, 
             }
         }
         "deactivate_document" => {
-            engine.document_deactivate(seat_id).await.map_err(json_err)?;
+            engine
+                .document_deactivate(seat_id)
+                .await
+                .map_err(json_err)?;
             json!({"success": true, "message": "Active document cleared"})
         }
         "get_active_document" => {
-            match engine.document_get_active(seat_id).await.map_err(json_err)? {
-                Some(d) => json!({"success": true, "has_active_document": true, "document_id": d.document_id, "category": d.category.as_str(), "content": truncate(&d.content, 2000), "tags": d.tags}),
-                None => json!({"success": true, "has_active_document": false, "message": "No active document"}),
+            match engine
+                .document_get_active(seat_id)
+                .await
+                .map_err(json_err)?
+            {
+                Some(d) => {
+                    json!({"success": true, "has_active_document": true, "document_id": d.document_id, "category": d.category.as_str(), "content": truncate(&d.content, 2000), "tags": d.tags})
+                }
+                None => {
+                    json!({"success": true, "has_active_document": false, "message": "No active document"})
+                }
             }
         }
         "list_tasks" => {
-            let project_id = args.get("project_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            let project_id = args
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
             let status = args.get("status").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-            let tasks = engine.task_list(seat_id, project_id, status, limit).await.map_err(json_err)?;
+            let tasks = engine
+                .task_list(seat_id, project_id, status, limit)
+                .await
+                .map_err(json_err)?;
             json!({"success": true, "tasks": tasks.iter().map(|t| json!({
                 "task_id": t.task_id, "name": t.name, "status": t.status,
                 "project_id": t.project_id, "auto_load_count": t.auto_load.len(),
@@ -1126,96 +1420,177 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, 
         // projects
         "create_project" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let auto_load = str_array(args, "auto_load");
             let metadata = args.get("metadata").cloned().unwrap_or(json!({}));
-            let p = engine.project_create(seat_id, name, description, &auto_load, &metadata).await.map_err(json_err)?;
+            let p = engine
+                .project_create(seat_id, name, description, &auto_load, &metadata)
+                .await
+                .map_err(json_err)?;
             json!({"success": true, "project_id": p.project_id, "name": p.name, "message": format!("Project '{}' created", p.name)})
         }
         "update_project" => {
-            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let project_id = args
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
             let description = args.get("description").and_then(|v| v.as_str());
             let auto_load = args.get("auto_load").map(|_| str_array(args, "auto_load"));
             let status = args.get("status").and_then(|v| v.as_str());
             let metadata = args.get("metadata").cloned();
-            match engine.project_update(seat_id, project_id, name, description, auto_load.as_deref(), status, metadata.as_ref()).await.map_err(json_err)? {
-                Some(_) => json!({"success": true, "project_id": project_id, "message": "Project updated"}),
-                None => json!({"success": false, "error": format!("Project not found: {project_id}")}),
+            match engine
+                .project_update(
+                    seat_id,
+                    project_id,
+                    name,
+                    description,
+                    auto_load.as_deref(),
+                    status,
+                    metadata.as_ref(),
+                )
+                .await
+                .map_err(json_err)?
+            {
+                Some(_) => {
+                    json!({"success": true, "project_id": project_id, "message": "Project updated"})
+                }
+                None => {
+                    json!({"success": false, "error": format!("Project not found: {project_id}")})
+                }
             }
         }
         "delete_project" => {
-            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
-            let ok = engine.project_delete(seat_id, project_id).await.map_err(json_err)?;
+            let project_id = args
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ok = engine
+                .project_delete(seat_id, project_id)
+                .await
+                .map_err(json_err)?;
             json!({"success": ok, "project_id": project_id, "message": if ok { "Project deleted" } else { "Project not found" }})
         }
         "get_project" => {
-            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
-            match engine.project_get(seat_id, project_id).await.map_err(json_err)? {
-                Some(p) => json!({"success": true, "project_id": p.project_id, "name": p.name, "description": p.description, "status": p.status, "auto_load": p.auto_load}),
-                None => json!({"success": false, "error": format!("Project not found: {project_id}")}),
+            let project_id = args
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match engine
+                .project_get(seat_id, project_id)
+                .await
+                .map_err(json_err)?
+            {
+                Some(p) => {
+                    json!({"success": true, "project_id": p.project_id, "name": p.name, "description": p.description, "status": p.status, "auto_load": p.auto_load})
+                }
+                None => {
+                    json!({"success": false, "error": format!("Project not found: {project_id}")})
+                }
             }
         }
         "list_projects" => {
             let status = args.get("status").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-            let projects = engine.project_list(seat_id, status, limit).await.map_err(json_err)?;
+            let projects = engine
+                .project_list(seat_id, status, limit)
+                .await
+                .map_err(json_err)?;
             json!({"success": true, "projects": projects.iter().map(|p| json!({
                 "project_id": p.project_id, "name": p.name, "status": p.status,
                 "auto_load_count": p.auto_load.len(),
             })).collect::<Vec<_>>(), "count": projects.len()})
         }
         // profiles
-        "get_user_profile" => {
-            match engine.get_user_profile(seat_id).await.map_err(json_err)? {
-                Some(content) => json!({"exists": true, "content": content}),
-                None => json!({"exists": false, "hint": "Create with update_user_profile(content)"}),
-            }
-        }
+        "get_user_profile" => match engine.get_user_profile(seat_id).await.map_err(json_err)? {
+            Some(content) => json!({"exists": true, "content": content}),
+            None => json!({"exists": false, "hint": "Create with update_user_profile(content)"}),
+        },
         "update_user_profile" => {
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let existed = engine.upsert_user_profile(seat_id, content).await.map_err(json_err)?;
+            let existed = engine
+                .upsert_user_profile(seat_id, content)
+                .await
+                .map_err(json_err)?;
             json!({"success": true, "action": if existed { "updated" } else { "created" }})
         }
-        "get_seat_profile" => {
-            match engine.get_seat_profile(seat_id).await.map_err(json_err)? {
-                Some((content, tz)) => json!({"exists": true, "seat_id": seat_id, "timezone": tz, "content": content}),
-                None => json!({"exists": false, "hint": "Create with update_seat_profile(content)"}),
+        "get_seat_profile" => match engine.get_seat_profile(seat_id).await.map_err(json_err)? {
+            Some((content, tz)) => {
+                json!({"exists": true, "seat_id": seat_id, "timezone": tz, "content": content})
             }
-        }
+            None => json!({"exists": false, "hint": "Create with update_seat_profile(content)"}),
+        },
         "update_seat_profile" => {
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let timezone = args.get("timezone").and_then(|v| v.as_str());
-            let existed = engine.upsert_seat_profile(seat_id, content, timezone).await.map_err(json_err)?;
+            let existed = engine
+                .upsert_seat_profile(seat_id, content, timezone)
+                .await
+                .map_err(json_err)?;
             json!({"success": true, "action": if existed { "updated" } else { "created" }, "seat_id": seat_id})
         }
         // pagination
         "get_page" => {
-            let response_id = args.get("response_id").and_then(|v| v.as_str()).unwrap_or("");
+            let response_id = args
+                .get("response_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let page = args.get("page").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-            engine.get_page(seat_id, response_id, page).await.map_err(json_err)?
+            engine
+                .get_page(seat_id, response_id, page)
+                .await
+                .map_err(json_err)?
         }
         "delete_response" => {
-            let response_id = args.get("response_id").and_then(|v| v.as_str()).unwrap_or("");
-            engine.delete_response(response_id).await.map_err(json_err)?
+            let response_id = args
+                .get("response_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            engine
+                .delete_response(response_id)
+                .await
+                .map_err(json_err)?
         }
         "set_page_limit" => {
-            let tokens = args.get("page_token_limit").and_then(|v| v.as_u64()).unwrap_or(16000) as usize;
+            let tokens = args
+                .get("page_token_limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(16000) as usize;
             engine.set_page_limit(tokens).await.map_err(json_err)?
         }
-        "get_page_settings" => {
-            engine.page_settings().await.map_err(json_err)?
-        }
+        "get_page_settings" => engine.page_settings().await.map_err(json_err)?,
         "update_context" => {
             let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-            let include_base = args.get("include_base_docs").and_then(|v| v.as_bool()).unwrap_or(true);
-            build_context(engine, seat_id, summary, include_base, events).await?
+            let include_base = args
+                .get("include_base_docs")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let changes = str_array(args, "changes");
+            let decisions = str_array(args, "decisions");
+            let next_steps = str_array(args, "next_steps");
+            build_context(
+                engine,
+                seat_id,
+                summary,
+                &changes,
+                &decisions,
+                &next_steps,
+                include_base,
+                events,
+            )
+            .await?
         }
         "load_module" => {
             // Requires knowledge:public:write; in embedded/legacy modes every
             // principal is a superuser, so accept. Module seeding is out of
             // scope for the standalone engine — report the known modules.
-            let module = args.get("module_name").and_then(|v| v.as_str()).unwrap_or("");
+            let module = args
+                .get("module_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let available = ["languages", "methodologies", "security"];
             if !available.contains(&module) {
                 json!({"success": false, "error": format!("Unknown module: {module}"), "available_modules": available})
@@ -1264,7 +1639,11 @@ fn parse_mind(s: &str) -> Option<slc_core::MindType> {
 fn str_array(args: &Value, key: &str) -> Vec<String> {
     args.get(key)
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
