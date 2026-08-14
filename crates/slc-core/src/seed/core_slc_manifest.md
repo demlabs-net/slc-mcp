@@ -17,15 +17,20 @@ Context is assembled from blocks by priority (highest → lowest):
 1. **Active document** — task/document the agent works on. NEVER dropped.
 2. **Focus items** — user's current priorities. NEVER dropped.
 3. **Profiles** — seat profile + user profile. Dropped when budget exceeded.
-4. **Core documents** — system knowledge. NEVER dropped.
+4. **Core documents** — system knowledge. Dropped LAST (least important
+   first; the manifest survives longest) when the budget still overflows.
 
 Compression on budget overflow:
 - Documents are NEVER truncated — only dropped whole or LLM-summarized.
-- Profiles drop first (least important first).
+- Overflow = token budget exceeded OR tool output over the byte cap
+  (`SLC_TOOL_OUTPUT_MAX_BYTES`, default 48000 — harnesses truncate larger
+  tool outputs silently).
+- Profiles drop first, then core docs one by one from the least important.
 - If still over — LLM summarization of remaining docs.
 - Response includes `compressed: true` + `warning`.
 
-Budget: `/limit N` (characters) or `SLC_CONTEXT_LIMIT_CHARS` env var. Default: 300000.
+Budget: `/limit N` (TOKENS; ~3 chars per token) or
+`SLC_CONTEXT_LIMIT_TOKENS` env var. Default: 100000 tokens (≈300000 chars).
 
 ## Documents
 
@@ -142,7 +147,7 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 
 | Command | Description |
 |---------|-------------|
-| `/limit N` | Context limit in characters |
+| `/limit N` | Context limit in TOKENS (~3 chars per token) |
 | `/ctx` | Show current context |
 | `/search <query>` | Search KB |
 | `/update_context [summary]` | Assemble context |
@@ -154,7 +159,8 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SLC_VAULT_PATH` | `~/.slc/vault` | Vault path |
-| `SLC_CONTEXT_LIMIT_CHARS` | `300000` | Context limit (characters) |
+| `SLC_CONTEXT_LIMIT_TOKENS` | `100000` | Context limit (tokens; ~3 chars each) |
+| `SLC_TOOL_OUTPUT_MAX_BYTES` | `48000` | Byte cap on tool output vs harness truncation (0 = off) |
 | `SLC_LLM` | auto | Provider: hash/ollama/lmstudio/candle |
 | `LMSTUDIO_URL` | — | LM Studio URL |
 | `LMSTUDIO_MODEL` | `google/gemma-4-e4b` | Reasoning model |
