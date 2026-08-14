@@ -10,6 +10,9 @@
 //! - Ships as `rlib` (embedded in Rust apps, e.g. vs-memory) + `staticlib`
 //!   (C ABI) + consumed by the standalone `slc-mcp` binary (MCP server/CLI).
 
+#[cfg(feature = "candle-emb")]
+pub mod candle_emb;
+
 pub mod auth;
 pub mod error;
 pub mod focus;
@@ -53,6 +56,17 @@ pub enum StorageKind {
     Sqlite,
     /// MongoDB (self-hosted or Atlas) — shared-server option.
     MongoDB,
+}
+
+/// Отчёт пересборки эмбеддингов (`reindex-embeddings`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReindexReport {
+    /// Документов всего (в выборке).
+    pub total: usize,
+    /// Пересобрано эмбеддингов (best-effort).
+    pub reindexed: usize,
+    /// Пропущено (другой сид при --seat).
+    pub skipped: usize,
 }
 
 /// Engine configuration.
@@ -141,13 +155,13 @@ impl SlcEngine {
             }
             StorageKind::MongoDB => unreachable!(),
         };
-        Ok(Self::with(store, Self::pick_llm(&config), config))
+        Ok(Self::with(store, Self::pick_llm(), config))
     }
 
     /// Async open — required for the MongoDB backend, fine for the others.
     pub async fn open_async(config: SlcConfig) -> SlcResult<Self> {
         let store = Self::open_store(&config).await?;
-        Ok(Self::with(store, Self::pick_llm(&config), config))
+        Ok(Self::with(store, Self::pick_llm(), config))
     }
 
     /// Open with an externally-built LLM (e.g. MCP-sampling fallback).
@@ -176,23 +190,52 @@ impl SlcEngine {
         })
     }
 
-    /// Provider auto-select: LM Studio (OpenAI-compatible) when configured,
-    /// else Ollama — same rule as the Python legacy.
-    fn pick_llm(config: &SlcConfig) -> std::sync::Arc<dyn LlmClient> {
-        if std::env::var("SLC_LLM").as_deref() == Ok("hash") {
+    /// Provider selection (user-approved cascade):
+    /// 1. Explicit `SLC_LLM` wins: `hash` | `ollama` | `lmstudio` | `candle`.
+    /// 2. Otherwise legacy envs: `LMSTUDIO_URL` → LM Studio, `OLLAMA_ENDPOINT`
+    ///    → Ollama — an explicit provider stays the provider even when it
+    ///    fails (search degrades to text-only, no silent switching).
+    /// 3. Nothing configured → onboard: GPU + downloaded model → candle
+    ///    embeddings (bge-m3); otherwise → CPU-hash embeddings. The model is
+    ///    NEVER auto-downloaded — `slc-mcp init` prepares it.
+    fn pick_llm() -> std::sync::Arc<dyn LlmClient> {
+        match std::env::var("SLC_LLM").as_deref() {
+            Ok("hash") => return std::sync::Arc::new(llm::CpuHashLlm),
+            Ok("ollama") => return std::sync::Arc::new(OllamaClient::from_env()),
+            Ok("lmstudio") => {
+                if let Some(c) = LmStudioClient::from_env() {
+                    return std::sync::Arc::new(c);
+                }
+            }
+            Ok("candle") => {
+                #[cfg(feature = "candle-emb")]
+                return std::sync::Arc::new(candle_emb::CandleEmbeddingLlm::new());
+            }
+            _ => {}
+        }
+        if let Some(c) = LmStudioClient::from_env() {
+            return std::sync::Arc::new(c);
+        }
+        if std::env::var("OLLAMA_ENDPOINT").is_ok() {
+            return std::sync::Arc::new(OllamaClient::from_env());
+        }
+        #[cfg(feature = "candle-emb")]
+        {
+            let onboard = candle_emb::CandleEmbeddingLlm::new();
+            if onboard.gpu_requested() && onboard.model_cached() {
+                tracing::info!("GPU detected — onboard candle embeddings (bge-m3)");
+                return std::sync::Arc::new(onboard);
+            }
+            if onboard.gpu_requested() {
+                tracing::warn!("GPU detected, but the embedding model is not downloaded — run `slc-mcp init`; CPU-hash embeddings for now");
+                return std::sync::Arc::new(llm::CpuHashLlm);
+            }
+            tracing::warn!("no GPU — CPU-hash embeddings by default; force local CPU inference with SLC_LLM=candle");
             return std::sync::Arc::new(llm::CpuHashLlm);
         }
-        match &config.lmstudio_url {
-            Some(url) => std::sync::Arc::new(LmStudioClient::new(
-                url,
-                &config.lmstudio_model,
-                &config.lmstudio_embed_model,
-            )),
-            None => std::sync::Arc::new(OllamaClient::new(
-                &config.ollama_endpoint,
-                &config.ollama_reasoning_model,
-                &config.ollama_embedding_model,
-            )),
+        #[cfg(not(feature = "candle-emb"))]
+        {
+            std::sync::Arc::new(llm::CpuHashLlm)
         }
     }
 
@@ -247,7 +290,64 @@ impl SlcEngine {
     // ── knowledge base (RAG-eligible) ────────────────────────────
 
     pub async fn add_document(&self, doc: &Document) -> SlcResult<()> {
-        self.store.kb_insert(doc).await
+        self.store.kb_insert(doc).await?;
+        // Best-effort embedding so semantic search covers KB documents (never
+        // fails the insert; the model may still be downloading).
+        self.embed_document(doc).await;
+        Ok(())
+    }
+
+    /// Embed one document for semantic search (chunk_total = 1; long docs
+    /// are truncated by the model's max length). Best-effort by design.
+    async fn embed_document(&self, doc: &Document) {
+        let Ok(emb) = self
+            .llm
+            .generate_embedding_kind(&doc.content, crate::llm::EmbeddingKind::Passage)
+            .await
+        else {
+            return;
+        };
+        let (scope, seat_id) = match &doc.seat_id {
+            Some(s) => (model::EmbeddingScope::Private, Some(s.clone())),
+            None => (model::EmbeddingScope::Public, None),
+        };
+        let rec = model::EmbeddingRecord {
+            document_id: doc.document_id.clone(),
+            chunk_index: 0,
+            chunk_total: 1,
+            embedding: emb.clone(),
+            embedding_model: self.llm.embedding_model_name(),
+            embedding_dimension: emb.len(),
+            generated_at: chrono::Utc::now(),
+            scope,
+            seat_id,
+        };
+        let _ = self.store.delete_embeddings(&doc.document_id).await;
+        let _ = self.store.insert_embeddings(&[rec]).await;
+    }
+
+    /// Пересобрать эмбеддинги всех документов (или одного сита) текущим
+    /// embedding-провайдером — после смены модели/настроек (`slc-mcp
+    /// reindex-embeddings`). Старые записи с другой размерностью всё равно
+    /// отфильтровываются поиском, но пересборка возвращает семантику.
+    pub async fn reindex_embeddings(&self, seat: Option<&str>) -> SlcResult<ReindexReport> {
+        let docs = self
+            .store
+            .kb_find(&storage::DocFilter::default(), &storage::DocSort::by_updated(storage::SortDir::Desc), usize::MAX)
+            .await?;
+        let mut done = 0usize;
+        let mut skipped = 0usize;
+        for doc in &docs {
+            if let Some(s) = seat {
+                if doc.seat_id.as_deref() != Some(s) {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            self.embed_document(doc).await;
+            done += 1;
+        }
+        Ok(ReindexReport { total: docs.len(), reindexed: done, skipped })
     }
 
     pub async fn get_document(&self, document_id: &str) -> SlcResult<Option<Document>> {

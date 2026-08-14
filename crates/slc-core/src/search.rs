@@ -192,11 +192,22 @@ pub struct SearchService {
     semantic_weight: f32,
     text_weight: f32,
     rank: RankWeights,
+    /// One-shot embedding refresh per process: when the embedding model
+    /// changes (e.g. hash → candle), stale records are re-generated lazily
+    /// on the first search.
+    refreshed: std::sync::Mutex<bool>,
 }
 
 impl SearchService {
     pub fn new(store: std::sync::Arc<dyn StorageBackend>, llm: std::sync::Arc<dyn LlmClient>, semantic_weight: f32, text_weight: f32) -> Self {
-        SearchService { store, llm, semantic_weight, text_weight, rank: RankWeights::default() }
+        SearchService {
+            store,
+            llm,
+            semantic_weight,
+            text_weight,
+            rank: RankWeights::default(),
+            refreshed: std::sync::Mutex::new(false),
+        }
     }
 
     pub async fn search(
@@ -250,13 +261,24 @@ impl SearchService {
 
     /// Cosine over embedding chunks; best score per document.
     async fn semantic_search(&self, query: &str, filter: &DocFilter, limit: usize) -> SlcResult<Vec<SearchHit>> {
-        let qv = self.llm.generate_embedding(query).await?;
+        let qv = self
+            .llm
+            .generate_embedding_kind(query, crate::llm::EmbeddingKind::Query)
+            .await?;
+        // One-shot migration: re-embed documents whose records were produced
+        // by a different model (dimension mismatch), so switching the
+        // embedding backend doesn't leave the KB unsearchable.
+        self.refresh_stale_embeddings(qv.len(), filter).await;
 
         let mut by_doc: HashMap<String, f32> = HashMap::new();
         for scope in [EmbeddingScope::Public, EmbeddingScope::Private] {
             let seat = if scope == EmbeddingScope::Private { filter.visible_to.clone() } else { None };
             let records = self.store.all_embeddings(scope, seat.as_deref()).await?;
             for r in records {
+                // Records from another embedding model are incomparable.
+                if r.embedding_dimension != qv.len() {
+                    continue;
+                }
                 let s = cosine_similarity(&qv, &r.embedding);
                 let e = by_doc.entry(r.document_id.clone()).or_insert(0.0);
                 if s > *e {
@@ -277,6 +299,67 @@ impl SearchService {
             }
         }
         Ok(out)
+    }
+
+    /// Re-embed documents whose embedding records came from another model
+    /// (dimension mismatch). Best-effort and one-shot per process: failures
+    /// (model still downloading, transient errors) just skip that document —
+    /// the search proceeds with whatever is compatible.
+    async fn refresh_stale_embeddings(&self, dim: usize, filter: &DocFilter) {
+        {
+            let mut done = self.refreshed.lock().unwrap();
+            if *done {
+                return;
+            }
+            *done = true;
+        }
+        let mut stale: Vec<String> = Vec::new();
+        for scope in [EmbeddingScope::Public, EmbeddingScope::Private] {
+            let seat = if scope == EmbeddingScope::Private { filter.visible_to.clone() } else { None };
+            match self.store.all_embeddings(scope, seat.as_deref()).await {
+                Ok(records) => {
+                    for r in records {
+                        if r.embedding_dimension != dim && !stale.contains(&r.document_id) {
+                            stale.push(r.document_id);
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!("refresh: all_embeddings failed: {e}"),
+            }
+        }
+        if stale.is_empty() {
+            return;
+        }
+        tracing::info!(count = stale.len(), "re-embedding documents from a previous embedding model");
+        for id in stale {
+            let Ok(Some(doc)) = self.store.kb_get(&id).await else {
+                continue;
+            };
+            let Ok(emb) = self
+                .llm
+                .generate_embedding_kind(&doc.content, crate::llm::EmbeddingKind::Passage)
+                .await
+            else {
+                continue; // model not ready yet — next process run will retry
+            };
+            let (scope, seat_id) = match &doc.seat_id {
+                Some(s) => (EmbeddingScope::Private, Some(s.clone())),
+                None => (EmbeddingScope::Public, None),
+            };
+            let rec = crate::model::EmbeddingRecord {
+                document_id: id.clone(),
+                chunk_index: 0,
+                chunk_total: 1,
+                embedding: emb.clone(),
+                embedding_model: self.llm.embedding_model_name(),
+                embedding_dimension: emb.len(),
+                generated_at: chrono::Utc::now(),
+                scope,
+                seat_id,
+            };
+            let _ = self.store.delete_embeddings(&id).await;
+            let _ = self.store.insert_embeddings(&[rec]).await;
+        }
     }
 
     /// BM25 over tokenized KB content (candidate set = filtered docs).

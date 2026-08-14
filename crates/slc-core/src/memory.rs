@@ -335,6 +335,7 @@ impl<S: StorageBackend, L: LlmClient> MemoryConsolidator<S, L> {
         let records = self.store.all_embeddings(crate::model::EmbeddingScope::Public, None).await?;
         for r in records {
             if r.document_id.starts_with("learned_fact_")
+                && r.embedding_dimension == qv.len()
                 && crate::search::cosine_similarity(&qv, &r.embedding) > DUPLICATE_THRESHOLD
             {
                 return Ok(true);
@@ -378,7 +379,7 @@ impl<S: StorageBackend, L: LlmClient> MemoryConsolidator<S, L> {
                     chunk_index: 0,
                     chunk_total: 1,
                     embedding: emb.clone(),
-                    embedding_model: "ollama".into(),
+                    embedding_model: self.llm.embedding_model_name(),
                     embedding_dimension: emb.len(),
                     generated_at: now,
                     scope: crate::model::EmbeddingScope::Public,
