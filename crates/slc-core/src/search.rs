@@ -38,11 +38,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         nb += y * y;
     }
     let mag = na.sqrt() * nb.sqrt();
-    if mag <= f32::EPSILON {
-        0.0
-    } else {
-        dot / mag
-    }
+    if mag <= f32::EPSILON { 0.0 } else { dot / mag }
 }
 
 /// Lowercase word tokens (unicode letters/digits runs).
@@ -73,7 +69,12 @@ fn term_freq(tokens: &[String]) -> HashMap<String, usize> {
 
 /// BM25-ish text score: sum over query terms of `(1 + ln tf) * idf`,
 /// length-normalized. IDF is computed over the candidate set.
-fn bm25(query_terms: &[String], doc_tokens: &[String], df: &HashMap<String, usize>, total_docs: usize) -> f32 {
+fn bm25(
+    query_terms: &[String],
+    doc_tokens: &[String],
+    df: &HashMap<String, usize>,
+    total_docs: usize,
+) -> f32 {
     let tf = term_freq(doc_tokens);
     let doc_len = doc_tokens.len().max(1) as f32;
     let avg_len = 200.0f32; // soft normalizer; candidates are short notes
@@ -118,7 +119,10 @@ impl Default for RankWeights {
 }
 
 fn env_f(key: &str, def: f32) -> f32 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(def)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(def)
 }
 
 fn importance(doc: &Document) -> f32 {
@@ -164,7 +168,11 @@ fn recency(doc: &Document, half_life_days: f32) -> f32 {
 /// Apply the inverted-context reranker: blend relevance (min-max normalized
 /// across the set), importance, recency and memory-type into `rank_score`,
 /// sort desc, truncate to `limit`.
-pub fn rerank_inverted(mut hits: Vec<SearchHit>, weights: &RankWeights, limit: usize) -> Vec<SearchHit> {
+pub fn rerank_inverted(
+    mut hits: Vec<SearchHit>,
+    weights: &RankWeights,
+    limit: usize,
+) -> Vec<SearchHit> {
     if !weights.enabled || hits.len() <= 1 {
         hits.truncate(limit);
         return hits;
@@ -174,13 +182,24 @@ pub fn rerank_inverted(mut hits: Vec<SearchHit>, weights: &RankWeights, limit: u
     let max = rel.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let range = max - min;
     for (idx, h) in hits.iter_mut().enumerate() {
-        let relevance = if range <= f32::EPSILON { 1.0 } else { (rel[idx] - min) / range };
+        let relevance = if range <= f32::EPSILON {
+            1.0
+        } else {
+            (rel[idx] - min) / range
+        };
         let imp = importance(&h.document);
         let rec = recency(&h.document, weights.recency_half_life_days);
         let mt = mem_type(&h.document);
-        h.rank_score = weights.relevance * relevance + weights.importance * imp + weights.recency * rec + weights.mem_type * mt;
+        h.rank_score = weights.relevance * relevance
+            + weights.importance * imp
+            + weights.recency * rec
+            + weights.mem_type * mt;
     }
-    hits.sort_by(|a, b| b.rank_score.partial_cmp(&a.rank_score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.rank_score
+            .partial_cmp(&a.rank_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.truncate(limit);
     hits
 }
@@ -199,7 +218,12 @@ pub struct SearchService {
 }
 
 impl SearchService {
-    pub fn new(store: std::sync::Arc<dyn StorageBackend>, llm: std::sync::Arc<dyn LlmClient>, semantic_weight: f32, text_weight: f32) -> Self {
+    pub fn new(
+        store: std::sync::Arc<dyn StorageBackend>,
+        llm: std::sync::Arc<dyn LlmClient>,
+        semantic_weight: f32,
+        text_weight: f32,
+    ) -> Self {
         SearchService {
             store,
             llm,
@@ -255,12 +279,21 @@ impl SearchService {
             }
         }
         let mut hits: Vec<SearchHit> = merged.into_values().collect();
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(rerank_inverted(hits, &self.rank, limit))
     }
 
     /// Cosine over embedding chunks; best score per document.
-    async fn semantic_search(&self, query: &str, filter: &DocFilter, limit: usize) -> SlcResult<Vec<SearchHit>> {
+    async fn semantic_search(
+        &self,
+        query: &str,
+        filter: &DocFilter,
+        limit: usize,
+    ) -> SlcResult<Vec<SearchHit>> {
         let qv = self
             .llm
             .generate_embedding_kind(query, crate::llm::EmbeddingKind::Query)
@@ -272,7 +305,11 @@ impl SearchService {
 
         let mut by_doc: HashMap<String, f32> = HashMap::new();
         for scope in [EmbeddingScope::Public, EmbeddingScope::Private] {
-            let seat = if scope == EmbeddingScope::Private { filter.visible_to.clone() } else { None };
+            let seat = if scope == EmbeddingScope::Private {
+                filter.visible_to.clone()
+            } else {
+                None
+            };
             let records = self.store.all_embeddings(scope, seat.as_deref()).await?;
             for r in records {
                 // Records from another embedding model are incomparable.
@@ -294,7 +331,11 @@ impl SearchService {
         for (id, score) in scored {
             if let Some(doc) = self.store.kb_get(&id).await? {
                 if filter_matches_doc(filter, &doc) {
-                    out.push(SearchHit { document: doc, score, rank_score: score });
+                    out.push(SearchHit {
+                        document: doc,
+                        score,
+                        rank_score: score,
+                    });
                 }
             }
         }
@@ -314,12 +355,17 @@ impl SearchService {
             *done = true;
         }
         let mut stale: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for scope in [EmbeddingScope::Public, EmbeddingScope::Private] {
-            let seat = if scope == EmbeddingScope::Private { filter.visible_to.clone() } else { None };
+            let seat = if scope == EmbeddingScope::Private {
+                filter.visible_to.clone()
+            } else {
+                None
+            };
             match self.store.all_embeddings(scope, seat.as_deref()).await {
                 Ok(records) => {
                     for r in records {
-                        if r.embedding_dimension != dim && !stale.contains(&r.document_id) {
+                        if r.embedding_dimension != dim && seen.insert(r.document_id.clone()) {
                             stale.push(r.document_id);
                         }
                     }
@@ -330,7 +376,10 @@ impl SearchService {
         if stale.is_empty() {
             return;
         }
-        tracing::info!(count = stale.len(), "re-embedding documents from a previous embedding model");
+        tracing::info!(
+            count = stale.len(),
+            "re-embedding documents from a previous embedding model"
+        );
         for id in stale {
             let Ok(Some(doc)) = self.store.kb_get(&id).await else {
                 continue;
@@ -363,14 +412,22 @@ impl SearchService {
     }
 
     /// BM25 over tokenized KB content (candidate set = filtered docs).
-    async fn text_search(&self, query: &str, filter: &DocFilter, limit: usize) -> SlcResult<Vec<SearchHit>> {
+    async fn text_search(
+        &self,
+        query: &str,
+        filter: &DocFilter,
+        limit: usize,
+    ) -> SlcResult<Vec<SearchHit>> {
         let q_terms = tokenize(query);
         if q_terms.is_empty() {
             return Ok(Vec::new());
         }
         // Oversample candidates: text search alone can't know the final
         // ranking, so pull limit*3 and score in Rust.
-        let docs = self.store.kb_find(filter, &DocSort::by_updated(SortDir::Desc), limit * 3).await?;
+        let docs = self
+            .store
+            .kb_find(filter, &DocSort::by_updated(SortDir::Desc), limit * 3)
+            .await?;
         let total = docs.len().max(1);
         let mut df: HashMap<String, usize> = HashMap::new();
         let mut tokenized: Vec<(Document, Vec<String>)> = Vec::with_capacity(docs.len());
@@ -385,11 +442,19 @@ impl SearchService {
             .into_iter()
             .map(|(d, toks)| {
                 let s = bm25(&q_terms, &toks, &df, total);
-                SearchHit { document: d, score: s, rank_score: s }
+                SearchHit {
+                    document: d,
+                    score: s,
+                    rank_score: s,
+                }
             })
             .filter(|h| h.score > 0.0)
             .collect();
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.truncate(limit);
         Ok(hits)
     }
@@ -454,15 +519,25 @@ mod tests {
     async fn cosine_and_bm25_sanity() {
         assert_eq!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]), 0.0);
         assert!((cosine_similarity(&[1.0, 2.0], &[2.0, 4.0]) - 1.0).abs() < 1e-5);
-        assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0]), 0.0, "length mismatch → 0");
+        assert_eq!(
+            cosine_similarity(&[1.0], &[1.0, 2.0]),
+            0.0,
+            "length mismatch → 0"
+        );
 
-        let df: HashMap<String, usize> = [("rust".into(), 1), ("voice".into(), 1), ("milk".into(), 1)].into_iter().collect();
+        let df: HashMap<String, usize> =
+            [("rust".into(), 1), ("voice".into(), 1), ("milk".into(), 1)]
+                .into_iter()
+                .collect();
         let docs = sample_docs();
         let scores: Vec<f32> = docs
             .iter()
             .map(|d| bm25(&tokenize("rust memory"), &tokenize(&d.content), &df, 3))
             .collect();
-        assert!(scores[0] > scores[2], "rust doc should outrank grocery list");
+        assert!(
+            scores[0] > scores[2],
+            "rust doc should outrank grocery list"
+        );
     }
 
     #[tokio::test]
@@ -472,15 +547,25 @@ mod tests {
         for d in sample_docs() {
             store.kb_insert(&d).await.unwrap();
         }
-        let llm: std::sync::Arc<dyn crate::llm::LlmClient> = std::sync::Arc::new(MockLlm::default());
+        let llm: std::sync::Arc<dyn crate::llm::LlmClient> =
+            std::sync::Arc::new(MockLlm::default());
         let svc = SearchService::new(store, llm, 0.7, 0.3);
-        let hits = svc.search("voice assistant memory", None, None, 5, None).await.unwrap();
+        let hits = svc
+            .search("voice assistant memory", None, None, 5, None)
+            .await
+            .unwrap();
         assert!(!hits.is_empty(), "expected hits");
         // KB search must never return episodic docs (none inserted here, but
         // the store split guarantees it structurally).
         assert!(hits.iter().all(|h| h.document.category.is_kb()));
-        let ids: Vec<&str> = hits.iter().map(|h| h.document.document_id.as_str()).collect();
-        assert!(ids.contains(&"vassista-plan"), "project doc should be found: {ids:?}");
+        let ids: Vec<&str> = hits
+            .iter()
+            .map(|h| h.document.document_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"vassista-plan"),
+            "project doc should be found: {ids:?}"
+        );
     }
 
     #[tokio::test]
@@ -488,14 +573,24 @@ mod tests {
         let hits = sample_docs()
             .into_iter()
             .enumerate()
-            .map(|(i, d)| SearchHit { document: d, score: 0.5 - i as f32 * 0.1, rank_score: 0.0 })
+            .map(|(i, d)| SearchHit {
+                document: d,
+                score: 0.5 - i as f32 * 0.1,
+                rank_score: 0.0,
+            })
             .collect();
         let ranked = rerank_inverted(hits, &RankWeights::default(), 3);
         assert_eq!(ranked.len(), 3);
         // vassista-plan has priority:high → importance 0.75 beats others at
         // equal-ish relevance; it must end up first or second, not last.
-        let pos = ranked.iter().position(|h| h.document.document_id == "vassista-plan").unwrap();
-        assert!(pos <= 1, "high-importance doc should rank near the top: {pos}");
+        let pos = ranked
+            .iter()
+            .position(|h| h.document.document_id == "vassista-plan")
+            .unwrap();
+        assert!(
+            pos <= 1,
+            "high-importance doc should rank near the top: {pos}"
+        );
     }
 
     #[tokio::test]
@@ -522,13 +617,28 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let llm: std::sync::Arc<dyn crate::llm::LlmClient> = std::sync::Arc::new(MockLlm::default()); // dim=16
+        let llm: std::sync::Arc<dyn crate::llm::LlmClient> =
+            std::sync::Arc::new(MockLlm::default()); // dim=16
         let svc = SearchService::new(store.clone(), llm, 0.7, 0.3);
-        let hits = svc.search("voice assistant memory", None, None, 5, None).await.unwrap();
-        assert!(!hits.is_empty(), "search must not break on stale embeddings");
+        let hits = svc
+            .search("voice assistant memory", None, None, 5, None)
+            .await
+            .unwrap();
+        assert!(
+            !hits.is_empty(),
+            "search must not break on stale embeddings"
+        );
         // One-shot refresh re-embedded everything under the current model.
-        for r in store.all_embeddings(crate::model::EmbeddingScope::Public, None).await.unwrap() {
-            assert_eq!(r.embedding_dimension, 16, "stale embedding must be re-embedded: {}", r.document_id);
+        for r in store
+            .all_embeddings(crate::model::EmbeddingScope::Public, None)
+            .await
+            .unwrap()
+        {
+            assert_eq!(
+                r.embedding_dimension, 16,
+                "stale embedding must be re-embedded: {}",
+                r.document_id
+            );
         }
     }
 }

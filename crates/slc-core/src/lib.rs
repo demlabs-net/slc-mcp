@@ -221,17 +221,17 @@ impl SlcEngine {
         }
         #[cfg(feature = "candle-emb")]
         {
+            if !candle_emb::CandleEmbeddingLlm::gpu_available() {
+                tracing::warn!("no GPU — CPU-hash embeddings by default; force local CPU inference with SLC_LLM=candle");
+                return std::sync::Arc::new(llm::CpuHashLlm);
+            }
             let onboard = candle_emb::CandleEmbeddingLlm::new();
-            if onboard.gpu_requested() && onboard.model_cached() {
+            if onboard.model_cached() {
                 tracing::info!("GPU detected — onboard candle embeddings (bge-m3)");
                 return std::sync::Arc::new(onboard);
             }
-            if onboard.gpu_requested() {
-                tracing::warn!("GPU detected, but the embedding model is not downloaded — run `slc-mcp init`; CPU-hash embeddings for now");
-                return std::sync::Arc::new(llm::CpuHashLlm);
-            }
-            tracing::warn!("no GPU — CPU-hash embeddings by default; force local CPU inference with SLC_LLM=candle");
-            return std::sync::Arc::new(llm::CpuHashLlm);
+            tracing::warn!("GPU detected, but the embedding model is not downloaded — run `slc-mcp init`; CPU-hash embeddings for now");
+            std::sync::Arc::new(llm::CpuHashLlm)
         }
         #[cfg(not(feature = "candle-emb"))]
         {

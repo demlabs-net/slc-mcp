@@ -10,11 +10,15 @@ mod server;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 use slc_core::{DocumentCategory, SlcConfig, SlcEngine, StorageKind};
+use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "slc-mcp", version, about = "SLC memory engine — MCP server + CLI")]
+#[command(
+    name = "slc-mcp",
+    version,
+    about = "SLC memory engine — MCP server + CLI"
+)]
 struct Cli {
     /// Obsidian vault path (default: $SLC_VAULT_PATH or ~/.slc/vault).
     #[arg(long, env = "SLC_VAULT_PATH")]
@@ -118,7 +122,9 @@ enum SeatAction {
         #[arg(long)]
         name: Option<String>,
     },
-    Close { seat_id: String },
+    Close {
+        seat_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -161,15 +167,16 @@ async fn main() -> anyhow::Result<()> {
                 // Inference through the MCP client (sampling) — no local
                 // GPU/LLM needed; embeddings degrade to text-only search.
                 let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
-                let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-                let llm: std::sync::Arc<dyn slc_core::LlmClient> = std::sync::Arc::new(
-                    slc_core::McpSamplingLlm::new(out_tx, pending.clone()),
-                );
+                let pending =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+                let llm: std::sync::Arc<dyn slc_core::LlmClient> =
+                    std::sync::Arc::new(slc_core::McpSamplingLlm::new(out_tx, pending.clone()));
                 let engine = SlcEngine::open_async_with_llm(config, llm).await?;
                 server::run(engine, port, Some(out_rx), pending).await
             } else {
                 let engine = SlcEngine::open_async(config).await?;
-                let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+                let pending =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
                 server::run(engine, port, None, pending).await
             }
         }
@@ -219,7 +226,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Remember { seat_id, event_id, content } => {
+        Cmd::Remember {
+            seat_id,
+            event_id,
+            content,
+        } => {
             let engine = SlcEngine::open_async(config).await?;
             engine.ensure_seat(&seat_id).await?;
             engine.remember(&seat_id, &event_id, &content).await?;
@@ -229,13 +240,19 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Compress { seat_id } => {
             let engine = SlcEngine::open_async(config).await?;
             let r = engine.compress(&seat_id).await?;
-            println!("L1→L2: {}, L2→L3: {}, L3→L4: {}", r.l1_to_l2, r.l2_to_l3, r.l3_to_l4);
+            println!(
+                "L1→L2: {}, L2→L3: {}, L3→L4: {}",
+                r.l1_to_l2, r.l2_to_l3, r.l3_to_l4
+            );
             Ok(())
         }
         Cmd::Consolidate { seat_id } => {
             let engine = SlcEngine::open_async(config).await?;
             let r = engine.consolidate(&seat_id).await?;
-            println!("sources: {}, facts added: {} (total extracted: {})", r.sources, r.facts_added, r.facts_total);
+            println!(
+                "sources: {}, facts added: {} (total extracted: {})",
+                r.sources, r.facts_added, r.facts_total
+            );
             Ok(())
         }
         Cmd::Search { query, seat, limit } => {
@@ -253,23 +270,21 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Import { path, category, seat } => {
+        Cmd::Import {
+            path,
+            category,
+            seat,
+        } => {
             let engine = SlcEngine::open_async(config).await?;
-            let cat = DocumentCategory::parse(&category)
-                .context("bad category (core|module|task|project|code_snippet|documentation|custom|system)")?;
+            let cat = DocumentCategory::parse(&category).context(
+                "bad category (core|module|task|project|code_snippet|documentation|custom|system)",
+            )?;
             let content = std::fs::read_to_string(&path)?;
             let name = std::path::Path::new(&path)
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "doc".into());
-            let doc = slc_core::Document::new(
-                name,
-                cat,
-                content,
-                Default::default(),
-                vec![],
-                seat,
-            );
+            let doc = slc_core::Document::new(name, cat, content, Default::default(), vec![], seat);
             engine.add_document(&doc).await?;
             println!("imported {}", doc.document_id);
             Ok(())
@@ -389,20 +404,29 @@ async fn cmd_init(
             println!("модель {repo_id} уже в кэше");
         }
 
-        // 5. Запись в .env.
-        let env_path = set_env_line("SLC_LLM", "candle")?;
-        set_env_line("SLC_EMBED_DEVICE", dev)?;
-        set_env_line("SLC_EMBED_MODEL", &repo_id)?;
-
-        // 6. Проверка: загрузить и сделать контрольный эмбеддинг.
+        // 5. Проверка: загрузить и сделать контрольный эмбеддинг ДО записи
+        //    .env — при провале (например, metal без layer-norm) конфигурация
+        //    не должна остаться в битом состоянии.
         let llm: std::sync::Arc<dyn slc_core::LlmClient> = std::sync::Arc::new(
             slc_core::candle_emb::CandleEmbeddingLlm::with_config(&repo_id, dev),
         );
-        match tokio::time::timeout(std::time::Duration::from_secs(120), llm.generate_embedding("проверка эмбеддинга")).await {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            llm.generate_embedding("проверка эмбеддинга"),
+        )
+        .await
+        {
             Ok(Ok(v)) => println!("✅ модель готова: dim={} (device={dev})", v.len()),
-            Ok(Err(e)) => anyhow::bail!("модель не загрузилась: {e}"),
-            Err(_) => anyhow::bail!("таймаут загрузки модели"),
+            Ok(Err(e)) => anyhow::bail!(
+                "модель не загрузилась: {e} — .env не записан, попробуй другое устройство"
+            ),
+            Err(_) => anyhow::bail!("таймаут загрузки модели — .env не записан"),
         }
+
+        // 6. Запись в .env (после успешной проверки).
+        let env_path = set_env_line("SLC_LLM", "candle")?;
+        set_env_line("SLC_EMBED_DEVICE", dev)?;
+        set_env_line("SLC_EMBED_MODEL", &repo_id)?;
         println!("конфигурация записана в {}", env_path.display());
         println!("дальше: slc-mcp serve (эмбеддинги уже в кэше, автоскачивание не требуется)");
     } else {
@@ -410,7 +434,9 @@ async fn cmd_init(
         let env_path = set_env_line("SLC_LLM", &llm)?;
         println!("конфигурация записана в {}", env_path.display());
         match llm.as_str() {
-            "ollama" => println!("убедись, что Ollama запущен (OLLAMA_ENDPOINT, default http://localhost:11434)"),
+            "ollama" => println!(
+                "убедись, что Ollama запущен (OLLAMA_ENDPOINT, default http://localhost:11434)"
+            ),
             "lmstudio" => println!("укажи LMSTUDIO_URL (OpenAI-совместимый сервер) в .env"),
             _ => println!("CPU-hash: эмбеддинги без моделей; семантика ограниченная"),
         }

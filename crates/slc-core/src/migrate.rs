@@ -23,7 +23,7 @@
 //! - **embeddings и идеи не переносятся** (перегенерация; концепция идей
 //!   удалена).
 
-use crate::error::{SlcError, SlcResult};
+use crate::error::SlcResult;
 use crate::model::{Document, DocumentCategory, Seat, SeatStatus, UsageStats};
 use crate::storage::StorageBackend;
 use chrono::{DateTime, Utc};

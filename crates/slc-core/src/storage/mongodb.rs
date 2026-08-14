@@ -16,11 +16,11 @@
 //! `mongodb://localhost:27017/slc`).
 
 use crate::error::{SlcError, SlcResult};
-use crate::model::{DocLevel, Document, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat, SeatStatus};
+use crate::model::{Document, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat, SeatStatus};
 use crate::storage::{DocFilter, DocSort, MetaPatch, SortField, SortDir, StorageBackend};
 use chrono::{DateTime, Utc};
 use bson::{doc, Bson, Document as BsonDoc};
-use mongodb::options::{FindOneAndUpdateOptions, FindOptions, IndexOptions, UpdateOptions};
+use mongodb::options::IndexOptions;
 use mongodb::{Client, Collection, IndexModel};
 
 /// Kind discriminator inside the `docs` collection.

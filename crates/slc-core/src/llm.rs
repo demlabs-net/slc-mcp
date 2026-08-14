@@ -32,7 +32,11 @@ pub trait LlmClient: Send + Sync {
     async fn generate_embedding(&self, text: &str) -> SlcResult<Vec<f32>>;
     /// Embedding with the text role; default is the plain call. Overridden by
     /// models that distinguish queries from passages (e5-style prefixes).
-    async fn generate_embedding_kind(&self, text: &str, _kind: EmbeddingKind) -> SlcResult<Vec<f32>> {
+    async fn generate_embedding_kind(
+        &self,
+        text: &str,
+        _kind: EmbeddingKind,
+    ) -> SlcResult<Vec<f32>> {
         self.generate_embedding(text).await
     }
     /// Human-readable name of the embedding model (logs, record metadata).
@@ -51,7 +55,11 @@ impl LlmClient for std::sync::Arc<dyn LlmClient> {
     async fn generate_embedding(&self, text: &str) -> SlcResult<Vec<f32>> {
         self.as_ref().generate_embedding(text).await
     }
-    async fn generate_embedding_kind(&self, text: &str, kind: EmbeddingKind) -> SlcResult<Vec<f32>> {
+    async fn generate_embedding_kind(
+        &self,
+        text: &str,
+        kind: EmbeddingKind,
+    ) -> SlcResult<Vec<f32>> {
         self.as_ref().generate_embedding_kind(text, kind).await
     }
     fn embedding_model_name(&self) -> String {
@@ -75,7 +83,11 @@ pub struct LmStudioClient {
 }
 
 impl LmStudioClient {
-    pub fn new(base_url: impl Into<String>, model: impl Into<String>, embed_model: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        embed_model: impl Into<String>,
+    ) -> Self {
         LmStudioClient {
             http: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -132,12 +144,16 @@ impl LlmClient for LmStudioClient {
             .await
             .map_err(|e| SlcError::Llm(format!("lmstudio chat decode: {e}")))?;
         if !status.is_success() {
-            return Err(SlcError::Llm(format!("lmstudio chat HTTP {status}: {json}")));
+            return Err(SlcError::Llm(format!(
+                "lmstudio chat HTTP {status}: {json}"
+            )));
         }
         json.pointer("/choices/0/message/content")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .ok_or_else(|| SlcError::Llm("lmstudio chat: missing choices[0].message.content".into()))
+            .ok_or_else(|| {
+                SlcError::Llm("lmstudio chat: missing choices[0].message.content".into())
+            })
     }
 
     async fn generate_embedding(&self, text: &str) -> SlcResult<Vec<f32>> {
@@ -155,11 +171,17 @@ impl LlmClient for LmStudioClient {
             .await
             .map_err(|e| SlcError::Llm(format!("lmstudio embeddings decode: {e}")))?;
         if !status.is_success() {
-            return Err(SlcError::Llm(format!("lmstudio embeddings HTTP {status}: {json}")));
+            return Err(SlcError::Llm(format!(
+                "lmstudio embeddings HTTP {status}: {json}"
+            )));
         }
         json.pointer("/data/0/embedding")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_f64().map(|f| f as f32))
+                    .collect()
+            })
             .ok_or_else(|| SlcError::Llm("lmstudio embeddings: missing data[0].embedding".into()))
     }
 
@@ -178,7 +200,11 @@ pub struct OllamaClient {
 }
 
 impl OllamaClient {
-    pub fn new(endpoint: impl Into<String>, reasoning_model: impl Into<String>, embedding_model: impl Into<String>) -> Self {
+    pub fn new(
+        endpoint: impl Into<String>,
+        reasoning_model: impl Into<String>,
+        embedding_model: impl Into<String>,
+    ) -> Self {
         OllamaClient {
             http: reqwest::Client::new(),
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
@@ -215,7 +241,9 @@ impl LlmClient for OllamaClient {
             .await
             .map_err(|e| SlcError::Llm(format!("ollama generate decode: {e}")))?;
         if !status.is_success() {
-            return Err(SlcError::Llm(format!("ollama generate HTTP {status}: {json}")));
+            return Err(SlcError::Llm(format!(
+                "ollama generate HTTP {status}: {json}"
+            )));
         }
         json.get("response")
             .and_then(|v| v.as_str())
@@ -238,11 +266,17 @@ impl LlmClient for OllamaClient {
             .await
             .map_err(|e| SlcError::Llm(format!("ollama embeddings decode: {e}")))?;
         if !status.is_success() {
-            return Err(SlcError::Llm(format!("ollama embeddings HTTP {status}: {json}")));
+            return Err(SlcError::Llm(format!(
+                "ollama embeddings HTTP {status}: {json}"
+            )));
         }
         json.get("embedding")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_f64().map(|f| f as f32))
+                    .collect()
+            })
             .ok_or_else(|| SlcError::Llm("ollama embeddings: missing `embedding`".into()))
     }
 
@@ -262,7 +296,9 @@ pub struct MockLlm {
 
 impl MockLlm {
     pub fn new(script: Vec<String>) -> Self {
-        MockLlm { script: std::sync::Arc::new(std::sync::Mutex::new(script)) }
+        MockLlm {
+            script: std::sync::Arc::new(std::sync::Mutex::new(script)),
+        }
     }
 }
 
@@ -299,16 +335,24 @@ pub struct McpSamplingLlm {
     /// Sampling-запросы наружу (сервер пересылает их клиенту по SSE).
     pub outbound: tokio::sync::mpsc::Sender<Value>,
     /// Ожидающие ответа запросы (id → канал ответа). Общий с сервером.
-    pub pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+    pub pending: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
+    >,
     max_tokens: usize,
 }
 
 impl McpSamplingLlm {
     pub fn new(
         outbound: tokio::sync::mpsc::Sender<Value>,
-        pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+        pending: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
+        >,
     ) -> Self {
-        Self { outbound, pending, max_tokens: 2000 }
+        Self {
+            outbound,
+            pending,
+            max_tokens: 2000,
+        }
     }
 }
 
@@ -339,7 +383,9 @@ impl LlmClient for McpSamplingLlm {
         match tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
             Ok(Some(text)) => Ok(text),
             Ok(None) => Err(SlcError::Storage("sampling channel closed".into())),
-            Err(_) => Err(SlcError::Storage("sampling timed out — is the MCP client connected?".into())),
+            Err(_) => Err(SlcError::Storage(
+                "sampling timed out — is the MCP client connected?".into(),
+            )),
         }
     }
 
@@ -430,7 +476,10 @@ mod tests {
     async fn cpu_hash_embeddings_are_deterministic_and_normalized() {
         let a = CpuHashLlm.generate_embedding("кофе чёрный").await.unwrap();
         let b = CpuHashLlm.generate_embedding("кофе чёрный").await.unwrap();
-        let c = CpuHashLlm.generate_embedding("совсем другой текст").await.unwrap();
+        let c = CpuHashLlm
+            .generate_embedding("совсем другой текст")
+            .await
+            .unwrap();
         assert_eq!(a.len(), 512);
         assert_eq!(a, b);
         assert_ne!(a, c);
@@ -438,7 +487,10 @@ mod tests {
         assert!((norm - 1.0).abs() < 1e-3);
         // Deterministic lexical similarity: similar texts correlate > 0.
         let dot: f32 = a.iter().zip(c.iter()).map(|(x, y)| x * y).sum();
-        assert!(dot < 0.5, "dissimilar texts should be weakly correlated: {dot}");
+        assert!(
+            dot < 0.5,
+            "dissimilar texts should be weakly correlated: {dot}"
+        );
     }
 
     #[test]

@@ -84,6 +84,12 @@ pub struct CandleEmbeddingLlm {
     cond: Arc<Condvar>,
 }
 
+impl Default for CandleEmbeddingLlm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CandleEmbeddingLlm {
     /// Общий конструктор: резолвит настройки из env.
     pub fn new() -> Self {
@@ -93,7 +99,10 @@ impl CandleEmbeddingLlm {
             _ => "auto".to_string(),
         };
         let repo = std::env::var("SLC_EMBED_MODEL").ok();
-        Self::with_config(repo.unwrap_or_else(|| Self::default_model_for(&device)), &device)
+        Self::with_config(
+            repo.unwrap_or_else(|| Self::default_model_for(&device)),
+            &device,
+        )
     }
 
     /// Конструктор с явной конфигурацией (используется `slc-mcp init`
@@ -135,6 +144,12 @@ impl CandleEmbeddingLlm {
             || self.device_kind == DeviceKind::Auto && detect_device() != DeviceKind::Cpu
     }
 
+    /// Статическая проверка «есть ли GPU-бэкенд» (без создания клиента и
+    /// фонового лоадера) — для выбора провайдера по умолчанию.
+    pub fn gpu_available() -> bool {
+        detect_device() != DeviceKind::Cpu
+    }
+
     /// True when all model files are already in the Hugging Face cache
     /// (checks the cache only — no network). Used by `slc-mcp init` and the
     /// engine's provider selection.
@@ -156,7 +171,9 @@ impl CandleEmbeddingLlm {
                 .is_ok()
         };
         // Вес — safetensors ИЛИ torch-фоллбэк.
-        (cached(MODEL_FILES[0]) || cached(PTH_FILE)) && cached(MODEL_FILES[1]) && cached(MODEL_FILES[2])
+        (cached(MODEL_FILES[0]) || cached(PTH_FILE))
+            && cached(MODEL_FILES[1])
+            && cached(MODEL_FILES[2])
     }
 
     /// Default model for a device kind (what `slc-mcp init` proposes).
@@ -202,7 +219,9 @@ impl CandleEmbeddingLlm {
             match &*state {
                 LoadState::Ready(l) => return Ok(l.clone()),
                 LoadState::Failed(e) => {
-                    return Err(SlcError::Storage(format!("embedding model unavailable: {e}")))
+                    return Err(SlcError::Storage(format!(
+                        "embedding model unavailable: {e}"
+                    )));
                 }
                 LoadState::Loading => state = self.cond.wait(state).unwrap(),
             }
@@ -263,8 +282,10 @@ impl CandleEmbeddingLlm {
         let config_path = dl(MODEL_FILES[1])?;
         let tokenizer_path = dl(MODEL_FILES[2])?;
 
-        let config_json = std::fs::read_to_string(config_path).map_err(|e| format!("read config: {e}"))?;
-        let cfg: serde_json::Value = serde_json::from_str(&config_json).map_err(|e| format!("parse config: {e}"))?;
+        let config_json =
+            std::fs::read_to_string(config_path).map_err(|e| format!("read config: {e}"))?;
+        let cfg: serde_json::Value =
+            serde_json::from_str(&config_json).map_err(|e| format!("parse config: {e}"))?;
         let dim = cfg
             .pointer("/hidden_size")
             .and_then(|v| v.as_u64())
@@ -282,7 +303,8 @@ impl CandleEmbeddingLlm {
         } else {
             // torch-формат читается целиком (pickle) — 4-5 ГБ в RAM для
             // bge-m3; это GPU-путь, для слабых машин есть e5-small/hash.
-            VarBuilder::from_pth(&weights, DType::F32, &device).map_err(|e| format!("load pytorch_model.bin: {e}"))?
+            VarBuilder::from_pth(&weights, DType::F32, &device)
+                .map_err(|e| format!("load pytorch_model.bin: {e}"))?
         };
         let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
             .map_err(|e| format!("load tokenizer: {e}"))?;
@@ -297,7 +319,11 @@ impl CandleEmbeddingLlm {
 
         // bge-m3 — XLM-RoBERTa (CLS pooling, без префиксов); e5 — BERT
         // (mean pooling, префиксы query:/passage:).
-        let pooling = if self.repo_id.contains("bge-m3") { Pooling::Cls } else { Pooling::Mean };
+        let pooling = if self.repo_id.contains("bge-m3") {
+            Pooling::Cls
+        } else {
+            Pooling::Mean
+        };
         let e5_prefix = self.repo_id.contains("e5");
 
         let model = if architecture == "XlmRobertaModel" {
@@ -308,16 +334,29 @@ impl CandleEmbeddingLlm {
             EncodeModel::XlmRoberta(m)
         } else {
             let config: candle_transformers::models::bert::Config =
-                serde_json::from_str(&config_json).map_err(|e| format!("parse bert config: {e}"))?;
+                serde_json::from_str(&config_json)
+                    .map_err(|e| format!("parse bert config: {e}"))?;
             let m = candle_transformers::models::bert::BertModel::load(vb, &config)
                 .map_err(|e| format!("load bert: {e}"))?;
             EncodeModel::Bert(m)
         };
 
-        Ok(Loaded { model, tokenizer, device, dim, pooling, e5_prefix })
+        Ok(Loaded {
+            model,
+            tokenizer,
+            device,
+            dim,
+            pooling,
+            e5_prefix,
+        })
     }
 
-    fn embed_loaded(&self, loaded: &Loaded, text: &str, kind: EmbeddingKind) -> SlcResult<Vec<f32>> {
+    fn embed_loaded(
+        &self,
+        loaded: &Loaded,
+        text: &str,
+        kind: EmbeddingKind,
+    ) -> SlcResult<Vec<f32>> {
         let embed = (|| -> Result<Vec<f32>, String> {
             let text = match (loaded.e5_prefix, kind) {
                 (true, EmbeddingKind::Query) => format!("query: {text}"),
@@ -337,15 +376,18 @@ impl CandleEmbeddingLlm {
                 .map_err(|e| e.to_string())?
                 .unsqueeze(0)
                 .map_err(|e| e.to_string())?;
-            let mask = Tensor::ones((1, len), DType::U32, &loaded.device).map_err(|e| e.to_string())?;
+            let mask =
+                Tensor::ones((1, len), DType::U32, &loaded.device).map_err(|e| e.to_string())?;
             let token_types =
                 Tensor::zeros((1, len), DType::U32, &loaded.device).map_err(|e| e.to_string())?;
 
             let out: Tensor = match &loaded.model {
-                EncodeModel::Bert(m) => m.forward(&ids, &token_types, Some(&mask)).map_err(|e| e.to_string())?,
-                EncodeModel::XlmRoberta(m) => {
-                    m.forward(&ids, &mask, &token_types, None, None, None).map_err(|e| e.to_string())?
-                }
+                EncodeModel::Bert(m) => m
+                    .forward(&ids, &token_types, Some(&mask))
+                    .map_err(|e| e.to_string())?,
+                EncodeModel::XlmRoberta(m) => m
+                    .forward(&ids, &mask, &token_types, None, None, None)
+                    .map_err(|e| e.to_string())?,
             };
             let hidden = out.get(0).map_err(|e| e.to_string())?; // (seq, hidden)
             let pooled = match loaded.pooling {
@@ -389,7 +431,11 @@ pub fn download_embedding_model(repo_id: &str) -> Result<(), String> {
             p
         }
         Err(_) => {
-            tracing::info!(model = repo_id, file = PTH_FILE, "no safetensors — downloading torch weights");
+            tracing::info!(
+                model = repo_id,
+                file = PTH_FILE,
+                "no safetensors — downloading torch weights"
+            );
             repo.download_file()
                 .filename(PTH_FILE.to_string())
                 .send()
@@ -468,12 +514,19 @@ impl LlmClient for CandleEmbeddingLlm {
         self.embed_loaded(&loaded, text, EmbeddingKind::Passage)
     }
 
-    async fn generate_embedding_kind(&self, text: &str, kind: EmbeddingKind) -> SlcResult<Vec<f32>> {
+    async fn generate_embedding_kind(
+        &self,
+        text: &str,
+        kind: EmbeddingKind,
+    ) -> SlcResult<Vec<f32>> {
         let loaded = self.wait_ready()?;
         self.embed_loaded(&loaded, text, kind)
     }
 
     fn embedding_model_name(&self) -> String {
-        format!("candle:{}", self.repo_id.split('/').next_back().unwrap_or("embed"))
+        format!(
+            "candle:{}",
+            self.repo_id.split('/').next_back().unwrap_or("embed")
+        )
     }
 }
