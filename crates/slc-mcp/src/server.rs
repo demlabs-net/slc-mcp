@@ -240,7 +240,7 @@ async fn mcp(
 ) -> (StatusCode, Json<Value>) {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        // A response to one of our sampling requests (client answered via
+    // A response to one of our sampling requests (client answered via
     // POST /messages): resolve the pending channel and reply with nothing.
     // Runs AFTER authentication (any unauthenticated client who learned a
     // request_id from SSE must not be able to inject text into the
@@ -263,7 +263,7 @@ async fn mcp(
         }
     }
 
-let params = req.get("params").cloned().unwrap_or(Value::Null);
+    let params = req.get("params").cloned().unwrap_or(Value::Null);
 
     let engine = state.engine.as_ref();
     let seat_hdr = seat_from_request(&headers);
@@ -982,7 +982,7 @@ async fn build_context(
             if content.chars().count() <= budget {
                 continue;
             }
-            if let Ok(summary) = engine.summarize_text(content, budget).await {
+            if let Ok(summary) = engine.summarize_text_for(seat_id, content, budget).await {
                 let summary_chars = summary.chars().count();
                 if summary_chars < content.chars().count() {
                     used_tokens = used_tokens.saturating_sub(to_tokens(content.chars().count()))
@@ -1124,10 +1124,8 @@ async fn call_tool(
                         .set_context_key(seat_id, "context_limit_tokens", json!(n))
                         .await
                         .map_err(json_err)?;
-                    Ok(
-                        json!({"success": ok, "context_limit_tokens": n,
-                               "message": "Context limit set (tokens)"}),
-                    )
+                    Ok(json!({"success": ok, "context_limit_tokens": n,
+                               "message": "Context limit set (tokens)"}))
                 }
                 "ctx" => {
                     let limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
@@ -1139,12 +1137,10 @@ async fn call_tool(
                     let focuses = engine.focus_list(seat_id, None).await.map_err(json_err)?;
                     let projects = project_list(engine).await?;
                     let tasks = task_list(engine, Some(seat_id)).await?;
-                    Ok(
-                        json!({"limit_tokens": limit,
+                    Ok(json!({"limit_tokens": limit,
                            "active_document": active.map(|d| d.document_id),
                            "focus_count": focuses.len(), "seat_context": seat.map(|s| s.context),
-                           "projects": projects, "tasks": tasks}),
-                    )
+                           "projects": projects, "tasks": tasks}))
                 }
                 "update_context" => {
                     // Slash-команда = тот же MCP-тул update_context; summary
@@ -1174,9 +1170,7 @@ async fn call_tool(
                     // Поиск по документам БЗ: /search <запрос>.
                     let query = parts.collect::<Vec<_>>().join(" ");
                     if query.is_empty() {
-                        return Err(
-                            json!({"code": -32602, "message": "usage: /search <query>"}),
-                        );
+                        return Err(json!({"code": -32602, "message": "usage: /search <query>"}));
                     }
                     let hits = engine
                         .search(&query, Some(seat_id), 10)
@@ -1846,13 +1840,25 @@ mod seat_filter_tests {
     #[test]
     fn seat_filter_is_deny_by_default() {
         // Same seat → delivered.
-        assert!(seat_matches_event(&json!({"type": "x", "seat_id": "cursor-1"}), "cursor-1"));
+        assert!(seat_matches_event(
+            &json!({"type": "x", "seat_id": "cursor-1"}),
+            "cursor-1"
+        ));
         // Other seat → withheld.
-        assert!(!seat_matches_event(&json!({"type": "x", "seat_id": "cursor-1"}), "cursor-2"));
+        assert!(!seat_matches_event(
+            &json!({"type": "x", "seat_id": "cursor-1"}),
+            "cursor-2"
+        ));
         // NO seat_id at all → withheld (regression: it used to be broadcast
         // to every subscriber — sampling prompts leaked across seats).
-        assert!(!seat_matches_event(&json!({"type": "sampling_request"}), "cursor-1"));
+        assert!(!seat_matches_event(
+            &json!({"type": "sampling_request"}),
+            "cursor-1"
+        ));
         // Malformed seat → withheld.
-        assert!(!seat_matches_event(&json!({"type": "x", "seat_id": 42}), "cursor-1"));
+        assert!(!seat_matches_event(
+            &json!({"type": "x", "seat_id": 42}),
+            "cursor-1"
+        ));
     }
 }

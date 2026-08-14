@@ -404,17 +404,28 @@ impl Drop for PendingGuard {
 
 #[async_trait]
 impl LlmClient for McpSamplingLlm {
-    /// No seat context here — the event carries an empty seat and the SSE
-    /// filter (deny-by-default on missing seat) drops it. Seat-scoped calls
-    /// must go through [`reason_for`](Self::reason_for).
+    /// No seat context here — sampling REQUIRES a seat (the SSE fan-out is
+    /// deny-by-default, an event with an empty seat would be dropped and the
+    /// caller would hang for the full 60s timeout). Fail fast instead;
+    /// seat-scoped calls must go through [`reason_for`](Self::reason_for).
     async fn reason(&self, prompt: &str) -> SlcResult<String> {
-        self.reason_for("", prompt).await
+        let _ = prompt;
+        Err(SlcError::Storage(
+            "sampling requires a seat — call reason_for(seat, prompt)".into(),
+        ))
     }
 
     /// The sampling event carries the seat so the SSE fan-out only delivers
     /// it to that seat's subscriber — compression prompts contain document
     /// contents and must never leak to other seats.
     async fn reason_for(&self, seat: &str, prompt: &str) -> SlcResult<String> {
+        if seat.is_empty() {
+            // Событие с пустым сидом никто не получит (deny-by-default) —
+            // мгновенный отказ вместо 60-секундного ожидания.
+            return Err(SlcError::Storage(
+                "sampling requires a non-empty seat (X-Seat-ID)".into(),
+            ));
+        }
         let request_id = format!("smp-{}", uuid::Uuid::new_v4());
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         // Guard lives for the whole request: on ANY exit (timeout, send
@@ -541,8 +552,30 @@ mod tests {
             let tx = pending2.lock().unwrap().remove(&rid).unwrap();
             tx.send("сжатый ответ клиента".into()).await.unwrap();
         });
-        let out = llm.reason("длинный текст для сжатия").await.unwrap();
+        let out = llm
+            .reason_for("dev", "длинный текст для сжатия")
+            .await
+            .unwrap();
         assert_eq!(out, "сжатый ответ клиента");
+    }
+
+    #[tokio::test]
+    async fn sampling_without_seat_fails_fast() {
+        // Пустой сид: событие с seat_id="" никто не получил бы (deny-by-default)
+        // — раньше это висело 60 секунд, теперь мгновенный Err.
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let llm = McpSamplingLlm::new(tx, pending.clone());
+        let t0 = std::time::Instant::now();
+        let err = llm.reason_for("", "текст").await.unwrap_err();
+        assert!(err.to_string().contains("non-empty seat"), "{err}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "must fail fast"
+        );
+        assert!(pending.lock().unwrap().is_empty());
+        // reason() без сита — тот же быстрый отказ.
+        assert!(llm.reason("текст").await.is_err());
     }
 
     /// Regression: a request whose client never answers (or whose channel
@@ -554,7 +587,7 @@ mod tests {
         drop(rx); // outbound closed → send fails → early return
         let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let llm = McpSamplingLlm::new(tx, pending.clone());
-        let err = llm.reason("текст").await.unwrap_err();
+        let err = llm.reason_for("dev", "текст").await.unwrap_err();
         assert!(err.to_string().contains("sampling channel closed"), "{err}");
         assert!(
             pending.lock().unwrap().is_empty(),
@@ -583,7 +616,12 @@ mod tests {
         // Drop the outbound AFTER the request was delivered: the reader task
         // above consumed the message, but nobody answers → the guard cleanup
         // path is exercised when the sender side errors on a second call.
-        let _ = llm.reason("первый запрос, ответа не будет — таймаут 60с в проде").await;
+        let _ = llm
+            .reason_for(
+                "dev",
+                "первый запрос, ответа не будет — таймаут 60с в проде",
+            )
+            .await;
         // The entry from the timed-out path must be gone (guard dropped it).
         // The spawned task above removed it on delivery, so the map is empty.
         assert!(pending.lock().unwrap().is_empty());

@@ -25,9 +25,9 @@ pub mod pagination;
 pub mod proactivity;
 pub mod profiles;
 pub mod reminders;
-pub mod seed;
 pub mod search;
 pub mod seat;
+pub mod seed;
 pub mod storage;
 pub mod tasks;
 pub mod timer;
@@ -108,7 +108,6 @@ pub async fn reembed_documents(
     }
     done
 }
-
 
 /// Best-effort seeding of core documents (manifest, standards, …) on open.
 async fn seed_core_if_missing(store: &dyn StorageBackend) {
@@ -261,20 +260,28 @@ async fn organize_document(
         names.join("\n"),
         doc.category.as_str(),
     );
-    let Ok(answer) = llm.reason(&prompt).await else { return };
+    // Сид документа: sampling-инференс работает только с сидом (иначе
+    // мгновенный отказ — дефолтная папка); локальные провайдеры игнорируют.
+    let seat = doc.seat_id.as_deref().unwrap_or("");
+    let Ok(answer) = llm.reason_for(seat, &prompt).await else {
+        return;
+    };
     let answer = answer.trim().to_lowercase();
     if answer.is_empty() || answer == "none" {
         return;
     }
-    let matched = projects.iter().find(|p| p.document_id == answer).or_else(|| {
-        projects.iter().find(|p| {
-            p.metadata
-                .extra
-                .get("name")
-                .and_then(|v| v.as_str())
-                .is_some_and(|n| n.to_lowercase() == answer)
-        })
-    });
+    let matched = projects
+        .iter()
+        .find(|p| p.document_id == answer)
+        .or_else(|| {
+            projects.iter().find(|p| {
+                p.metadata
+                    .extra
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|n| n.to_lowercase() == answer)
+            })
+        });
     if let Some(p) = matched {
         doc.metadata
             .extra
@@ -445,17 +452,38 @@ impl SlcEngine {
 
     /// Intelligent compression of a text via the reasoning LLM: keep the key
     /// facts within `max_chars` (размер сжатого текста для LLM-промпта, не
-    /// контекстный бюджет). Best-effort — on LLM failure the original
-    /// text is returned unchanged (callers never truncate by hand).
-    pub async fn summarize_text(&self, text: &str, max_chars: usize) -> SlcResult<String> {
+    /// контекстный бюджет). Seat-aware: sampling-инференс требует сид.
+    /// Best-effort — on LLM failure the original text is returned unchanged
+    /// (callers never truncate by hand).
+    pub async fn summarize_text_for(
+        &self,
+        seat_id: &str,
+        text: &str,
+        max_chars: usize,
+    ) -> SlcResult<String> {
         let prompt = format!(
             "Сожми следующий текст до ключевых фактов (не более {max_chars} символов).              Только факты, без воды, сохрани имена и цифры:\n\n{text}"
         );
-        let out = self.llm.reason(&prompt).await?.trim().to_string();
+        let out = self
+            .llm
+            .reason_for(seat_id, &prompt)
+            .await?
+            .trim()
+            .to_string();
         if out.is_empty() {
             return Ok(text.to_string());
         }
         Ok(out)
+    }
+
+    /// Seat-less variant for callers without a seat context (returns the
+    /// original text when the provider requires a seat, e.g. MCP sampling).
+    pub async fn summarize_text(&self, text: &str, max_chars: usize) -> SlcResult<String> {
+        match self.summarize_text_for("", text, max_chars).await {
+            Ok(s) => Ok(s),
+            Err(e) if e.to_string().contains("requires a non-empty seat") => Ok(text.to_string()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Effective context budget for a seat (TOKENS): per-seat override
@@ -1261,7 +1289,9 @@ fn spawn_ttl_cleanup(store: std::sync::Arc<dyn crate::storage::StorageBackend>) 
             // Paginated responses are global.
             let paginator = crate::pagination::Paginator::new(store.clone());
             match paginator.cleanup(crate::pagination::TTL_SECONDS).await {
-                Ok(n) if n > 0 => tracing::info!(removed = n, "expired paginated responses cleaned"),
+                Ok(n) if n > 0 => {
+                    tracing::info!(removed = n, "expired paginated responses cleaned")
+                }
                 Ok(_) => {}
                 Err(e) => tracing::warn!("pagination cleanup: {e}"),
             }
