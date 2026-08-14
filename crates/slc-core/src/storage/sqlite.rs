@@ -520,9 +520,8 @@ impl StorageBackend for SqliteStore {
                 doc.document_id, doc.category
             )));
         }
-        if doc.seat_id.is_none() {
-            return Err(SlcError::Storage("episodic docs must be seat-scoped".into()));
-        }
+        // Seat-less episodic docs are allowed (legacy import): they are not
+        // picked up by any per-seat pipeline, just stored as diary.
         let row = doc_to_row(doc)?;
         self.blocking(move |conn| {
             conn.execute(

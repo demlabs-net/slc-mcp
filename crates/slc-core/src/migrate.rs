@@ -23,12 +23,17 @@
 //! - **embeddings и идеи не переносятся** (перегенерация; концепция идей
 //!   удалена).
 
-use crate::error::SlcResult;
-use crate::model::{Document, DocumentCategory, Seat, SeatStatus, UsageStats};
+use crate::error::{SlcError, SlcResult};
+use crate::llm::LlmClient;
+use crate::model::{content_hash, DocMeta, Document, DocumentCategory, Seat, SeatStatus, UsageStats};
 use crate::storage::StorageBackend;
+use bson::{doc, Bson, Document as BsonDoc};
 use chrono::{DateTime, Utc};
+use mongodb::{Client, Collection};
 use serde_json::{Map, Value, json};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Duration;
 
 /// Result of a migration run.
 #[derive(Debug, Default, serde::Serialize)]
@@ -296,6 +301,478 @@ pub async fn migrate_legacy_vault(
     Ok(report)
 }
 
+// ─────────────────────────── MongoDB legacy migration ──────────────────────────
+
+/// Options for `migrate_legacy_mongo` (`slc-mcp migrate --from-mongo`).
+#[derive(Debug, Clone)]
+pub struct MongoMigrateOptions {
+    /// Legacy MongoDB URI (e.g. `mongodb://127.0.0.1:27017`).
+    pub uri: String,
+    /// Legacy database name (the Python server used `slc_mcp`).
+    pub database: String,
+}
+
+/// Result of a Mongo migration run.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct MongoMigrateReport {
+    /// KB documents imported (RAG-eligible categories).
+    pub documents: usize,
+    /// Episodic history docs imported (diary, not RAG).
+    pub history: usize,
+    /// Seats imported.
+    pub seats: usize,
+    /// KB ids renamed by the LLM (`--rename-with-ai`).
+    pub renamed_with_ai: usize,
+    /// Soft-deleted docs skipped.
+    pub skipped_deleted: usize,
+    pub errors: Vec<String>,
+}
+
+/// Normalized legacy document (from `slc_mcp.knowledge_base`).
+struct LegacyDoc {
+    document_id: String,
+    category: Option<String>,
+    content: String,
+    doc_type: Option<String>,
+    metadata: Map<String, Value>,
+    tags: Vec<String>,
+    auto_load: Vec<String>,
+    references: Vec<String>,
+    seat_id: Option<String>,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    version: i64,
+    deleted_at: Option<DateTime<Utc>>,
+}
+
+/// bson → serde_json (dates as RFC 3339 strings; exotic variants → debug).
+fn bson_to_json(v: &Bson) -> Value {
+    match v {
+        Bson::Double(f) => json!(f),
+        Bson::String(s) => json!(s),
+        Bson::Array(a) => Value::Array(a.iter().map(bson_to_json).collect()),
+        Bson::Document(d) => Value::Object(
+            d.iter().map(|(k, x)| (k.clone(), bson_to_json(x))).collect(),
+        ),
+        Bson::Boolean(b) => json!(b),
+        Bson::Int32(i) => json!(i),
+        Bson::Int64(i) => json!(i),
+        Bson::DateTime(dt) => json!(dt.to_chrono().to_rfc3339()),
+        Bson::Null | Bson::Undefined | Bson::MinKey | Bson::MaxKey => Value::Null,
+        other => json!(format!("{other:?}")),
+    }
+}
+
+fn bson_doc_to_map(d: &BsonDoc) -> Map<String, Value> {
+    match bson_to_json(&Bson::Document(d.clone())) {
+        Value::Object(m) => m,
+        _ => Map::new(),
+    }
+}
+
+fn bson_i64(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::Int32(i) => Some(*i as i64),
+        Bson::Int64(i) => Some(*i),
+        _ => None,
+    }
+}
+
+fn bson_strs(d: &BsonDoc, key: &str) -> Vec<String> {
+    d.get_array(key)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+fn extract_legacy_doc(raw: &BsonDoc) -> Option<LegacyDoc> {
+    let document_id = raw.get_str("document_id").ok()?.to_string();
+    let category = raw.get_str("category").ok().map(String::from);
+    let content = match raw.get("content") {
+        Some(Bson::String(s)) => s.clone(),
+        Some(other) => serde_json::to_string_pretty(&bson_to_json(other))
+            .unwrap_or_else(|_| other.to_string()),
+        None => String::new(),
+    };
+    let mut metadata = raw
+        .get_document("metadata")
+        .map(bson_doc_to_map)
+        .unwrap_or_default();
+    let doc_type = metadata
+        .remove("doc_type")
+        .or_else(|| metadata.remove("type"))
+        .and_then(|v| v.as_str().map(String::from));
+    Some(LegacyDoc {
+        document_id,
+        category,
+        content,
+        doc_type,
+        metadata,
+        tags: bson_strs(raw, "tags"),
+        auto_load: bson_strs(raw, "auto_load"),
+        references: bson_strs(raw, "references"),
+        seat_id: raw.get_str("seat_id").ok().map(String::from),
+        created_at: raw.get_datetime("created_at").ok().map(|d| d.to_chrono()),
+        updated_at: raw.get_datetime("updated_at").ok().map(|d| d.to_chrono()),
+        version: raw.get("version").and_then(bson_i64).unwrap_or(1),
+        deleted_at: raw.get_datetime("deleted_at").ok().map(|d| d.to_chrono()),
+    })
+}
+
+fn doc_category(doc: &LegacyDoc) -> DocumentCategory {
+    doc.category
+        .as_deref()
+        .and_then(DocumentCategory::parse)
+        .unwrap_or(DocumentCategory::Custom)
+}
+
+/// Lowercase ascii slug (words joined with `_`, ≤48 chars, empty → `""`).
+fn slugify(raw: &str) -> String {
+    raw.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .split('_')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+        .chars()
+        .take(48)
+        .collect()
+}
+
+/// Deterministic readable id for a legacy diary entry: date + id tail.
+/// History docs are not renamed by the LLM — there are hundreds of them.
+fn history_id(old_id: &str, created: Option<DateTime<Utc>>) -> String {
+    let date = created
+        .map(|d| d.format("%Y_%m_%d").to_string())
+        .unwrap_or_else(|| "undated".into());
+    let stripped = old_id.strip_prefix("history_").unwrap_or(old_id);
+    let tail: String = stripped
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let tail: String = tail.chars().rev().take(12).collect();
+    format!("history_{date}_{}", tail.chars().rev().collect::<String>())
+}
+
+/// Human slug from the first heading / first non-empty line.
+fn doc_slug(doc: &LegacyDoc) -> String {
+    let raw = doc
+        .content
+        .lines()
+        .find(|l| {
+            let t = l.trim();
+            !t.is_empty()
+        })
+        .map(|l| l.trim().trim_start_matches('#').trim().to_string())
+        .unwrap_or_default();
+    slugify(&raw)
+}
+
+/// Insert into `used`, appending `_2`, `_3`, … on collision.
+fn unique(base: String, used: &mut HashSet<String>) -> String {
+    if used.insert(base.clone()) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let cand = format!("{base}_{n}");
+        if used.insert(cand.clone()) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// KB id: AI slug (if provided) or deterministic fallback, with the category
+/// prefix; deduped against `used`.
+fn new_kb_id(doc: &LegacyDoc, ai: Option<String>, used: &mut HashSet<String>) -> String {
+    let base = match ai {
+        Some(slug) if !slug.is_empty() => {
+            format!("{}{}", category_prefix(doc_category(doc)), slug)
+        }
+        _ => {
+            let slug = doc_slug(doc);
+            if slug.is_empty() {
+                format!(
+                    "{}legacy_{}",
+                    category_prefix(doc_category(doc)),
+                    doc.document_id
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .take(24)
+                        .collect::<String>()
+                )
+            } else {
+                format!("{}{}", category_prefix(doc_category(doc)), slug)
+            }
+        }
+    };
+    unique(base, used)
+}
+
+/// Ask the LLM (reasoning model from the environment) for a short meaningful
+/// id for the document; sanitized to an ascii slug (empty on failure).
+async fn ai_slug(llm: &dyn LlmClient, doc: &LegacyDoc) -> Option<String> {
+    let snippet: String = doc.content.chars().take(600).collect();
+    let prompt = format!(
+        "Ты — сервис нейминга документов памяти SLC. По содержимому документа придумай \
+         короткий осмысленный id (slug): строчные ascii-буквы и цифры, слова через \
+         подчёркивание, максимум 6 слов, без префикса категории. Если текущий id уже \
+         осмысленный — можешь оставить его. Верни ТОЛЬКО id, без пояснений.\n\n\
+         Текущий id: {}\nДокумент:\n{}",
+        doc.document_id, snippet
+    );
+    let out = llm.reason(&prompt).await.ok()?;
+    let slug = slugify(&out);
+    if slug.is_empty() { None } else { Some(slug) }
+}
+
+/// Rewrite auto_load/references through the old→new id map (unknown ids —
+/// skipped docs, external refs — are kept as-is).
+fn fix_links(ids: &[String], id_map: &HashMap<String, String>) -> Vec<String> {
+    ids.iter()
+        .map(|id| id_map.get(id).cloned().unwrap_or_else(|| id.clone()))
+        .collect()
+}
+
+/// Legacy seat → new `Seat`. All seats are imported ACTIVE and non-expiring
+/// (every legacy seat id keeps working); the original status/expiry/active
+/// task are preserved in `metadata.legacy_*`. Handles both field layouts:
+/// the standard `last_accessed`/`usage_stats` and the recovered-from-JSON
+/// `last_activity`/`statistics`.
+fn extract_legacy_seat(raw: &BsonDoc) -> Option<Seat> {
+    let seat_id = raw.get_str("seat_id").ok()?.to_string();
+    let now = Utc::now();
+    let created_at = raw
+        .get_datetime("created_at")
+        .ok()
+        .map(|d| d.to_chrono())
+        .unwrap_or(now);
+    let last_accessed = raw
+        .get_datetime("last_accessed")
+        .ok()
+        .map(|d| d.to_chrono())
+        .or_else(|| raw.get_datetime("last_activity").ok().map(|d| d.to_chrono()))
+        .unwrap_or(created_at);
+
+    let mut metadata = raw
+        .get_document("metadata")
+        .map(bson_doc_to_map)
+        .unwrap_or_default();
+    if let Ok(st) = raw.get_str("status") {
+        if st != "active" {
+            metadata.insert("legacy_status".into(), json!(st));
+        }
+    }
+    if let Ok(exp) = raw.get_datetime("expires_at") {
+        metadata.insert("legacy_expires_at".into(), json!(exp.to_chrono().to_rfc3339()));
+    }
+    if let Ok(task) = raw.get_str("active_task_id") {
+        metadata.insert("legacy_active_task_id".into(), json!(task));
+    }
+
+    // Usage stats: standard `usage_stats` layout or recovered `statistics`.
+    let mut total_requests = 0i64;
+    let mut total_tokens = 0i64;
+    let mut tools_used = Map::new();
+    for key in ["usage_stats", "statistics"] {
+        let Ok(us) = raw.get_document(key) else { continue };
+        for (k, v) in us.iter() {
+            match k.as_str() {
+                "total_requests" => {
+                    if let Some(i) = bson_i64(v) {
+                        total_requests = i;
+                    }
+                }
+                "total_tokens" => {
+                    if let Some(i) = bson_i64(v) {
+                        total_tokens = i;
+                    }
+                }
+                "tools_used" | "tool_usage" => {
+                    if let Bson::Document(d) = v {
+                        tools_used = bson_doc_to_map(d);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Some(Seat {
+        seat_id,
+        name: raw.get_str("name").unwrap_or("unnamed").to_string(),
+        status: SeatStatus::Active,
+        created_at,
+        last_accessed,
+        expires_at: None,
+        metadata,
+        active_task_id: None,
+        active_document_id: None,
+        context: raw
+            .get_document("context")
+            .map(bson_doc_to_map)
+            .unwrap_or_default(),
+        usage_stats: UsageStats {
+            total_requests,
+            total_tokens,
+            tools_used,
+        },
+    })
+}
+
+/// Migrate the legacy Python MongoDB (`knowledge_base` + `seats` collections)
+/// into `target` (any new backend; Obsidian vault by default).
+///
+/// - KB documents keep their ids by default; with `rename_with_ai` the
+///   reasoning LLM from the environment proposes meaningful ids and
+///   `auto_load`/`references` are rewritten to the new ids.
+/// - `history` docs go to the episodic store (diary layout), not the KB.
+/// - Seats are imported Active and non-expiring (all seat ids keep working);
+///   the original status/expiry survive in `metadata.legacy_*`.
+pub async fn migrate_legacy_mongo(
+    opts: &MongoMigrateOptions,
+    target: &dyn StorageBackend,
+    llm: Option<&dyn LlmClient>,
+    rename_with_ai: bool,
+) -> SlcResult<MongoMigrateReport> {
+    let client = Client::with_uri_str(&opts.uri)
+        .await
+        .map_err(|e| SlcError::Storage(format!("mongodb connect: {e}")))?;
+    let db = client.database(&opts.database);
+    let mut report = MongoMigrateReport::default();
+
+    // ── knowledge_base → KB documents + episodic diary ──
+    let kb: Collection<BsonDoc> = db.collection("knowledge_base");
+    let mut cursor = kb
+        .find(doc! {})
+        .await
+        .map_err(|e| SlcError::Storage(format!("knowledge_base find: {e}")))?;
+    let mut docs = Vec::new();
+    while cursor
+        .advance()
+        .await
+        .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+    {
+        let raw: BsonDoc = cursor
+            .deserialize_current()
+            .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+        let Some(doc) = extract_legacy_doc(&raw) else { continue };
+        if doc.deleted_at.is_some() {
+            report.skipped_deleted += 1;
+            continue;
+        }
+        docs.push(doc);
+    }
+    // Deterministic order → stable ids across runs.
+    docs.sort_by_key(|d| d.created_at);
+
+    let mut used = HashSet::new();
+    let mut id_map: HashMap<String, String> = HashMap::new();
+    let mut jobs = Vec::with_capacity(docs.len());
+    for (i, doc) in docs.into_iter().enumerate() {
+        if doc_category(&doc) == DocumentCategory::History {
+            let new_id = unique(history_id(&doc.document_id, doc.created_at), &mut used);
+            id_map.insert(doc.document_id.clone(), new_id.clone());
+            jobs.push((doc, new_id));
+            continue;
+        }
+        let ai = if rename_with_ai {
+            match llm {
+                Some(l) => match tokio::time::timeout(Duration::from_secs(30), ai_slug(l, &doc)).await
+                {
+                    Ok(Some(slug)) => Some(slug),
+                    _ => None,
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        if ai.is_some() {
+            report.renamed_with_ai += 1;
+        }
+        let new_id = new_kb_id(&doc, ai, &mut used);
+        if new_id != doc.document_id {
+            id_map.insert(doc.document_id.clone(), new_id.clone());
+        }
+        jobs.push((doc, new_id));
+        if (i + 1) % 25 == 0 {
+            tracing::info!("migrate: обработано {} документов", i + 1);
+        }
+    }
+
+    let now = Utc::now();
+    for (doc, new_id) in jobs {
+        let cat = doc_category(&doc);
+        let legacy_id = doc.document_id.clone();
+        let mut meta = DocMeta {
+            doc_type: doc.doc_type,
+            ..Default::default()
+        };
+        meta.extra = doc.metadata;
+        meta.extra.insert("legacy_id".into(), json!(legacy_id));
+        let content = doc.content;
+        let content_hash_value = content_hash(&content);
+        let document = Document {
+            document_id: new_id,
+            category: cat,
+            folder: None,
+            content,
+            content_hash: content_hash_value,
+            metadata: meta,
+            tags: doc.tags,
+            auto_load: fix_links(&doc.auto_load, &id_map),
+            references: fix_links(&doc.references, &id_map),
+            seat_id: doc.seat_id,
+            created_at: doc.created_at.unwrap_or(now),
+            updated_at: doc.updated_at.unwrap_or(now),
+            version: doc.version.max(1),
+            deleted_at: None,
+        };
+        let res = if cat == DocumentCategory::History {
+            target.episodic_upsert(&document).await
+        } else {
+            target.kb_upsert(&document).await
+        };
+        match res {
+            Ok(_) => {
+                if cat == DocumentCategory::History {
+                    report.history += 1;
+                } else {
+                    report.documents += 1;
+                }
+            }
+            Err(e) => report.errors.push(format!("{} ({})", document.document_id, e)),
+        }
+    }
+
+    // ── seats ──
+    let seats: Collection<BsonDoc> = db.collection("seats");
+    let mut cursor = seats
+        .find(doc! {})
+        .await
+        .map_err(|e| SlcError::Storage(format!("seats find: {e}")))?;
+    while cursor
+        .advance()
+        .await
+        .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+    {
+        let raw: BsonDoc = cursor
+            .deserialize_current()
+            .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+        let Some(seat) = extract_legacy_seat(&raw) else { continue };
+        if let Err(e) = target.insert_seat(&seat).await {
+            report.errors.push(format!("seat {}: {e}", seat.seat_id));
+        } else {
+            report.seats += 1;
+        }
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +920,221 @@ mod tests {
         assert_eq!(human_id("project_", &fm, ""), "project_vassista_plan");
         let empty = Map::new();
         assert_eq!(human_id("doc_", &empty, ""), "doc_legacy_doc");
+    }
+
+    // ── MongoDB legacy migration ────────────────────────────────────────
+
+    #[test]
+    fn bson_to_json_maps_datetimes_and_docs() {
+        let dt = DateTime::parse_from_rfc3339("2026-03-10T09:49:34.582000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let doc = bson::doc! {
+            "s": "text", "i32": 1i32, "i64": 2i64, "f": 1.5f64, "b": true,
+            "dt": bson::DateTime::from_chrono(dt),
+            "nested": bson::doc! { "k": "v" },
+            "arr": ["a", "b"],
+            "null": null,
+        };
+        let j = bson_doc_to_map(&doc);
+        assert_eq!(j["s"], "text");
+        assert_eq!(j["i32"], 1);
+        assert_eq!(j["i64"], 2);
+        assert_eq!(j["b"], true);
+        assert_eq!(j["dt"], "2026-03-10T09:49:34.582+00:00");
+        assert_eq!(j["nested"]["k"], "v");
+        assert_eq!(j["arr"], json!(["a", "b"]));
+        assert_eq!(j["null"], Value::Null);
+    }
+
+    #[test]
+    fn extract_legacy_doc_normalizes_content_and_metadata() {
+        let dt = bson::DateTime::from_chrono(Utc::now());
+        let raw = bson::doc! {
+            "document_id": "core_slc_manifest",
+            "category": "DOCUMENTATION",          // case-insensitive parse
+            "content": bson::doc! { "name": "manifest", "version": 1 },
+            "metadata": bson::doc! { "type": "plan", "seed_version": 2, "loaded_at": dt },
+            "tags": ["a", "b"],
+            "auto_load": ["documentation_xyz"],
+            "references": ["custom_abc", "missing_doc"],
+            "seat_id": null,
+            "version": 3i32,
+        };
+        let d = extract_legacy_doc(&raw).unwrap();
+        assert_eq!(d.document_id, "core_slc_manifest");
+        assert_eq!(d.category.as_deref(), Some("DOCUMENTATION"));
+        assert_eq!(doc_category(&d), DocumentCategory::Documentation);
+        assert!(d.content.contains("\"name\": \"manifest\""));
+        assert_eq!(d.doc_type.as_deref(), Some("plan"));
+        assert_eq!(d.metadata["seed_version"], 2);
+        assert!(d.metadata.get("type").is_none(), "type moved to doc_type");
+        assert_eq!(d.tags, vec!["a", "b"]);
+        assert_eq!(d.auto_load, vec!["documentation_xyz"]);
+        assert_eq!(d.version, 3);
+        assert!(d.seat_id.is_none());
+        assert!(d.deleted_at.is_none());
+
+        // String content passes through untouched.
+        let raw2 = bson::doc! { "document_id": "x", "content": "просто текст" };
+        let d2 = extract_legacy_doc(&raw2).unwrap();
+        assert_eq!(d2.content, "просто текст");
+
+        // Soft-deleted docs are detectable.
+        let raw3 = bson::doc! { "document_id": "y", "deleted_at": dt };
+        assert!(extract_legacy_doc(&raw3).unwrap().deleted_at.is_some());
+    }
+
+    #[test]
+    fn extract_legacy_seat_handles_both_layouts() {
+        // Recovered-from-JSON layout: last_activity + statistics + deleted.
+        let raw = bson::doc! {
+            "seat_id": "recovered_seat_b2aa8d86",
+            "name": "test-laptop",
+            "status": "deleted",
+            "created_at": bson::DateTime::from_chrono(Utc::now()),
+            "last_activity": bson::DateTime::from_chrono(Utc::now()),
+            "expires_at": bson::DateTime::from_chrono(Utc::now()),
+            "metadata": bson::doc! { "migrated_from_json": true },
+            "statistics": bson::doc! {
+                "total_requests": 7i64, "total_tokens": 12i64,
+                "tool_usage": bson::doc! { "search": 3i64 },
+            },
+            "context": null,
+        };
+        let s = extract_legacy_seat(&raw).unwrap();
+        assert_eq!(s.seat_id, "recovered_seat_b2aa8d86");
+        assert_eq!(s.status, SeatStatus::Active, "все сиды активны");
+        assert!(s.expires_at.is_none(), "сиды не протухают");
+        assert_eq!(s.metadata["legacy_status"], "deleted");
+        let exp = s.metadata["legacy_expires_at"].as_str().unwrap();
+        assert!(
+            DateTime::parse_from_rfc3339(exp).is_ok(),
+            "legacy_expires_at должен быть RFC 3339: {exp}"
+        );
+        assert_eq!(s.metadata["migrated_from_json"], true);
+        assert!(s.context.is_empty(), "null context → empty map");
+        assert_eq!(s.usage_stats.total_requests, 7);
+        assert_eq!(s.usage_stats.total_tokens, 12);
+        assert_eq!(s.usage_stats.tools_used["search"], 3);
+
+        // Standard layout: last_accessed + usage_stats + active task.
+        let raw2 = bson::doc! {
+            "seat_id": "SuvU3sGLTW0fwNlIATtSNgcF6gf0cAo0FXSpeo4adKs",
+            "name": "mcp-client",
+            "status": "active",
+            "created_at": bson::DateTime::from_chrono(Utc::now()),
+            "last_accessed": bson::DateTime::from_chrono(Utc::now()),
+            "active_task_id": "task_eb36fa40",
+            "context": bson::doc! { "context_limit_chars": 8000i64 },
+            "usage_stats": bson::doc! { "total_requests": 1237i64, "tools_used": bson::doc! {} },
+        };
+        let s2 = extract_legacy_seat(&raw2).unwrap();
+        assert_eq!(s2.metadata["legacy_active_task_id"], "task_eb36fa40");
+        assert!(s2.active_task_id.is_none(), "указатель на легаси-таску в metadata");
+        assert_eq!(s2.context["context_limit_chars"], 8000);
+        assert_eq!(s2.usage_stats.total_requests, 1237);
+        assert!(s2.metadata.get("legacy_status").is_none());
+    }
+
+    #[test]
+    fn slugify_and_ids_are_unique_and_readable() {
+        assert_eq!(slugify("  SLC MCP Server #3! "), "slc_mcp_server_3");
+        assert_eq!(slugify("—"), "");
+        assert_eq!(slugify("…"), "");
+
+        let mut used = HashSet::new();
+        let a = unique("doc_x".into(), &mut used);
+        let b = unique("doc_x".into(), &mut used);
+        let c = unique("doc_x".into(), &mut used);
+        assert_eq!((a.as_str(), b.as_str(), c.as_str()), ("doc_x", "doc_x_2", "doc_x_3"));
+
+        let h = history_id("history_d5ae1bb1a5f52096", None);
+        assert!(h.starts_with("history_undated_"), "{h}");
+        let h2 = history_id(
+            "history_d5ae1bb1a5f52096",
+            Some(DateTime::parse_from_rfc3339("2026-03-10T09:49:34Z").unwrap().with_timezone(&Utc)),
+        );
+        assert_eq!(h2, "history_2026_03_10_1bb1a5f52096", "{h2}");
+        assert_ne!(h, h2);
+    }
+
+    #[test]
+    fn new_kb_id_prefers_ai_slug_and_falls_back() {
+        let d = LegacyDoc {
+            document_id: "doc_a1b2c3".into(),
+            category: Some("custom".into()),
+            content: "# План миграции SLC\n\nпереносим память".into(),
+            doc_type: None,
+            metadata: Map::new(),
+            tags: vec![],
+            auto_load: vec![],
+            references: vec![],
+            seat_id: None,
+            created_at: None,
+            updated_at: None,
+            version: 1,
+            deleted_at: None,
+        };
+        let mut used = HashSet::new();
+        let ai = new_kb_id(&d, Some("migration_slc_plan".into()), &mut used);
+        assert_eq!(ai, "doc_migration_slc_plan");
+        // Без AI: латинское "SLC" в заголовке даёт ascii-slug.
+        let fb = new_kb_id(&d, None, &mut used);
+        assert_eq!(fb, "doc_slc");
+        // Киррилический текст без заголовка — тот же fallback.
+        let d2 = LegacyDoc {
+            document_id: "doc_a1b2c3".into(),
+            content: "просто кириллический текст".into(),
+            ..Default::default()
+        };
+        let mut used2 = HashSet::new();
+        assert_eq!(new_kb_id(&d2, None, &mut used2), "doc_legacy_doc_a1b2c3");
+    }
+
+    #[tokio::test]
+    async fn ai_slug_uses_reasoning_model_and_sanitizes() {
+        use crate::llm::MockLlm;
+        let llm = MockLlm::new(vec!["  Simple-Name! ".to_string()]);
+        let d = LegacyDoc {
+            document_id: "doc_x".into(),
+            category: Some("module".into()),
+            content: "какой-то документ".into(),
+            ..Default::default()
+        };
+        let slug = ai_slug(&llm, &d).await.unwrap();
+        assert_eq!(slug, "simple_name");
+        // Не-ASCII ответ модели → пустой slug → None (fallback на детерминированный).
+        let llm2 = MockLlm::new(vec!["Простое-имя".to_string()]);
+        assert!(ai_slug(&llm2, &d).await.is_none());
+    }
+
+    #[test]
+    fn fix_links_rewrites_known_ids_and_keeps_unknown() {
+        let mut map = HashMap::new();
+        map.insert("old_a".to_string(), "doc_new_a".to_string());
+        map.insert("old_b".to_string(), "doc_new_b".to_string());
+        let out = fix_links(&["old_a".into(), "ghost".into(), "old_b".into()], &map);
+        assert_eq!(out, vec!["doc_new_a", "ghost", "doc_new_b"]);
+    }
+
+    impl Default for LegacyDoc {
+        fn default() -> Self {
+            LegacyDoc {
+                document_id: String::new(),
+                category: None,
+                content: String::new(),
+                doc_type: None,
+                metadata: Map::new(),
+                tags: Vec::new(),
+                auto_load: Vec::new(),
+                references: Vec::new(),
+                seat_id: None,
+                created_at: None,
+                updated_at: None,
+                version: 1,
+                deleted_at: None,
+            }
+        }
     }
 }

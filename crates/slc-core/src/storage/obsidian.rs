@@ -720,9 +720,8 @@ impl StorageBackend for ObsidianVaultStore {
         if doc.category != DocumentCategory::History {
             return Err(SlcError::Storage("only history docs go to the episodic store".into()));
         }
-        if doc.seat_id.is_none() {
-            return Err(SlcError::Storage("episodic docs must be seat-scoped".into()));
-        }
+        // Seat-less episodic docs are allowed (legacy import): they are not
+        // picked up by any per-seat pipeline, just stored as diary.
         if self.index.lock().unwrap().contains_key(&doc.document_id) {
             return Err(SlcError::Storage(format!("document already exists: {}", doc.document_id)));
         }
