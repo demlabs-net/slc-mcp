@@ -335,11 +335,7 @@ impl LlmClient for MockLlm {
     }
 
     async fn generate_embedding(&self, text: &str) -> SlcResult<Vec<f32>> {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(text.as_bytes());
-        let digest = h.finalize();
-        Ok(digest.iter().take(16).map(|b| *b as f32 / 255.0).collect())
+        Ok(cpu_hash_embedding(text))
     }
 
     fn embedding_model_name(&self) -> String {
@@ -421,6 +417,35 @@ impl LlmClient for McpSamplingLlm {
     }
 }
 
+/// Deterministic lexical embedding: char n-grams (2..=4) hashed into a
+/// 512-dim vector, L2-normalized. Shared by the CPU-hash fallback
+/// (`CpuHashLlm`) and the test mock (`MockLlm`) — the mock must be
+/// representative of a real embedder, or relevance tests lie (a naive
+/// positive-only hash correlates ~0.5 with ANY text and drowns the
+/// relevance gate in noise).
+fn cpu_hash_embedding(text: &str) -> Vec<f32> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let dim = 512usize;
+    let mut out = vec![0.0f32; dim];
+    // char n-grams (2..=4) hashed into the vector — cheap lexical signal.
+    let chars: Vec<char> = text.chars().collect();
+    for n in 2..=4 {
+        for w in chars.windows(n) {
+            let mut h = DefaultHasher::new();
+            w.hash(&mut h);
+            let idx = (h.finish() % dim as u64) as usize;
+            out[idx] += 1.0;
+        }
+    }
+    // L2-normalize.
+    let norm = out.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+    for v in out.iter_mut() {
+        *v /= norm;
+    }
+    out
+}
+
 /// CPU-only fallback LLM for weak machines/virtual machines: embeddings
 /// are deterministic hash features (n-gram → 512-dim) so hybrid search
 /// works without ANY model server; reasoning returns a clear error (the
@@ -436,26 +461,7 @@ impl LlmClient for CpuHashLlm {
     }
 
     async fn generate_embedding(&self, text: &str) -> SlcResult<Vec<f32>> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let dim = 512usize;
-        let mut out = vec![0.0f32; dim];
-        // char n-grams (2..=4) hashed into the vector — cheap lexical signal.
-        let chars: Vec<char> = text.chars().collect();
-        for n in 2..=4 {
-            for w in chars.windows(n) {
-                let mut h = DefaultHasher::new();
-                w.hash(&mut h);
-                let idx = (h.finish() % dim as u64) as usize;
-                out[idx] += 1.0;
-            }
-        }
-        // L2-normalize.
-        let norm = out.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
-        for v in out.iter_mut() {
-            *v /= norm;
-        }
-        Ok(out)
+        Ok(cpu_hash_embedding(text))
     }
 
     fn embedding_model_name(&self) -> String {
