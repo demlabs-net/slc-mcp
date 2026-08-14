@@ -119,10 +119,19 @@ async fn sse_endpoint(
         loop {
             match rx.recv().await {
                 Ok(evt) => {
-                    // Only forward notifications for this seat.
+                    // Only forward events for this seat.
                     let seat_matches = evt.get("seat_id").and_then(|v| v.as_str()).map(|s| s == seat).unwrap_or(true);
                     if seat_matches {
-                        yield Ok(Event::default().event("notification").data(evt.to_string()));
+                        // JSON-RPC replies (legacy SSE protocol) → `message`
+                        // event with the response as data; everything else is
+                        // a server notification.
+                        if evt.get("type").and_then(|v| v.as_str()) == Some("rpc_response") {
+                            if let Some(resp) = evt.get("response") {
+                                yield Ok(Event::default().event("message").data(resp.to_string()));
+                            }
+                        } else {
+                            yield Ok(Event::default().event("notification").data(evt.to_string()));
+                        }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -143,11 +152,34 @@ async fn messages(
     headers: axum::http::HeaderMap,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
+    // Legacy SSE transport (the SDK's `SSEClientTransport`, used by ZCode):
+    // POSTs JSON-RPC to /messages WITHOUT an `Accept` header and ignores the
+    // response body — the reply must arrive as an SSE `message` event on the
+    // /sse stream. Streamable-HTTP clients send `Accept: application/json…`
+    // and read the response inline.
+    let legacy_sse = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| !a.contains("application/json"))
+        .unwrap_or(true);
     let sid = headers
         .get("sessionId")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
-    let (status, Json(body)) = mcp(State(state), headers, Json(req)).await;
+    let seat = seat_from_request(&headers).unwrap_or_default();
+    let (status, Json(body)) = mcp(State(state.clone()), headers, Json(req)).await;
+    if legacy_sse {
+        // Reply via the seat's SSE stream (only for requests with an id;
+        // notifications get a bare 202).
+        if body.get("id").is_some() {
+            let _ = state.events.send(json!({
+                "type": "rpc_response",
+                "seat_id": seat,
+                "response": body,
+            }));
+        }
+        return (StatusCode::ACCEPTED, Json(json!({}))).into_response();
+    }
     if let Some(sid) = sid {
         if body.get("result").is_some() {
             let mut b = body;
