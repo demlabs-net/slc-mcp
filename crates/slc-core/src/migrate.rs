@@ -370,11 +370,10 @@ mod tests {
         assert_eq!(report.skipped_ideas, 1, "ideas concept is gone");
         assert!(report.errors.is_empty(), "{:?}", report.errors);
 
-        // Human-readable ids: slug from the name/title.
-        let proj = store.kb_get("project_vassista_plan").await.unwrap();
-        assert!(proj.is_none(), "old id must NOT be kept for named docs");
-        let proj = store.kb_get("project_vassista_plan").await.unwrap();
-        let _ = proj;
+        // Human-readable ids: slug from the name/title (here the legacy id
+        // already equals the slug, so the same document is found by it).
+        let proj = store.kb_get("project_vassista_plan").await.unwrap().expect("project doc");
+        assert_eq!(proj.category, DocumentCategory::Project);
         let by_new = store
             .kb_find(
                 &crate::storage::DocFilter {
