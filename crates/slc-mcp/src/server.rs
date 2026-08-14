@@ -14,7 +14,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Value, json};
-use slc_core::{DocMeta, Document, DocumentCategory, SlcEngine};
+use slc_core::{DocFilter, DocMeta, DocSort, Document, DocumentCategory, SlcEngine, SortDir};
 use std::sync::Arc;
 
 pub struct AppState {
@@ -287,9 +287,10 @@ async fn mcp(
                 if let Some(seat) = seat_hdr.as_deref() {
                     // The seat may not exist yet — create it first.
                     let _ = engine.seats.ensure_seat(seat).await;
-                    // SLC budget = 50% of the client's model window: the rest
-                    // is left for the conversation itself.
-                    let limit = window / 2;
+                    // SLC budget = 50% of the client's model window (the rest
+                    // is left for the conversation itself), capped at the
+                    // configured limit (SLC_CONTEXT_LIMIT_CHARS).
+                    let limit = (window / 2).min(engine.config.context_limit_chars as u64);
                     let _ = engine
                         .seats
                         .set_context_key(seat, "context_limit_chars", json!(limit))
@@ -995,8 +996,64 @@ async fn build_context(
     Ok(
         json!({"docs": docs, "seat": seat_id, "save_info": save_info,
                    "limit_chars": limit, "used_chars": used, "compressed": compressed,
-                   "warning": warning}),
+                   "warning": warning,
+                   "active_document": engine.seats.get_active_document(seat_id).await.map_err(json_err)?,
+                   "projects": project_list(engine).await?,
+                   "tasks": task_list(engine, Some(seat_id)).await?}),
     )
+}
+
+/// Compact list of project documents: id + name (metadata.extra["name"]).
+async fn project_list(engine: &SlcEngine) -> Result<Vec<Value>, Value> {
+    let projects = engine
+        .store()
+        .kb_find(
+            &DocFilter {
+                category: Some(DocumentCategory::Project),
+                ..Default::default()
+            },
+            &DocSort::by_created(SortDir::Asc),
+            100,
+        )
+        .await
+        .map_err(json_err)?;
+    Ok(projects
+        .iter()
+        .map(|p| {
+            json!({
+                "document_id": p.document_id,
+                "name": p.metadata.extra.get("name").and_then(|v| v.as_str()).unwrap_or(&p.document_id),
+                "updated_at": p.updated_at.to_rfc3339(),
+            })
+        })
+        .collect())
+}
+
+/// Compact list of task documents: id + status + project binding.
+async fn task_list(engine: &SlcEngine, _seat_id: Option<&str>) -> Result<Vec<Value>, Value> {
+    let tasks = engine
+        .store()
+        .kb_find(
+            &DocFilter {
+                category: Some(DocumentCategory::Task),
+                ..Default::default()
+            },
+            &DocSort::by_updated(SortDir::Desc),
+            100,
+        )
+        .await
+        .map_err(json_err)?;
+    Ok(tasks
+        .iter()
+        .map(|t| {
+            json!({
+                "document_id": t.document_id,
+                "status": t.metadata.extra.get("status").and_then(|v| v.as_str()).unwrap_or("active"),
+                "project": t.project_slug(),
+                "updated_at": t.updated_at.to_rfc3339(),
+            })
+        })
+        .collect())
 }
 
 async fn call_tool(
@@ -1042,9 +1099,12 @@ async fn call_tool(
                         .await
                         .map_err(json_err)?;
                     let focuses = engine.focus_list(seat_id, None).await.map_err(json_err)?;
+                    let projects = project_list(engine).await?;
+                    let tasks = task_list(engine, Some(seat_id)).await?;
                     Ok(
                         json!({"limit_chars": limit, "active_document": active.map(|d| d.document_id),
-                           "focus_count": focuses.len(), "seat_context": seat.map(|s| s.context)}),
+                           "focus_count": focuses.len(), "seat_context": seat.map(|s| s.context),
+                           "projects": projects, "tasks": tasks}),
                     )
                 }
                 "update_context" => {
@@ -1071,9 +1131,30 @@ async fn call_tool(
                     )
                     .await
                 }
+                "search" => {
+                    // Поиск по документам БЗ: /search <запрос>.
+                    let query = parts.collect::<Vec<_>>().join(" ");
+                    if query.is_empty() {
+                        return Err(
+                            json!({"code": -32602, "message": "usage: /search <query>"}),
+                        );
+                    }
+                    let hits = engine
+                        .search(&query, Some(seat_id), 10)
+                        .await
+                        .map_err(json_err)?;
+                    Ok(json!({"results": hits.iter().map(|h| json!({
+                        "document_id": h.document.document_id,
+                        "category": h.document.category.as_str(),
+                        "folder": h.document.folder,
+                        "score": h.rank_score,
+                        "snippet": h.document.content.chars().take(200).collect::<String>(),
+                    })).collect::<Vec<_>>()}))
+                }
                 "help" => Ok(json!({"commands": [
                     "/limit <chars> — установить лимит контекста (символы)",
-                    "/ctx — показать текущий срез контекста (лимит, активный документ, фокусы)",
+                    "/ctx — показать текущий срез контекста (лимит, активный документ, проекты, задачи, фокусы)",
+                    "/search <query> — поиск по документам БЗ",
                     "/update_context [summary] — собрать контекст (как MCP-тул)",
                     "/save_context <summary> — сохранить снимок контекста в историю",
                     "/help — этот список",
@@ -1650,6 +1731,14 @@ async fn call_tool(
         }
     }
     let mut result = json!({"content": [{"type": "text", "text": text}], "isError": false});
+    // structuredContent: некоторые клиенты требуют его, когда у тула есть
+    // outputSchema (MCP SDK валидирует). Отдаём всегда — JSON, если текст
+    // парсится, иначе {"text": …}.
+    if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+        result["structuredContent"] = parsed;
+    } else {
+        result["structuredContent"] = json!({"text": text});
+    }
     // Pagination envelope: cache oversized list responses and tag them.
     if text.chars().count() > 20000 {
         let response_id = uid("resp");
