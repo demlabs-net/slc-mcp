@@ -125,6 +125,33 @@ impl CandleEmbeddingLlm {
         llm
     }
 
+    /// Конструктор с явной конфигурацией (используется `slc-mcp init`
+    /// для контрольной проверки без чтения env). `device` — `auto` |
+    /// `cuda` | `metal` | `cpu`.
+    pub fn with_config(repo_id: impl Into<String>, device: &str) -> Self {
+        let device_kind = match device {
+            "cuda" => DeviceKind::Cuda,
+            "metal" => DeviceKind::Metal,
+            "cpu" => DeviceKind::Cpu,
+            _ => detect_device(),
+        };
+        let repo_id = repo_id.into();
+        let llm = Self { repo_id, device_kind, state: Mutex::new(LoadState::Loading), cond: Condvar::new() };
+        if llm.model_cached() {
+            let worker = llm.clone_for_loader();
+            std::thread::Builder::new()
+                .name("slc-embed-loader".into())
+                .spawn(move || worker.load_in_background())
+                .expect("spawn slc-embed-loader");
+        } else {
+            *llm.state.lock().unwrap() = LoadState::Failed(format!(
+                "model {} is not in the cache — run `slc-mcp init` to download it",
+                llm.repo_id
+            ));
+        }
+        llm
+    }
+
     /// True when the caller asked for a GPU-backed model (used by the engine
     /// to decide the default: GPU → onboard candle, otherwise → CPU-hash).
     pub fn gpu_requested(&self) -> bool {
