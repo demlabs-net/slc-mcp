@@ -193,6 +193,20 @@ impl SlcEngine {
         self.store.as_ref()
     }
 
+    /// Intelligent compression of a text via the reasoning LLM: keep the key
+    /// facts within `budget_chars`. Best-effort — on LLM failure the original
+    /// text is returned unchanged (callers never truncate by hand).
+    pub async fn summarize_text(&self, text: &str, budget_chars: usize) -> SlcResult<String> {
+        let prompt = format!(
+            "Сожми следующий текст до ключевых фактов (не более {budget_chars} символов).              Только факты, без воды, сохрани имена и цифры:\n\n{text}"
+        );
+        let out = self.llm.reason(&prompt).await?.trim().to_string();
+        if out.is_empty() {
+            return Ok(text.to_string());
+        }
+        Ok(out)
+    }
+
     /// Effective context budget for a seat (characters): per-seat override
     /// (`seat.context["context_limit_chars"]`) wins over the config default.
     pub async fn context_limit_for(&self, seat_id: &str) -> SlcResult<usize> {
@@ -705,5 +719,29 @@ pub unsafe extern "C" fn slc_free_string(ptr: *mut std::os::raw::c_char) {
     if !ptr.is_null() {
         // SAFETY: ptr came from CString::into_raw.
         drop(unsafe { CString::from_raw(ptr) });
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn summarize_text_uses_llm_and_falls_back() {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        // LLM returns a short summary → used.
+        let llm: std::sync::Arc<dyn LlmClient> =
+            std::sync::Arc::new(MockLlm::new(vec!["краткий факт".into()]));
+        let engine = SlcEngine::with(store.clone(), llm, SlcConfig::default());
+        let out = engine.summarize_text("очень длинный текст", 100).await.unwrap();
+        assert_eq!(out, "краткий факт");
+
+        // LLM yields a long echo (no real compression) → the text is never
+        // truncated by hand to the budget.
+        let llm2: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
+        let engine2 = SlcEngine::with(store, llm2, SlcConfig::default());
+        let out2 = engine2.summarize_text("очень длинный текст", 5).await.unwrap();
+        assert!(out2.len() > 5, "no manual truncation: {out2}");
     }
 }
