@@ -22,7 +22,8 @@ const CORE_DOCS: [(&str, &[&str]); 4] = [
 ];
 
 /// Текущая версия сида. bump = перезапись системных core-документов.
-const SEED_VERSION: i64 = 2;
+/// v3: манифест синхронизирован с кодом (токены, byte cap, drop-core).
+const SEED_VERSION: i64 = 3;
 
 /// v1-документы, которых больше нет в комплекте (легаси JSON-сид).
 const LEGACY_V1_DOCS: [&str; 5] = [
