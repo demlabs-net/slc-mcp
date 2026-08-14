@@ -536,6 +536,19 @@ impl SlcEngine {
         Ok(())
     }
 
+    /// Re-embed a document by id (after task/project/document updates that
+    /// change the body) so semantic search sees the current content.
+    /// Best-effort: returns false when the doc is missing or embedding failed.
+    pub async fn reembed_document(&self, document_id: &str) -> bool {
+        match self.store.kb_get(document_id).await {
+            Ok(Some(doc)) => {
+                self.embed_document(&doc).await;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Embed one document for semantic search (chunk_total = 1; long docs
     /// are truncated by the model's max length). Best-effort by design.
     async fn embed_document(&self, doc: &Document) {
@@ -817,6 +830,7 @@ impl SlcEngine {
         task_id: &str,
         name: Option<&str>,
         description: Option<&str>,
+        description_patch: Option<&serde_json::Value>,
         project_id: Option<Option<&str>>,
         auto_load: Option<&[String]>,
         status: Option<&str>,
@@ -828,6 +842,7 @@ impl SlcEngine {
             task_id,
             name,
             description,
+            description_patch,
             project_id,
             auto_load,
             status,
@@ -925,6 +940,7 @@ impl SlcEngine {
         project_id: &str,
         name: Option<&str>,
         description: Option<&str>,
+        description_patch: Option<&serde_json::Value>,
         auto_load: Option<&[String]>,
         status: Option<&str>,
         metadata: Option<&serde_json::Value>,
@@ -935,6 +951,7 @@ impl SlcEngine {
             project_id,
             name,
             description,
+            description_patch,
             auto_load,
             status,
             metadata,

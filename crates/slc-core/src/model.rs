@@ -465,3 +465,54 @@ pub fn unique_id(prefix: &str) -> String {
     let u = uuid::Uuid::new_v4().simple().to_string();
     format!("{prefix}_{}", &u[..12])
 }
+
+/// Кириллица → латиница (для говорящих id из русских названий).
+fn translit_char(c: char, upper: bool) -> Option<String> {
+    const LOWER: &[(&str, &str)] = &[
+        ("а", "a"), ("б", "b"), ("в", "v"), ("г", "g"), ("д", "d"), ("е", "e"),
+        ("ё", "yo"), ("ж", "zh"), ("з", "z"), ("и", "i"), ("й", "y"), ("к", "k"),
+        ("л", "l"), ("м", "m"), ("н", "n"), ("о", "o"), ("п", "p"), ("р", "r"),
+        ("с", "s"), ("т", "t"), ("у", "u"), ("ф", "f"), ("х", "h"), ("ц", "ts"),
+        ("ч", "ch"), ("ш", "sh"), ("щ", "sch"), ("ъ", ""), ("ы", "y"), ("ь", ""),
+        ("э", "e"), ("ю", "yu"), ("я", "ya"),
+    ];
+    let lower: String = c.to_lowercase().collect();
+    for (ru, lat) in LOWER {
+        if ru == &lower {
+            let out = if upper {
+                let mut ch = lat.chars();
+                match ch.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + ch.as_str(),
+                    None => String::new(),
+                }
+            } else {
+                (*lat).to_string()
+            };
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Говорящий слаг из названия: транслит кириллицы, lowercase, не-буквы → `_`,
+/// пустые сегменты схлопываются, до 48 символов. Пустой результат → `task`-
+/// стиль callers должен заменить на unique_id.
+pub fn slug_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if let Some(t) = translit_char(c, c.is_uppercase()) {
+            out.push_str(&t);
+        } else {
+            out.push('_');
+        }
+    }
+    let slug: String = out
+        .to_lowercase()
+        .split('_')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    slug.chars().take(48).collect()
+}
