@@ -1052,7 +1052,6 @@ fn row_to_timer(row: &Row) -> rusqlite::Result<PersistedTimer> {
         timer_type: match timer_type.as_str() {
             "CONSOLIDATION" => TimerType::Consolidation,
             "HISTORY_COMPRESSION" => TimerType::HistoryCompression,
-            "REFLECTION" => TimerType::Reflection,
             "FOCUS_REMINDER" => TimerType::FocusReminder,
             _ => TimerType::Reminder,
         },

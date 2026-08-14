@@ -29,7 +29,6 @@ pub trait TimerHandler: Send + Sync {
 pub fn default_interval(timer_type: TimerType) -> i64 {
     let (key, fallback) = match timer_type {
         TimerType::FocusReminder => ("FOCUS_REMINDER_INTERVAL_SEC", 900),
-        TimerType::Reflection => ("REFLECTION_INTERVAL_SEC", 7200),
         TimerType::HistoryCompression => ("HISTORY_COMPRESSION_INTERVAL_SEC", 86400),
         TimerType::Consolidation => ("CONSOLIDATION_INTERVAL_SEC", 86400),
         TimerType::Reminder => return 0, // reminder timers are one-shot
@@ -41,9 +40,8 @@ pub fn default_interval(timer_type: TimerType) -> i64 {
 }
 
 /// All periodic timer types created per seat on first use.
-pub const DEFAULT_PERIODIC_TIMERS: [TimerType; 4] = [
+pub const DEFAULT_PERIODIC_TIMERS: [TimerType; 3] = [
     TimerType::FocusReminder,
-    TimerType::Reflection,
     TimerType::HistoryCompression,
     TimerType::Consolidation,
 ];
@@ -361,17 +359,16 @@ mod tests {
         let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
         let registry = TimerRegistry::new(store.clone());
         let created = registry.create_defaults("seat_d").await.unwrap();
-        assert_eq!(created.len(), 4, "all four periodic defaults (ideas removed)");
+        assert_eq!(created.len(), 3, "all three periodic defaults");
         let again = registry.create_defaults("seat_d").await.unwrap();
         assert!(again.is_empty(), "idempotent");
-        assert_eq!(registry.list(Some("seat_d")).await.unwrap().len(), 4);
+        assert_eq!(registry.list(Some("seat_d")).await.unwrap().len(), 3);
     }
 
     #[test]
     fn interval_env_fallbacks() {
         assert_eq!(default_interval(TimerType::HistoryCompression), 86400);
         assert_eq!(default_interval(TimerType::FocusReminder), 900);
-        assert_eq!(default_interval(TimerType::Reflection), 7200);
         assert_eq!(default_interval(TimerType::Consolidation), 86400);
     }
 
