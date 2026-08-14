@@ -497,4 +497,38 @@ mod tests {
         let pos = ranked.iter().position(|h| h.document.document_id == "vassista-plan").unwrap();
         assert!(pos <= 1, "high-importance doc should rank near the top: {pos}");
     }
+
+    #[tokio::test]
+    async fn stale_embeddings_are_filtered_and_refreshed() {
+        let store: std::sync::Arc<dyn crate::storage::StorageBackend> =
+            std::sync::Arc::new(SqliteStore::in_memory().unwrap());
+        for d in sample_docs() {
+            store.kb_insert(&d).await.unwrap();
+        }
+        // Записи от "старой модели" (dim=2) — как после смены эмбеддера.
+        for id in ["rust-patterns", "vassista-plan", "grocery-list"] {
+            store
+                .insert_embeddings(&[crate::model::EmbeddingRecord {
+                    document_id: id.into(),
+                    chunk_index: 0,
+                    chunk_total: 1,
+                    embedding: vec![0.1, 0.2],
+                    embedding_model: "old-model".into(),
+                    embedding_dimension: 2,
+                    generated_at: chrono::Utc::now(),
+                    scope: crate::model::EmbeddingScope::Public,
+                    seat_id: None,
+                }])
+                .await
+                .unwrap();
+        }
+        let llm: std::sync::Arc<dyn crate::llm::LlmClient> = std::sync::Arc::new(MockLlm::default()); // dim=16
+        let svc = SearchService::new(store.clone(), llm, 0.7, 0.3);
+        let hits = svc.search("voice assistant memory", None, None, 5, None).await.unwrap();
+        assert!(!hits.is_empty(), "search must not break on stale embeddings");
+        // One-shot refresh re-embedded everything under the current model.
+        for r in store.all_embeddings(crate::model::EmbeddingScope::Public, None).await.unwrap() {
+            assert_eq!(r.embedding_dimension, 16, "stale embedding must be re-embedded: {}", r.document_id);
+        }
+    }
 }
