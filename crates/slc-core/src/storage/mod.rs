@@ -13,7 +13,7 @@
 //! separation here makes "history is not RAG'd" an invariant of the type
 //! system, not a filter that can be forgotten.
 
-// pub mod mongodb; // TEMP verification
+pub mod mongodb;
 pub mod obsidian;
 pub mod sqlite;
 

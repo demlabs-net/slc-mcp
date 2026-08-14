@@ -10,6 +10,7 @@ mod server;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use slc_core::{DocumentCategory, SlcConfig, SlcEngine, StorageKind};
 
 #[derive(Parser)]
@@ -76,6 +77,16 @@ enum Cmd {
         #[command(subcommand)]
         action: GraveyardAction,
     },
+    /// Migrate a legacy Python SLC vault into the current storage
+    /// (id → human-readable names, folders by category in Obsidian).
+    Migrate {
+        /// Legacy vault root (vault/<collection>/<stem>.md layout).
+        #[arg(long)]
+        from: PathBuf,
+        /// Target Obsidian vault (default: $SLC_VAULT_PATH).
+        #[arg(long)]
+        to_vault: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -128,6 +139,15 @@ async fn main() -> anyhow::Result<()> {
             config.auto_git_commit = auto_commit;
             let engine = SlcEngine::open_async(config).await?;
             server::run(engine, port).await
+        }
+        Cmd::Migrate { from, to_vault } => {
+            let engine = SlcEngine::open_async(config).await?;
+            let report = slc_core::migrate::migrate_legacy_vault(&from, engine.store()).await?;
+            println!("migration complete: {report:?}");
+            if let Some(v) = to_vault {
+                println!("target vault: {}", v.display());
+            }
+            Ok(())
         }
         Cmd::Status => {
             let backend = if cli.mongodb {

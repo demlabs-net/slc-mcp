@@ -114,7 +114,11 @@ fn normalize_dates(b: &mut BsonDoc, to_datetime: bool) {
                 }
             }
             (false, Some(Bson::DateTime(d))) => {
-                b.insert(key, Bson::String(d.to_chrono().to_rfc3339()));
+                use chrono::SecondsFormat;
+                b.insert(
+                    key,
+                    Bson::String(d.to_chrono().to_rfc3339_opts(SecondsFormat::AutoSi, true)),
+                );
             }
             _ => {}
         }
@@ -774,7 +778,8 @@ mod tests {
         assert_eq!(back.content, doc.content);
         assert_eq!(back.tags, doc.tags);
         assert_eq!(back.seat_id, doc.seat_id);
-        assert_eq!(back.created_at, doc.created_at);
+        // BSON datetimes are millisecond-precision.
+        assert_eq!(back.created_at.timestamp_millis(), doc.created_at.timestamp_millis());
     }
 
     #[test]
@@ -791,7 +796,7 @@ mod tests {
         let tags = q.get("tags").unwrap().as_document().unwrap();
         assert_eq!(tags.get_array("$in").unwrap().len(), 2);
         assert_eq!(tags.get_array("$all").unwrap().len(), 1);
-        assert!(q.get("deleted_at").unwrap().as_document().unwrap().contains_key("$exists"));
+        assert!(q.get("deleted_at").unwrap().as_null().is_some(), "deleted=false → null filter");
     }
 
     #[test]
