@@ -64,8 +64,34 @@ pub async fn run(
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("SLC MCP listening on http://{addr}/mcp (SSE: /sse → /messages)");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    tracing::info!("SLC MCP stopped gracefully");
     Ok(())
+}
+
+/// Wait for Ctrl-C or SIGTERM (docker stop) — clean shutdown so SSE clients
+/// see a proper close and reconnect instead of a dropped connection.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -152,33 +178,24 @@ async fn messages(
     headers: axum::http::HeaderMap,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    // Legacy SSE transport (the SDK's `SSEClientTransport`, used by ZCode):
-    // POSTs JSON-RPC to /messages WITHOUT an `Accept` header and ignores the
-    // response body — the reply must arrive as an SSE `message` event on the
-    // /sse stream. Streamable-HTTP clients send `Accept: application/json…`
-    // and read the response inline.
-    let legacy_sse = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|a| !a.contains("application/json"))
-        .unwrap_or(true);
     let sid = headers
         .get("sessionId")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let seat = seat_from_request(&headers).unwrap_or_default();
     let (status, Json(body)) = mcp(State(state.clone()), headers, Json(req)).await;
-    if legacy_sse {
-        // Reply via the seat's SSE stream (only for requests with an id;
-        // notifications get a bare 202).
-        if body.get("id").is_some() {
-            let _ = state.events.send(json!({
-                "type": "rpc_response",
-                "seat_id": seat,
-                "response": body,
-            }));
-        }
-        return (StatusCode::ACCEPTED, Json(json!({}))).into_response();
+    // Ответ доставляется ДВУМЯ путями сразу:
+    // 1. SSE-событие `message` на потоке /sse — легаси-SSE клиенты (SDK
+    //    SSEClientTransport) игнорируют тело POST и ждут ответ там;
+    // 2. inline-тело — streamable-HTTP клиенты и гибридные клиенты, которые
+    //    читают ответ из тела.
+    // Лишний канал просто игнорируется клиентом, чей pending уже resolved.
+    if body.get("id").is_some() {
+        let _ = state.events.send(json!({
+            "type": "rpc_response",
+            "seat_id": seat,
+            "response": body,
+        }));
     }
     if let Some(sid) = sid {
         if body.get("result").is_some() {
