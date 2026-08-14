@@ -66,6 +66,8 @@ struct Loaded {
     pooling: Pooling,
     /// e5-семейство требует префиксов query:/passage:.
     e5_prefix: bool,
+    /// Id токена паддинга (для батч-инференса).
+    pad_id: u32,
 }
 
 enum LoadState {
@@ -350,6 +352,9 @@ impl CandleEmbeddingLlm {
             EncodeModel::Bert(m)
         };
 
+        // Токен паддинга для батч-инференса (<pad> в bert/xlm-r словарях).
+        let pad_id = tokenizer.token_to_id("<pad>").unwrap_or(0);
+
         Ok(Loaded {
             model,
             tokenizer,
@@ -357,11 +362,12 @@ impl CandleEmbeddingLlm {
             dim,
             pooling,
             e5_prefix,
+            pad_id,
         })
     }
 
-    /// Синхронный эмбеддинг (токенизация + forward + pooling). Вызывается
-    /// только из `spawn_blocking` — candle-операции блокирующие.
+    /// Синхронный эмбеддинг одного текста (токенизация + forward + pooling).
+    /// Вызывается только из `spawn_blocking` — candle-операции блокирующие.
     fn embed_loaded(loaded: &Loaded, text: &str, kind: EmbeddingKind) -> SlcResult<Vec<f32>> {
         let embed = (|| -> Result<Vec<f32>, String> {
             let text = match (loaded.e5_prefix, kind) {
@@ -387,34 +393,134 @@ impl CandleEmbeddingLlm {
             let token_types =
                 Tensor::zeros((1, len), DType::U32, &loaded.device).map_err(|e| e.to_string())?;
 
-            let out: Tensor = match &loaded.model {
-                EncodeModel::Bert(m) => m
-                    .forward(&ids, &token_types, Some(&mask))
-                    .map_err(|e| e.to_string())?,
-                EncodeModel::XlmRoberta(m) => m
-                    .forward(&ids, &mask, &token_types, None, None, None)
-                    .map_err(|e| e.to_string())?,
-            };
-            let hidden = out.get(0).map_err(|e| e.to_string())?; // (seq, hidden)
-            let pooled = match loaded.pooling {
-                Pooling::Cls => hidden.get(0).map_err(|e| e.to_string())?,
-                Pooling::Mean => hidden.mean(0).map_err(|e| e.to_string())?,
-            };
-            let norm = pooled
-                .sqr()
-                .map_err(|e| e.to_string())?
-                .sum_all()
-                .map_err(|e| e.to_string())?
-                .sqrt()
-                .map_err(|e| e.to_string())?;
-            let vec: Vec<f32> = pooled
-                .broadcast_div(&norm)
+            let out = Self::forward(loaded, &ids, &mask, &token_types)?;
+            let pooled = Self::pool(loaded, &out, &mask)?; // (1, hidden)
+            let vec: Vec<f32> = Self::normalize(&pooled)?
+                .squeeze(0)
                 .map_err(|e| e.to_string())?
                 .to_vec1()
                 .map_err(|e| e.to_string())?;
             Ok(vec)
         })();
         embed.map_err(|e| SlcError::Storage(format!("candle embed: {e}")))
+    }
+
+    /// Синхронный БАТЧ-эмбеддинг: один forward на все тексты (паддинг до
+    /// максимальной длины в батче). Для индексации/реиндекса — на порядок
+    /// быстрее последовательных вызовов. Только из `spawn_blocking`.
+    fn embed_batch(
+        loaded: &Loaded,
+        texts: &[String],
+        kind: EmbeddingKind,
+    ) -> SlcResult<Vec<Vec<f32>>> {
+        let embed = (|| -> Result<Vec<Vec<f32>>, String> {
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Токенизация + префиксы e5.
+            let mut encodings: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
+            for t in texts {
+                let t = match (loaded.e5_prefix, kind) {
+                    (true, EmbeddingKind::Query) => format!("query: {t}"),
+                    (true, EmbeddingKind::Passage) => format!("passage: {t}"),
+                    _ => t.clone(),
+                };
+                let enc = loaded
+                    .tokenizer
+                    .encode(t, true)
+                    .map_err(|e| format!("tokenize: {e}"))?;
+                encodings.push(enc.get_ids().to_vec());
+            }
+            let max_len = encodings.iter().map(|v| v.len()).max().unwrap_or(1).max(1);
+            let batch = encodings.len();
+
+            // Плотный паддинг + attention-маска.
+            let mut ids: Vec<u32> = Vec::with_capacity(batch * max_len);
+            let mut mask: Vec<u32> = Vec::with_capacity(batch * max_len);
+            for e in &encodings {
+                ids.extend(e.iter());
+                ids.extend(std::iter::repeat(loaded.pad_id).take(max_len - e.len()));
+                mask.extend(std::iter::repeat(1u32).take(e.len()));
+                mask.extend(std::iter::repeat(0u32).take(max_len - e.len()));
+            }
+            let ids = Tensor::new(ids, &loaded.device)
+                .map_err(|e| e.to_string())?
+                .reshape((batch, max_len))
+                .map_err(|e| e.to_string())?;
+            let mask_t = Tensor::new(mask, &loaded.device)
+                .map_err(|e| e.to_string())?
+                .reshape((batch, max_len))
+                .map_err(|e| e.to_string())?;
+            let token_types = Tensor::zeros((batch, max_len), DType::U32, &loaded.device)
+                .map_err(|e| e.to_string())?;
+
+            let out = Self::forward(loaded, &ids, &mask_t, &token_types)?; // (batch, seq, hidden)
+            let pooled = Self::pool(loaded, &out, &mask_t)?; // (batch, hidden)
+            let normed = Self::normalize(&pooled)?;
+            normed.to_vec2().map_err(|e| e.to_string())
+        })();
+        embed.map_err(|e| SlcError::Storage(format!("candle embed batch: {e}")))
+    }
+
+    /// Общий forward: bert/xlm-roberta → (batch, seq, hidden).
+    fn forward(
+        loaded: &Loaded,
+        ids: &Tensor,
+        mask: &Tensor,
+        token_types: &Tensor,
+    ) -> Result<Tensor, String> {
+        match &loaded.model {
+            EncodeModel::Bert(m) => m
+                .forward(ids, token_types, Some(mask))
+                .map_err(|e| e.to_string()),
+            EncodeModel::XlmRoberta(m) => m
+                .forward(ids, mask, token_types, None, None, None)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Pooling → (batch, hidden): CLS (первый токен) или маскированный mean.
+    fn pool(loaded: &Loaded, out: &Tensor, mask: &Tensor) -> Result<Tensor, String> {
+        match loaded.pooling {
+            Pooling::Cls => out
+                .narrow(1, 0, 1)
+                .map_err(|e| e.to_string())?
+                .squeeze(1)
+                .map_err(|e| e.to_string()),
+            Pooling::Mean => {
+                // Сумма по реальным токенам / количество реальных токенов.
+                let mf = mask
+                    .to_dtype(DType::F32)
+                    .map_err(|e| e.to_string())?
+                    .unsqueeze(2)
+                    .map_err(|e| e.to_string())?;
+                let sums = out
+                    .broadcast_mul(&mf)
+                    .map_err(|e| e.to_string())?
+                    .sum(1)
+                    .map_err(|e| e.to_string())?;
+                let counts = mf
+                    .sum(1)
+                    .map_err(|e| e.to_string())?
+                    .clamp(1.0f32, f32::MAX)
+                    .map_err(|e| e.to_string())?;
+                sums.broadcast_div(&counts).map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    /// L2-нормализация последней оси.
+    fn normalize(pooled: &Tensor) -> Result<Tensor, String> {
+        let norm = pooled
+            .sqr()
+            .map_err(|e| e.to_string())?
+            .sum(1)
+            .map_err(|e| e.to_string())?
+            .unsqueeze(1)
+            .map_err(|e| e.to_string())?
+            .sqrt()
+            .map_err(|e| e.to_string())?;
+        pooled.broadcast_div(&norm).map_err(|e| e.to_string())
     }
 }
 
@@ -534,6 +640,18 @@ impl LlmClient for CandleEmbeddingLlm {
             .map_err(|e| SlcError::Storage(format!("embed task panicked: {e}")))?
     }
 
+    async fn generate_embeddings(
+        &self,
+        texts: &[String],
+        kind: EmbeddingKind,
+    ) -> SlcResult<Vec<Vec<f32>>> {
+        let loaded = self.wait_ready().await?;
+        let texts = texts.to_vec();
+        tokio::task::spawn_blocking(move || Self::embed_batch(&loaded, &texts, kind))
+            .await
+            .map_err(|e| SlcError::Storage(format!("embed batch task panicked: {e}")))?
+    }
+
     fn embedding_model_name(&self) -> String {
         format!(
             "candle:{}",
@@ -573,5 +691,39 @@ mod tests {
         assert_eq!(v.len(), 384);
         let norm: f32 = v.iter().map(|x| x * x).sum();
         assert!((norm - 1.0).abs() < 1e-3, "L2-normalized, got {norm}");
+    }
+
+    #[tokio::test]
+    #[ignore = "требует модель в HF-кэше (slc-mcp init)"]
+    async fn batch_embeddings_match_single() {
+        let llm = CandleEmbeddingLlm::with_config("intfloat/multilingual-e5-small", "cpu");
+        let texts = vec![
+            "кофе чёрный".to_string(),
+            "ракета летит на орбиту".to_string(),
+            "коза даёт молоко".to_string(),
+        ];
+        let batch = llm
+            .generate_embeddings(&texts, EmbeddingKind::Passage)
+            .await
+            .expect("batch embed");
+        assert_eq!(batch.len(), 3);
+        for (b, t) in batch.iter().zip(&texts) {
+            assert_eq!(b.len(), 384);
+            let norm: f32 = b.iter().map(|x| x * x).sum();
+            assert!((norm - 1.0).abs() < 1e-3, "L2-normalized, got {norm}");
+            let single = llm
+                .generate_embedding_kind(t, EmbeddingKind::Passage)
+                .await
+                .unwrap();
+            let max_diff = b
+                .iter()
+                .zip(&single)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-3,
+                "batch must match single, max diff {max_diff}"
+            );
+        }
     }
 }

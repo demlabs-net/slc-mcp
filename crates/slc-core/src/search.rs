@@ -380,35 +380,19 @@ impl SearchService {
             count = stale.len(),
             "re-embedding documents from a previous embedding model"
         );
+        // Батч-пересборка (один forward на чанк).
+        let mut docs = Vec::with_capacity(stale.len());
         for id in stale {
-            let Ok(Some(doc)) = self.store.kb_get(&id).await else {
-                continue;
-            };
-            let Ok(emb) = self
-                .llm
-                .generate_embedding_kind(&doc.content, crate::llm::EmbeddingKind::Passage)
-                .await
-            else {
-                continue; // model not ready yet — next process run will retry
-            };
-            let (scope, seat_id) = match &doc.seat_id {
-                Some(s) => (EmbeddingScope::Private, Some(s.clone())),
-                None => (EmbeddingScope::Public, None),
-            };
-            let rec = crate::model::EmbeddingRecord {
-                document_id: id.clone(),
-                chunk_index: 0,
-                chunk_total: 1,
-                embedding: emb.clone(),
-                embedding_model: self.llm.embedding_model_name(),
-                embedding_dimension: emb.len(),
-                generated_at: chrono::Utc::now(),
-                scope,
-                seat_id,
-            };
-            let _ = self.store.delete_embeddings(&id).await;
-            let _ = self.store.insert_embeddings(&[rec]).await;
+            if let Ok(Some(doc)) = self.store.kb_get(&id).await {
+                docs.push(doc);
+            }
         }
+        let done = crate::reembed_documents(self.store.as_ref(), self.llm.as_ref(), &docs).await;
+        tracing::info!(
+            reembedded = done,
+            total = docs.len(),
+            "embedding refresh finished"
+        );
     }
 
     /// BM25 over tokenized KB content (candidate set = filtered docs).
