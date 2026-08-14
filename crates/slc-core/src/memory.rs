@@ -113,13 +113,14 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
         );
         self.store.episodic_insert(&l2).await?;
 
-        // Mark sources consumed.
+        // Mark the EXACT sources consumed — never the whole seat's unmarked
+        // L1 (that used to mark today's events as consumed: they were not in
+        // yesterday's window, and tomorrow's run would skip them → loss).
+        let consumed: Vec<String> = l1.iter().map(|d| d.document_id.clone()).collect();
         self.store
             .episodic_patch_meta(
                 &DocFilter {
-                    seat_id: Some(seat_id.into()),
-                    doc_level: Some(DocLevel::L1),
-                    has_compression_batch: Some(false),
+                    document_ids: Some(consumed),
                     ..Default::default()
                 },
                 &MetaPatch { set_archived: Some(true), set_compression_batch_id: Some(batch_id.into()), ..Default::default() },
@@ -171,11 +172,13 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
         let ids: Vec<String> = batch.iter().map(|d| d.document_id.clone()).collect();
         self.store
             .episodic_patch_meta(
-                &DocFilter { seat_id: Some(seat_id.into()), ..Default::default() },
+                &DocFilter {
+                    document_ids: Some(ids),
+                    ..Default::default()
+                },
                 &MetaPatch { set_archived: Some(true), set_compression_batch_id: Some(batch_id.into()), ..Default::default() },
             )
             .await?;
-        let _ = ids;
         Ok(batch.len())
     }
 
@@ -241,9 +244,13 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
             self.store.episodic_insert(&l4).await?;
         }
 
+        let consumed: Vec<String> = batch.iter().map(|d| d.document_id.clone()).collect();
         self.store
             .episodic_patch_meta(
-                &DocFilter { seat_id: Some(seat_id.into()), doc_level: Some(DocLevel::L3), ..Default::default() },
+                &DocFilter {
+                    document_ids: Some(consumed),
+                    ..Default::default()
+                },
                 &MetaPatch { set_archived: Some(true), set_compression_batch_id: Some(batch_id.into()), ..Default::default() },
             )
             .await?;
@@ -548,4 +555,44 @@ mod tests {
         assert_eq!(parse_facts("no array here"), Vec::<String>::new());
         assert_eq!(parse_facts("[]"), Vec::<String>::new());
     }
+    /// Regression: the L1→L2 patch used to mark the WHOLE seat's unmarked L1
+    /// as consumed — including TODAY's events, which were not in yesterday's
+    /// date window and therefore never made it into the digest. Tomorrow's
+    /// run would skip them → silent data loss.
+    #[tokio::test]
+    async fn l1_to_l2_does_not_consume_todays_events() {
+        let store = SqliteStore::in_memory().unwrap();
+        let seat = "seat_today";
+        // One YESTERDAY event (in the window) + one TODAY event (not in it).
+        store.episodic_insert(&l1_doc(seat, 1, "yesterday work")).await.unwrap();
+        let mut today = l1_doc(seat, 2, "today work");
+        today.created_at = Utc::now().with_hour(15).unwrap();
+        today.document_id = "evt-today".into();
+        store.episodic_insert(&today).await.unwrap();
+
+        let llm = MockLlm::new(vec!["- yesterday work".into()]);
+        let compressor = HistoryCompressor::new(store.clone(), llm);
+        let report = compressor.compress(seat).await.unwrap();
+        assert_eq!(report.l1_to_l2, 1);
+
+        // The today event must STILL be unmarked (available for tomorrow).
+        let today_doc = store
+            .episodic_find(
+                &DocFilter { document_ids: Some(vec!["evt-today".into()]), ..Default::default() },
+                &DocSort::default(),
+                10,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.document_id == "evt-today")
+            .expect("today event exists");
+        assert!(
+            today_doc.metadata.archived != Some(true)
+                && today_doc.metadata.compression_batch_id.is_none(),
+            "today's event must NOT be consumed: {:?}",
+            today_doc.metadata
+        );
+    }
+
 }
