@@ -320,7 +320,6 @@ pub struct PersistedTimer {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TimerType {
     FocusReminder,
-    IdeaReminder,
     Reflection,
     Consolidation,
     HistoryCompression,
@@ -331,7 +330,6 @@ impl TimerType {
     pub fn as_str(self) -> &'static str {
         match self {
             TimerType::FocusReminder => "FOCUS_REMINDER",
-            TimerType::IdeaReminder => "IDEA_REMINDER",
             TimerType::Reflection => "REFLECTION",
             TimerType::Consolidation => "CONSOLIDATION",
             TimerType::HistoryCompression => "HISTORY_COMPRESSION",

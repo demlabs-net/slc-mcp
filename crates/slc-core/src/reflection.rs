@@ -1,55 +1,48 @@
-//! ReflectionEngine — periodic analysis of work history → actionable ideas.
+//! ReflectionEngine — periodic analysis of work history → actionable focuses.
 //!
 //! Legacy equivalent: `src/reflection/engine.py`. Runs as a TimerRegistry
 //! handler for the `REFLECTION` timer: loads recent episodic history + active
-//! focuses for a seat, asks the LLM for a JSON array of up to 5 ideas, then
-//! adds each to the [`IdeaPool`] with source `reflection`.
+//! focuses for a seat, asks the LLM for a JSON array of up to 5 focus
+//! proposals, then adds each to the focus manager. Ideas as a concept were
+//! dropped — focuses are the single proactive channel.
 
 use crate::error::SlcResult;
-use crate::ideas::IdeaPool;
+use crate::focus::FocusManager;
 use crate::llm::LlmClient;
 use crate::model::{Document, PersistedTimer};
-use crate::proactivity::MindType;
 use crate::storage::{DocFilter, DocSort, SortDir, StorageBackend};
-use serde::Deserialize;
 
-/// System prompt for the reflection LLM call (matches the legacy).
+/// System prompt for the reflection LLM call.
 pub const REFLECTION_SYSTEM_PROMPT: &str = "\
 You are a background reflection engine for a knowledge management system.
 Analyze the recent work history and current focuses provided below.
 Identify non-obvious patterns, connections, potential improvements, and
-actionable ideas.
+actionable focus proposals worth keeping the agent's attention on.
 
-Return a JSON array of idea objects:
-[{\"content\": \"idea text\"}, ...]
+Return a JSON array of focus objects:
+[{\"content\": \"focus text\"}, ...]
 
-Keep each idea concise (1-2 sentences). Return at most 5 ideas.
+Keep each focus concise (1-2 sentences). Return at most 5 focuses.
 If nothing interesting stands out, return an empty array: []";
 
-/// Max ideas the LLM may return (legacy cap).
-pub const MAX_IDEAS_PER_REFLECTION: usize = 5;
+/// Max focuses the LLM may return.
+pub const MAX_FOCUSES_PER_REFLECTION: usize = 5;
 
-/// Shape of a single idea in the LLM JSON response.
-#[derive(Debug, Deserialize)]
-pub struct ReflectionIdea {
-    pub content: String,
-}
-
-/// Runs background reflection for a seat and funnels ideas into the pool.
+/// Runs background reflection for a seat and funnels focus proposals into
+/// the focus manager.
 #[derive(Clone)]
 pub struct ReflectionEngine<S: StorageBackend, L: LlmClient> {
     store: S,
     llm: L,
-    pool: IdeaPool<S>,
 }
 
 impl<S: StorageBackend + Clone, L: LlmClient> ReflectionEngine<S, L> {
     pub fn new(store: S, llm: L) -> Self {
-        ReflectionEngine { pool: IdeaPool::new(store.clone()), store, llm }
+        ReflectionEngine { store, llm }
     }
 
     /// The `REFLECTION` timer handler. Loads history + focuses, generates
-    /// ideas, and adds them to the pool. Skips silently when there is no
+    /// focus proposals, and adds them. Skips silently when there is no
     /// recent history.
     pub async fn handle_timer(&self, timer: &PersistedTimer) -> SlcResult<()> {
         let seat_id = timer.seat_id.as_str();
@@ -61,20 +54,16 @@ impl<S: StorageBackend + Clone, L: LlmClient> ReflectionEngine<S, L> {
         let focuses = self.load_focuses(seat_id).await?;
         let prompt = self.build_prompt(&history, &focuses);
         let raw = self.generate(prompt).await?;
-        let ideas = parse_ideas(&raw);
+        let proposals = parse_focuses(&raw);
         let mut added = 0;
-        for text in ideas {
-            let embedding = self.llm.generate_embedding(&text).await.ok();
-            match self
-                .pool
-                .add(seat_id, &text, "reflection", embedding, Some(MindType::Shared.as_str()))
-                .await
-            {
+        let fm = FocusManager::new(self.store.clone());
+        for text in proposals {
+            match fm.add(seat_id, &text, "", 1, &[], Some("shared")).await {
                 Ok(_) => added += 1,
-                Err(_) => break, // pool full
+                Err(_) => break, // focus list full (MAX_FOCUSES)
             }
         }
-        tracing::info!("reflection [{seat_id}]: {added} ideas added");
+        tracing::info!("reflection [{seat_id}]: {added} focuses added");
         Ok(())
     }
 
@@ -89,7 +78,7 @@ impl<S: StorageBackend + Clone, L: LlmClient> ReflectionEngine<S, L> {
 
     /// Active focuses for the seat (title + priority).
     pub async fn load_focuses(&self, seat_id: &str) -> SlcResult<Vec<(String, i64)>> {
-        let focuses = crate::focus::FocusManager::new(self.store.clone()).get_active(seat_id, None).await?;
+        let focuses = FocusManager::new(self.store.clone()).get_active(seat_id, None).await?;
         Ok(focuses.into_iter().map(|f| (f.title, f.priority)).collect())
     }
 
@@ -110,7 +99,7 @@ impl<S: StorageBackend + Clone, L: LlmClient> ReflectionEngine<S, L> {
                 parts.push(format!("- [{priority}] {title}"));
             }
         }
-        parts.push("\nAnalyze the above and generate actionable ideas as a JSON array.".into());
+        parts.push("\nAnalyze the above and generate actionable focus proposals as a JSON array.".into());
         parts.join("\n")
     }
 
@@ -119,8 +108,8 @@ impl<S: StorageBackend + Clone, L: LlmClient> ReflectionEngine<S, L> {
     }
 }
 
-/// Extract idea texts from an LLM response (JSON array of `{content}`).
-pub fn parse_ideas(raw: &str) -> Vec<String> {
+/// Extract focus texts from an LLM response (JSON array of `{content}`).
+pub fn parse_focuses(raw: &str) -> Vec<String> {
     let start = raw.find('[');
     let end = raw.rfind(']');
     let (Some(start), Some(end)) = (start, end) else { return vec![] };
@@ -139,10 +128,9 @@ pub fn parse_ideas(raw: &str) -> Vec<String> {
                 item.as_str().map(String::from)
             }
         })
-        .take(MAX_IDEAS_PER_REFLECTION)
+        .take(MAX_FOCUSES_PER_REFLECTION)
         .collect()
 }
-
 fn level_rank(d: &Document) -> i64 {
     match d.metadata.doc_level {
         Some(crate::model::DocLevel::L2) => 2,
@@ -161,7 +149,7 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn reflection_adds_ideas_from_llm() {
+    async fn reflection_adds_focuses_from_llm() {
         let llm = MockLlm::new(vec!["[{\"content\": \"improve latency\"}, {\"content\": \"add tests\"}]".to_string()]);
         let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
         let mut meta = DocMeta::default();
@@ -184,17 +172,16 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         engine.handle_timer(&timer).await.unwrap();
-        let ideas = engine.pool.list_active("seat_r", 50, None).await.unwrap();
-        assert_eq!(ideas.len(), 2);
-        assert!(ideas.iter().all(|i| i.source == "reflection"));
+        let focuses = FocusManager::new(store.clone()).get_active("seat_r", None).await.unwrap();
+        assert_eq!(focuses.len(), 2);
+        assert!(focuses.iter().any(|f| f.title == "improve latency"));
+        assert!(focuses.iter().any(|f| f.title == "add tests"));
     }
 
     #[tokio::test]
     async fn reflection_skips_without_history() {
-        let (engine, _) = {
-            let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
-            (ReflectionEngine::new(store.clone(), MockLlm::default()), store)
-        };
+        let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
+        let engine = ReflectionEngine::new(store.clone(), MockLlm::default());
         let timer = crate::model::PersistedTimer {
             timer_id: "t".into(),
             seat_id: "empty_seat".into(),
@@ -207,17 +194,18 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         engine.handle_timer(&timer).await.unwrap();
-        assert!(engine.pool.list_active("empty_seat", 50, None).await.unwrap().is_empty());
+        let focuses = FocusManager::new(store).get_active("empty_seat", None).await.unwrap();
+        assert!(focuses.is_empty());
     }
 
     #[test]
-    fn parse_ideas_handles_plain_and_json() {
-        let parsed = parse_ideas("[{\"content\": \"one\"}, \"two\", {\"content\": \"three\"}]");
+    fn parse_focuses_handles_plain_and_json() {
+        let parsed = parse_focuses("[{\"content\": \"one\"}, \"two\", {\"content\": \"three\"}]");
         assert_eq!(parsed, vec!["one".to_string(), "two".to_string(), "three".to_string()]);
-        assert!(parse_ideas("no brackets here").is_empty());
-        assert!(parse_ideas("[]").is_empty());
+        assert!(parse_focuses("no brackets here").is_empty());
+        assert!(parse_focuses("[]").is_empty());
         // >5 truncated
         let many = (0..7).map(|i| format!("{{\"content\": \"{i}\"}}")).collect::<Vec<_>>().join(",");
-        assert_eq!(parse_ideas(&format!("[{many}]")).len(), 5);
+        assert_eq!(parse_focuses(&format!("[{many}]")).len(), 5);
     }
 }
