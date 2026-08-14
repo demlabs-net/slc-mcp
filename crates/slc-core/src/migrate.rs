@@ -411,7 +411,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ev.len(), 1);
-        assert_eq!(ev[0].document_id, "history_rabotali_nad_migraciej");
+        // Cyrillic body has no ascii slug → deterministic fallback on the
+        // legacy id.
+        assert_eq!(ev[0].document_id, "history_legacy_ev_abc");
 
         // Focus record written.
         let focus = store.get_record("focuses", "foc_123").await.unwrap().expect("focus record");
