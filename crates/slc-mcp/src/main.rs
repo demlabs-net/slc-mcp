@@ -375,7 +375,7 @@ async fn cmd_init(
         }
         // 3. Модель: дефолт по устройству.
         let dev = device.as_deref().unwrap_or("auto");
-        let default_model = slc_core::candle_emb::default_model_for(dev);
+        let default_model = slc_core::candle_emb::CandleEmbeddingLlm::default_model_for(dev);
         if model.is_none() {
             model = Some(ask("модель (HF repo id)", &default_model));
         }
@@ -384,7 +384,7 @@ async fn cmd_init(
         // 4. Скачивание (единственное место, где качается модель).
         if !slc_core::candle_emb::model_is_cached(&repo_id) {
             println!("скачиваю модель {repo_id} в кэш Hugging Face…");
-            slc_core::candle_emb::download_embedding_model(&repo_id)?;
+            slc_core::candle_emb::download_embedding_model(&repo_id).map_err(anyhow::Error::msg)?;
         } else {
             println!("модель {repo_id} уже в кэше");
         }
@@ -395,8 +395,9 @@ async fn cmd_init(
         set_env_line("SLC_EMBED_MODEL", &repo_id)?;
 
         // 6. Проверка: загрузить и сделать контрольный эмбеддинг.
-        let llm: std::sync::Arc<dyn slc_core::LlmClient> =
-            std::sync::Arc::new(slc_core::candle_emb::CandleEmbeddingLlm::new());
+        let llm: std::sync::Arc<dyn slc_core::LlmClient> = std::sync::Arc::new(
+            slc_core::candle_emb::CandleEmbeddingLlm::with_config(&repo_id, dev),
+        );
         match tokio::time::timeout(std::time::Duration::from_secs(120), llm.generate_embedding("проверка эмбеддинга")).await {
             Ok(Ok(v)) => println!("✅ модель готова: dim={} (device={dev})", v.len()),
             Ok(Err(e)) => anyhow::bail!("модель не загрузилась: {e}"),
