@@ -164,31 +164,51 @@ async fn mcp(
     }
 
     let result = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": "2025-03-26",
-            "capabilities": { "tools": {}, "prompts": {} },
-            "serverInfo": { "name": "slc-mcp", "version": env!("CARGO_PKG_VERSION") },
-        })),
+        "initialize" => {
+            // Auto-apply the client's context budget when it advertises one
+            // (capabilities.experimental.context_limit_chars) — the per-seat
+            // override used by update_context compression.
+            if let Some(limit) = params
+                .pointer("/capabilities/experimental/context_limit_chars")
+                .and_then(|v| v.as_u64())
+            {
+                if let Some(seat) = seat_hdr.as_deref() {
+                    // The seat may not exist yet — create it first.
+                    let _ = engine.seats.ensure_seat(seat).await;
+                    let _ = engine.seats.set_context_key(seat, "context_limit_chars", json!(limit)).await;
+                }
+            }
+            Ok(json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": { "tools": {}, "prompts": {} },
+                "serverInfo": { "name": "slc-mcp", "version": env!("CARGO_PKG_VERSION") },
+            }))
+        },
         "ping" => Ok(Value::Null),
         "tools/list" => Ok(json!({ "tools": tools() })),
         "prompts/list" => Ok(json!({ "prompts": prompts() })),
         "prompts/get" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if name == "check_notifications" {
-                Ok(json!({
+            match name {
+                "instructions" => Ok(json!({
+                    "name": "instructions",
+                    "description": "Полная рабочая инструкция агента: рабочий процесс, auto_load vs references, рефлексия через истории",
+                    "arguments": [],
+                    "messages": [ { "role": "user", "content": { "type": "text", "text": INSTRUCTIONS_PROMPT } } ],
+                })),
+                "check_notifications" => Ok(json!({
                     "name": "check_notifications",
                     "description": "Pop pending notifications for this seat and report them to the user",
                     "arguments": [{ "name": "limit", "description": "max notifications (default 5)", "required": false }],
-                }))
-            } else {
-                Err(json!({"code": -32602, "message": format!("unknown prompt: {name}")}))
+                })),
+                _ => Err(json!({"code": -32602, "message": format!("unknown prompt: {name}")})),
             }
         }
         "tools/call" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
             let seat = seat_hdr.clone().unwrap_or_default();
-            call_tool(engine, &seat, name, &args).await
+            call_tool(engine, &seat, name, &args, &state.events).await
         }
         _ => Err(json!({"code": -32601, "message": format!("method not found: {method}")})),
     };
@@ -296,11 +316,7 @@ fn tools() -> Vec<Value> {
     
     
     
-    json!({
-        "name": "reflect_now",
-        "description": "Run one reflection pass: recent history + focuses → new focus proposals",
-        "inputSchema": {"type":"object","properties":{},"required":[]}
-    }),
+    
     json!({
         "name": "reminder_create",
         "description": "Create a reminder; schedules a one-shot timer (ISO time)",
@@ -527,11 +543,22 @@ fn tools() -> Vec<Value> {
             "module_name": {"type":"string"}
         },"required":["module_name"]}
     }),
+    json!({
+        "name": "command",
+        "description": "Slash-команды для управления памятью: `/limit N` — установить лимит контекста (символы), `/context` — показать текущий срез и лимит, `/help` — список команд. Вызывай, когда пользователь пишет сообщение, начинающееся с '/'.",
+        "inputSchema": {"type":"object","properties":{
+            "input": {"type":"string","description":"строка, начинающаяся с /"}
+        },"required":["input"]}
+    }),
 ]
 }
 
 fn prompts() -> Vec<Value> {
     vec![
+    json!({
+        "name": "instructions",
+        "description": "Полная рабочая инструкция агента: рабочий процесс, auto_load vs references, рефлексия через истории",
+    }),
     json!({
         "name": "check_notifications",
         "description": "Pop pending notifications for this seat and report them to the user",
@@ -539,9 +566,111 @@ fn prompts() -> Vec<Value> {
     ]
 }
 
-async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value) -> Result<Value, Value> {
+/// The agent instruction prompt — a working contract that pushes the model
+/// to use the full memory surface: search/activate documents, create and
+/// enrich tasks/projects/skills, distinguish auto_load from references, and
+/// run reflection as work over SLC histories (NOT a separate mode).
+pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инструкция агента
+
+Ты работаешь с системой памяти SLC (Smart Layered Context): единая база
+документов (проекты, задачи, скилы, знания), эпизодическая история с
+прогрессивной суммаризацией, фокусы, напоминания.
+
+## Рабочий процесс (обязателен)
+
+1. **Ищи перед тем, как отвечать.** На любой вопрос сначала `search` по
+   базе знаний; если есть активный документ — начни с него (`get_document`
+   по `get_active_document`). Не отвечай по памяти — SLC помнит за тебя.
+2. **Активируй контекст.** Когда работа идёт над проектом/задачей/скилом —
+   `activate_document` — документ станет контекст-якорем сита и будет
+   включён в `update_context`. Активируй один главный документ, не
+   несколько.
+3. **Веди работу документами.** Новая деятельность → `create_task` (или
+   `add_document` с category=task) и/или проект. Скилы — это тоже
+   документы (category=skill): инструкции «как делать X».
+4. **Обогащай по ходу.** После значимых шагов обновляй документы
+   (`add_document` с тем же document_id — upsert): статусы, решения,
+   новые факты. История (remember) — это сырьё, а документы — рабочий
+   артефакт.
+5. **auto_load vs references (важно, не путай).**
+   - `auto_load` — РАБОЧИЕ связи: документы, которые должны подтягиваться
+     в контекст при обновлении этого документа (состав, зависимости,
+     связанные задачи). Ставь сюда то, что нужно видеть вместе.
+   - `references` — ПАССИВНЫЕ упоминания: документы, на которые этот
+     документ ссылается, но которые не нужны в контексте автоматически.
+   Не дублируй одно и то же в оба списка.
+6. **Контекст.** `update_context` возвращает текущий срез (базовые
+   документы + активный документ + профили + фокусы). Сохраняй снимок
+   (summary) в конце крупного этапа — это попадёт в историю.
+
+## Рефлексия (это работа над историями, а не отдельный режим)
+
+Периодически, когда накопилась работа (или пользователь просит
+«порефлексируй»), проведи рефлексию через тулы:
+
+1. `recall` — возьми свежую историю сита (10–30 событий); при
+   необходимости `compress` (L1→L2) и `consolidate` (извлечение фактов),
+   чтобы увидеть сжатую картину.
+2. **Извлеки данные для документов.** Из историй вытащи: факты о
+   пользователе, решения, договорённости, проблемы, метрики. Обогащай
+   существующие документы (`add_document` с тем же id) или создавай новые
+   (проект/задача/скил/знание), если темы ещё нет.
+3. **Сделай ревью документов:** проверь актуальность (устаревшие статусы,
+   факты, связи), обнови содержимое, добавь недостающие связи
+   (auto_load/references), удали дубли.
+4. **Обнови фокусы:** `focus_add`/`focus_update` — что реально важно
+   сейчас; `focus_remove` — что закрыто.
+5. **Результат рефлексии** — это изменённые/новые документы и фокусы, а
+   не текст «я порефлексировал». Если менять нечего — так и скажи кратко.
+
+## Лимиты контекста
+
+`update_context` возвращает `limit_chars`/`used_chars`/`compressed` — суммарный
+бюджет контекста и степень сжатия. При `compressed: true` сокращай ответы и
+сохраняй снимок чаще. Лимит можно изменить: `/limit <chars>` (или клиент
+передаёт его при подключении). `used_chars` около лимита — сигнал провести
+рефлексию (см. выше) и ужать документы.
+
+## Напоминания
+
+`check_notifications` в начале каждого хода — там могут быть фокус- или
+таймер-напоминания, требующие действий.
+"#;
+
+async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, events: &tokio::sync::broadcast::Sender<Value>) -> Result<Value, Value> {
     engine.seats.ensure_seat(seat_id).await.map_err(|e| json!({"code": -32000, "message": e.to_string()}))?;
     let text = match name {
+        "command" => {
+            let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
+            if !input.starts_with('/') {
+                return Err(json!({"code": -32602, "message": "command must start with /"}));
+            }
+            let mut parts = input[1..].split_whitespace();
+            let cmd = parts.next().unwrap_or("");
+            match cmd {
+                "limit" => {
+                    let n = parts.next().and_then(|v| v.parse::<u64>().ok());
+                    let Some(n) = n else {
+                        return Err(json!({"code": -32602, "message": "usage: /limit <chars>"}));
+                    };
+                    let ok = engine.seats.set_context_key(seat_id, "context_limit_chars", json!(n)).await.map_err(json_err)?;
+                    json!({"success": ok, "context_limit_chars": n, "message": "Context limit set"})
+                }
+                "context" => {
+                    let limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
+                    let seat = engine.seats.get_seat(seat_id).await.map_err(json_err)?;
+                    let active = engine.document_get_active(seat_id).await.map_err(json_err)?;
+                    json!({"limit_chars": limit, "active_document": active.map(|d| d.document_id),
+                           "seat_context": seat.map(|s| s.context)})
+                }
+                "help" => json!({"commands": [
+                    "/limit <chars> — установить лимит контекста (символы)",
+                    "/context — показать текущий срез контекста и лимит",
+                    "/help — этот список",
+                ]}),
+                other => return Err(json!({"code": -32602, "message": format!("unknown command: /{other} — use /help")})),
+            }
+        }
         "search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
@@ -637,10 +766,7 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value) 
         
         
         
-        "reflect_now" => {
-            engine.reflect(seat_id).await.map_err(json_err)?;
-            json!({"reflected": true})
-        }
+        
         "reminder_create" => {
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let remind_at = args.get("remind_at").and_then(|v| v.as_str()).unwrap_or("");
@@ -730,6 +856,10 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value) 
             let document_id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
             let ok = engine.document_activate(seat_id, document_id).await.map_err(json_err)?;
             if ok {
+                // Hook: notify subscribers (SSE) so automation can react.
+                let _ = events.send(json!({
+                    "type": "document_activated", "seat_id": seat_id, "document_id": document_id,
+                }));
                 json!({"success": true, "document_id": document_id, "message": "Document activated (context anchor)"})
             } else {
                 json!({"success": false, "error": format!("document not found: {document_id}")})
@@ -859,32 +989,62 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value) 
                 engine.store().episodic_insert(&doc).await.map_err(json_err)?;
                 save_info = Some(json!({"success": true, "document_id": doc_id, "message": "Context saved as history snapshot."}));
             }
-            // base docs + active task + profiles + focuses
+            // base docs + active document (any category) + profiles + focuses,
+            // bounded by the seat's context budget: the active document is
+            // always kept complete, the rest is truncated to fit — that is
+            // the context compression policy.
+            let limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
             let mut docs = Vec::new();
+            let mut used = 0usize;
+            let mut push_doc = |docs: &mut Vec<Value>, used: &mut usize, budget: usize, id: &str, ty: &str, content: &str| {
+                let content = truncate(content, budget);
+                *used += id.len() + ty.len() + content.len();
+                docs.push(json!({"id": id, "type": ty, "content": content}));
+            };
             if include_base {
                 for base in ["core_slc_manifest", "core_standards"] {
                     if let Ok(Some(d)) = engine.get_document(base).await {
-                        docs.push(json!({"id": base, "type": "base", "content": truncate(&d.content, 3000)}));
+                        // Base docs are truncated harder when over budget.
+                        let b = if used > limit { 800 } else { 3000 };
+                        push_doc(&mut docs, &mut used, b, base, "base", &d.content);
                     }
                 }
             }
             // Active document — any category (task/project/skill/knowledge).
             // Task activation also lands here via the unified anchor.
             if let Ok(Some(d)) = engine.document_get_active(seat_id).await {
-                docs.push(json!({"id": d.document_id, "type": d.category.as_str(), "name": d.document_id, "content": truncate(&d.content, 2000)}));
+                let remaining = limit.saturating_sub(used);
+                let b = remaining.min(2000);
+                push_doc(&mut docs, &mut used, b, &d.document_id, d.category.as_str(), &d.content);
             }
             if let Ok(Some((content, _))) = engine.get_seat_profile(seat_id).await {
-                docs.push(json!({"id": format!("seat_profile:{seat_id}"), "type": "seat_profile", "content": truncate(&content, 2000)}));
+                let remaining = limit.saturating_sub(used);
+                let over = used > limit;
+                let b = remaining.min(2000).min(if over { 500 } else { 2000 });
+                push_doc(&mut docs, &mut used, b, &format!("seat_profile:{seat_id}"), "seat_profile", &content);
             }
             if let Ok(Some(content)) = engine.get_user_profile(seat_id).await {
-                docs.push(json!({"id": "user_profile", "type": "user_profile", "content": truncate(&content, 2000)}));
+                let b = if used > limit { 500 } else { 2000 };
+                push_doc(&mut docs, &mut used, b, "user_profile", "user_profile", &content);
             }
             if let Ok(items) = engine.focus_list(seat_id, None).await {
                 if !items.is_empty() {
+                    used += 32;
                     docs.push(json!({"id": "active_focuses", "type": "focuses", "count": items.len()}));
                 }
             }
-            json!({"docs": docs, "seat": seat_id, "save_info": save_info})
+            let compressed = used > limit;
+            // Hook: notify subscribers (SSE) after a context refresh/save so
+            // automation can react (e.g. persist the snapshot elsewhere).
+            if save_info.is_some() || compressed {
+                let _ = events.send(json!({
+                    "type": "context_updated", "seat_id": seat_id,
+                    "compressed": compressed, "used_chars": used, "limit_chars": limit,
+                    "saved": save_info.as_ref().and_then(|v| v.get("document_id")).cloned(),
+                }));
+            }
+            json!({"docs": docs, "seat": seat_id, "save_info": save_info,
+                   "limit_chars": limit, "used_chars": used, "compressed": compressed})
         }
         "load_module" => {
             // Requires knowledge:public:write; in embedded/legacy modes every

@@ -122,6 +122,15 @@ impl<S: StorageBackend> SeatManager<S> {
     pub async fn get_active_document(&self, seat_id: &str) -> SlcResult<Option<String>> {
         self.store.get_seat_active_document(seat_id).await
     }
+
+    /// Set one key in the seat's context map (per-seat settings, e.g.
+    /// `context_limit_chars`).
+    pub async fn set_context_key(&self, seat_id: &str, key: &str, value: Value) -> SlcResult<bool> {
+        let Some(mut seat) = self.store.get_seat(seat_id).await? else { return Ok(false) };
+        seat.context.insert(key.to_string(), value);
+        self.store.insert_seat(&seat).await?;
+        Ok(true)
+    }
 }
 
 /// Convenience: build the default metadata map from env (client/user ids).

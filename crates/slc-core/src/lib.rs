@@ -20,7 +20,6 @@ pub mod notifications;
 pub mod pagination;
 pub mod proactivity;
 pub mod profiles;
-pub mod reflection;
 pub mod reminders;
 pub mod search;
 pub mod seat;
@@ -37,7 +36,6 @@ pub use notifications::NotificationQueue;
 pub use pagination::Paginator;
 pub use proactivity::{mind_matches, normalize_write_mind_type, MindType};
 pub use profiles::ProfileManager;
-pub use reflection::{parse_focuses, ReflectionEngine};
 pub use reminders::{parse_remind_at, ReminderManager};
 pub use search::{RankWeights, SearchHit, SearchService};
 pub use seat::SeatManager;
@@ -72,6 +70,10 @@ pub struct SlcConfig {
     pub semantic_weight: f32,
     pub text_weight: f32,
     pub seat_ttl_seconds: i64,
+    /// Total context budget in characters handed to the model per
+    /// `update_context` call. Per-seat override: `/limit N` or the client's
+    /// `capabilities.experimental.context_limit_chars`.
+    pub context_limit_chars: usize,
 }
 
 impl Default for SlcConfig {
@@ -90,6 +92,10 @@ impl Default for SlcConfig {
             semantic_weight: 0.7,
             text_weight: 0.3,
             seat_ttl_seconds: 86400,
+            context_limit_chars: std::env::var("SLC_CONTEXT_LIMIT_CHARS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8000),
         }
     }
 }
@@ -102,7 +108,6 @@ pub struct SlcEngine {
     search: SearchService,
     compressor: HistoryCompressor<std::sync::Arc<dyn StorageBackend>, std::sync::Arc<dyn LlmClient>>,
     consolidator: MemoryConsolidator<std::sync::Arc<dyn StorageBackend>, std::sync::Arc<dyn LlmClient>>,
-    reflection: ReflectionEngine<std::sync::Arc<dyn StorageBackend>, std::sync::Arc<dyn LlmClient>>,
     pub config: SlcConfig,
     scheduler: std::sync::Mutex<Option<timer::TimerRegistry>>,
 }
@@ -146,12 +151,22 @@ impl SlcEngine {
         let search = SearchService::new(store.clone(), llm.clone(), config.semantic_weight, config.text_weight);
         let compressor = HistoryCompressor::new(store.clone(), llm.clone());
         let consolidator = MemoryConsolidator::new(store.clone(), llm.clone());
-        let reflection = ReflectionEngine::new(store.clone(), llm.clone());
-        SlcEngine { store, llm, seats, search, compressor, consolidator, reflection, config, scheduler: std::sync::Mutex::new(None) }
+        SlcEngine { store, llm, seats, search, compressor, consolidator, config, scheduler: std::sync::Mutex::new(None) }
     }
 
     pub fn store(&self) -> &dyn StorageBackend {
         self.store.as_ref()
+    }
+
+    /// Effective context budget for a seat (characters): per-seat override
+    /// (`seat.context["context_limit_chars"]`) wins over the config default.
+    pub async fn context_limit_for(&self, seat_id: &str) -> SlcResult<usize> {
+        if let Ok(Some(seat)) = self.seats.get_seat(seat_id).await {
+            if let Some(v) = seat.context.get("context_limit_chars").and_then(|v| v.as_u64()) {
+                return Ok(v as usize);
+            }
+        }
+        Ok(self.config.context_limit_chars)
     }
 
     /// The active LLM provider (LM Studio or Ollama).
@@ -247,21 +262,6 @@ impl SlcEngine {
         fm.get_active(seat_id, mind_type).await
     }
 
-    /// Run one reflection pass for a seat (the `REFLECTION` timer handler).
-    pub async fn reflect(&self, seat_id: &str) -> SlcResult<()> {
-        let timer = model::PersistedTimer {
-            timer_id: format!("reflect_{seat_id}"),
-            seat_id: seat_id.into(),
-            timer_type: model::TimerType::Reflection,
-            interval_seconds: None,
-            last_fired_at: None,
-            next_fire_at: chrono::Utc::now(),
-            is_active: true,
-            metadata: Default::default(),
-            created_at: chrono::Utc::now(),
-        };
-        self.reflection.handle_timer(&timer).await
-    }
 
     // ── reminders + notifications ────────────────────────────────
 
@@ -531,18 +531,6 @@ impl SlcEngine {
                 Box::pin(async move {
                     let report = consolidator.consolidate(&seat).await?;
                     tracing::info!("consolidation [{seat}]: +{} facts", report.facts_added);
-                    Ok(())
-                })
-            })),
-        );
-        let reflection = self.reflection.clone();
-        registry.set_handler(
-            model::TimerType::Reflection,
-            std::sync::Arc::new(timer::AsyncFnHandler::new(move |t| {
-                let reflection = reflection.clone();
-                let timer = t.clone();
-                Box::pin(async move {
-                    reflection.handle_timer(&timer).await?;
                     Ok(())
                 })
             })),
