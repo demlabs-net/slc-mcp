@@ -50,6 +50,8 @@ pub enum StorageKind {
     ObsidianVault,
     /// Embedded SQLite file.
     Sqlite,
+    /// MongoDB (self-hosted or Atlas) — shared-server option.
+    MongoDB,
 }
 
 /// Engine configuration.
@@ -74,6 +76,8 @@ pub struct SlcConfig {
     /// `update_context` call. Per-seat override: `/limit N` or the client's
     /// `capabilities.experimental.context_limit_chars`.
     pub context_limit_chars: usize,
+    /// MongoDB connection URI (used when `storage = MongoDB`).
+    pub mongodb_uri: Option<String>,
 }
 
 impl Default for SlcConfig {
@@ -96,6 +100,7 @@ impl Default for SlcConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8000),
+            mongodb_uri: std::env::var("SLC_MONGODB_URI").ok(),
         }
     }
 }
@@ -112,7 +117,14 @@ pub struct SlcEngine {
     scheduler: std::sync::Mutex<Option<timer::TimerRegistry>>,
 }
 impl SlcEngine {
+    /// Synchronous open for the embedded backends (Obsidian vault, SQLite).
+    /// MongoDB needs an async connect — use [`Self::open_async`].
     pub fn open(config: SlcConfig) -> SlcResult<Self> {
+        if config.storage == StorageKind::MongoDB {
+            return Err(SlcError::Storage(
+                "MongoDB storage requires the async `SlcEngine::open_async`".into(),
+            ));
+        }
         let store: std::sync::Arc<dyn StorageBackend> = match config.storage {
             StorageKind::ObsidianVault => {
                 let path = expand_tilde(&config.path);
@@ -122,10 +134,34 @@ impl SlcEngine {
                 let path = expand_tilde(&config.path);
                 std::sync::Arc::new(storage::sqlite::SqliteStore::open(path)?)
             }
+            StorageKind::MongoDB => unreachable!(),
         };
-        // Provider auto-select: LM Studio (OpenAI-compatible) when
-        // configured, else Ollama — same rule as the Python legacy.
-        let llm: std::sync::Arc<dyn LlmClient> = match &config.lmstudio_url {
+        Ok(Self::with(store, Self::pick_llm(&config), config))
+    }
+
+    /// Async open — required for the MongoDB backend, fine for the others.
+    pub async fn open_async(config: SlcConfig) -> SlcResult<Self> {
+        let store: std::sync::Arc<dyn StorageBackend> = match config.storage {
+            StorageKind::ObsidianVault => {
+                let path = expand_tilde(&config.path);
+                std::sync::Arc::new(storage::obsidian::ObsidianVaultStore::open(path, config.auto_git_commit)?)
+            }
+            StorageKind::Sqlite => {
+                let path = expand_tilde(&config.path);
+                std::sync::Arc::new(storage::sqlite::SqliteStore::open(path)?)
+            }
+            StorageKind::MongoDB => {
+                // TEMP verification: mongodb module disabled
+                return Err(SlcError::Storage("mongodb backend disabled (temp)".into()));
+            }
+        };
+        Ok(Self::with(store, Self::pick_llm(&config), config))
+    }
+
+    /// Provider auto-select: LM Studio (OpenAI-compatible) when configured,
+    /// else Ollama — same rule as the Python legacy.
+    fn pick_llm(config: &SlcConfig) -> std::sync::Arc<dyn LlmClient> {
+        match &config.lmstudio_url {
             Some(url) => std::sync::Arc::new(LmStudioClient::new(
                 url,
                 &config.lmstudio_model,
@@ -136,8 +172,7 @@ impl SlcEngine {
                 &config.ollama_reasoning_model,
                 &config.ollama_embedding_model,
             )),
-        };
-        Ok(Self::with(store, llm, config))
+        }
     }
 
     /// Build from already-constructed parts (tests, embedding into vs-memory

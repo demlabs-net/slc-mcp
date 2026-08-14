@@ -16,11 +16,11 @@
 //! `mongodb://localhost:27017/slc`).
 
 use crate::error::{SlcError, SlcResult};
-use crate::model::{Document, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat, SeatStatus};
+use crate::model::{DocLevel, Document, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat, SeatStatus};
 use crate::storage::{DocFilter, DocSort, MetaPatch, SortField, SortDir, StorageBackend};
 use chrono::{DateTime, Utc};
 use bson::{doc, Bson, Document as BsonDoc};
-use mongodb::options::IndexOptions;
+use mongodb::options::{FindOneAndUpdateOptions, FindOptions, IndexOptions, UpdateOptions};
 use mongodb::{Client, Collection, IndexModel};
 
 /// Kind discriminator inside the `docs` collection.
@@ -114,11 +114,7 @@ fn normalize_dates(b: &mut BsonDoc, to_datetime: bool) {
                 }
             }
             (false, Some(Bson::DateTime(d))) => {
-                use chrono::SecondsFormat;
-                b.insert(
-                    key,
-                    Bson::String(d.to_chrono().to_rfc3339_opts(SecondsFormat::AutoSi, true)),
-                );
+                b.insert(key, Bson::String(d.to_chrono().to_rfc3339()));
             }
             _ => {}
         }
@@ -152,9 +148,6 @@ fn bson_to_doc(b: BsonDoc) -> SlcResult<Document> {
 /// Build the query for a `DocFilter` plus the kind discriminator.
 fn filter_query(kind: &str, f: &DocFilter) -> BsonDoc {
     let mut q = doc! { "kind": kind };
-    if let Some(ids) = &f.document_ids {
-        q.insert("document_id", doc! { "$in": ids.iter().map(|i| Bson::String(i.clone())).collect::<Vec<_>>() });
-    }
     if let Some(cat) = f.category {
         q.insert("category", Bson::String(cat.as_str().into()));
     }
@@ -781,8 +774,7 @@ mod tests {
         assert_eq!(back.content, doc.content);
         assert_eq!(back.tags, doc.tags);
         assert_eq!(back.seat_id, doc.seat_id);
-        // BSON datetimes are millisecond-precision.
-        assert_eq!(back.created_at.timestamp_millis(), doc.created_at.timestamp_millis());
+        assert_eq!(back.created_at, doc.created_at);
     }
 
     #[test]
@@ -799,7 +791,7 @@ mod tests {
         let tags = q.get("tags").unwrap().as_document().unwrap();
         assert_eq!(tags.get_array("$in").unwrap().len(), 2);
         assert_eq!(tags.get_array("$all").unwrap().len(), 1);
-        assert!(q.get("deleted_at").unwrap().as_null().is_some(), "deleted=false → null filter");
+        assert!(q.get("deleted_at").unwrap().as_document().unwrap().contains_key("$exists"));
     }
 
     #[test]

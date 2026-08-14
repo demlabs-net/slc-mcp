@@ -21,6 +21,9 @@ struct Cli {
     /// Use embedded SQLite instead of the Obsidian vault.
     #[arg(long)]
     sqlite: bool,
+    /// Use MongoDB (SLC_MONGODB_URI, default mongodb://localhost:27017/slc).
+    #[arg(long)]
+    mongodb: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -109,7 +112,13 @@ async fn main() -> anyhow::Result<()> {
     // Local settings live in .env (cwd, e.g. slc-mcp/.env or repo root).
     dotenvy::dotenv().ok();
     let mut config = SlcConfig::default();
-    config.storage = if cli.sqlite { StorageKind::Sqlite } else { StorageKind::ObsidianVault };
+    config.storage = if cli.mongodb {
+        StorageKind::MongoDB
+    } else if cli.sqlite {
+        StorageKind::Sqlite
+    } else {
+        StorageKind::ObsidianVault
+    };
     if let Some(v) = cli.vault {
         config.path = v;
     }
@@ -117,21 +126,27 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Serve { port, auto_commit } => {
             config.auto_git_commit = auto_commit;
-            let engine = SlcEngine::open(config)?;
+            let engine = SlcEngine::open_async(config).await?;
             server::run(engine, port).await
         }
         Cmd::Status => {
-            let backend = if cli.sqlite { "sqlite" } else { "obsidian-vault" };
+            let backend = if cli.mongodb {
+                "mongodb"
+            } else if cli.sqlite {
+                "sqlite"
+            } else {
+                "obsidian-vault"
+            };
             println!("backend: {backend}");
             println!("path: {}", config.path);
-            let engine = SlcEngine::open(config)?;
+            let engine = SlcEngine::open_async(config).await?;
             println!("health: {}", engine.health().await);
             let seats = engine.seats.list_active(100).await?;
             println!("active seats: {}", seats.len());
             Ok(())
         }
         Cmd::Seat { action } => {
-            let engine = SlcEngine::open(config)?;
+            let engine = SlcEngine::open_async(config).await?;
             match action {
                 SeatAction::List => {
                     for s in engine.seats.list_active(100).await? {
@@ -152,26 +167,26 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Remember { seat_id, event_id, content } => {
-            let engine = SlcEngine::open(config)?;
+            let engine = SlcEngine::open_async(config).await?;
             engine.ensure_seat(&seat_id).await?;
             engine.remember(&seat_id, &event_id, &content).await?;
             println!("recorded {event_id} for {seat_id}");
             Ok(())
         }
         Cmd::Compress { seat_id } => {
-            let engine = SlcEngine::open(config)?;
+            let engine = SlcEngine::open_async(config).await?;
             let r = engine.compress(&seat_id).await?;
             println!("L1→L2: {}, L2→L3: {}, L3→L4: {}", r.l1_to_l2, r.l2_to_l3, r.l3_to_l4);
             Ok(())
         }
         Cmd::Consolidate { seat_id } => {
-            let engine = SlcEngine::open(config)?;
+            let engine = SlcEngine::open_async(config).await?;
             let r = engine.consolidate(&seat_id).await?;
             println!("sources: {}, facts added: {} (total extracted: {})", r.sources, r.facts_added, r.facts_total);
             Ok(())
         }
         Cmd::Search { query, seat, limit } => {
-            let engine = SlcEngine::open(config)?;
+            let engine = SlcEngine::open_async(config).await?;
             let hits = engine.search(&query, seat.as_deref(), limit).await?;
             for h in hits {
                 println!(
@@ -186,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Import { path, category, seat } => {
-            let engine = SlcEngine::open(config)?;
+            let engine = SlcEngine::open_async(config).await?;
             let cat = DocumentCategory::parse(&category)
                 .context("bad category (core|module|task|project|code_snippet|documentation|custom|system)")?;
             let content = std::fs::read_to_string(&path)?;
@@ -207,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Graveyard { action } => {
-            let engine = SlcEngine::open(config)?;
+            let engine = SlcEngine::open_async(config).await?;
             match action {
                 GraveyardAction::List => {
                     for d in engine.store().kb_graveyard(None).await? {

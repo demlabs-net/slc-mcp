@@ -16,6 +16,8 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+mongodb = { version = "3", default-features = false, features = ["rustls-tls", "bson-3", "compat-3-3-0"] }
+bson = { version = "3", default-features = false, features = ["compat-3-0-0", "serde", "chrono-0_4"] }
 chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
