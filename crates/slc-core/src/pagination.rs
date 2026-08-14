@@ -19,7 +19,9 @@ pub const COLLECTION: &str = "paginated_responses";
 /// Min / max page sizes in tokens (legacy constants).
 pub const MIN_PAGE_TOKEN_LIMIT: usize = 500;
 pub const MAX_PAGE_TOKEN_LIMIT: usize = 100_000;
-pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 16_000;
+/// 5000 токенов ≈ 20K симв ≈ 20-40K байт: страница гарантированно влезает
+/// в типовой resultBudget харнеса (50K байт на вывод одного тула).
+pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 5_000;
 
 /// Rough chars-per-token estimate (legacy CHARS_PER_TOKEN=4).
 pub const CHARS_PER_TOKEN: usize = 4;

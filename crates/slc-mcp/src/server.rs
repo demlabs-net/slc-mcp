@@ -299,8 +299,8 @@ let params = req.get("params").cloned().unwrap_or(Value::Null);
     let result = match method {
         "initialize" => {
             // Auto-apply the client's context budget when it advertises one
-            // (capabilities.experimental.context_limit_chars) — the per-seat
-            // override used by update_context compression.
+            // (capabilities.experimental.context_limit_chars — ТОКЕНЫ) as the
+            // per-seat override used by update_context compression.
             if let Some(window) = params
                 .pointer("/capabilities/experimental/context_limit_chars")
                 .and_then(|v| v.as_u64())
@@ -308,13 +308,13 @@ let params = req.get("params").cloned().unwrap_or(Value::Null);
                 if let Some(seat) = seat_hdr.as_deref() {
                     // The seat may not exist yet — create it first.
                     let _ = engine.seats.ensure_seat(seat).await;
-                    // SLC budget = 80% of the client's model window (the rest
-                    // is left for the conversation itself), capped at the
-                    // configured limit (SLC_CONTEXT_LIMIT_CHARS).
-                    let limit = (window * 4 / 5).min(engine.config.context_limit_chars as u64);
+                    // SLC budget = 80% of the client's model window in TOKENS
+                    // (the rest is left for the conversation itself), capped
+                    // at the configured limit (SLC_CONTEXT_LIMIT_TOKENS).
+                    let limit = (window * 4 / 5).min(engine.config.context_limit_tokens as u64);
                     let _ = engine
                         .seats
-                        .set_context_key(seat, "context_limit_chars", json!(limit))
+                        .set_context_key(seat, "context_limit_tokens", json!(limit))
                         .await;
                 }
             }
@@ -873,11 +873,22 @@ async fn build_context(
     //    in by dropping whole low-priority blocks (base docs first,
     //    then profiles), keeping the active document and focuses.
     // 3. The model is warned about the compression in the reply.
-    let limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
+    let limit_tokens = engine.context_limit_for(seat_id).await.map_err(json_err)?;
+    // Лимит задаётся в ТОКЕНАХ (окно модели), компрессия работает в
+    // символах: budget = tokens × ~3 симв/токен (RU/EN смесь).
+    let limit = limit_tokens.saturating_mul(slc_core::CHARS_PER_TOKEN).max(200);
+    // Байтовый guard вывода: харнесы режут вывод тула по resultBudget
+    // (~50K байт, strategy=truncate — молча, с потерей хвоста). Считаем
+    // used_bytes честно (UTF-8) и дропаем блоки при превышении.
+    // Выключается SLC_TOOL_OUTPUT_MAX_BYTES=0.
+    let cap_bytes: usize = std::env::var("SLC_TOOL_OUTPUT_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48_000);
     let mut docs: Vec<Value> = Vec::new();
-    // used считаем в СИМВОЛАХ — лимит тоже в символах; байты
-    // (str::len) для кириллицы завышали бы расход в ~2 раза.
+    // used — символы (для токен-бюджета); used_bytes — UTF-8 байты (guard).
     let mut used = 0usize;
+    let mut used_bytes = 0usize;
 
     // Blocks in priority order: active document FIRST (never dropped),
     // then focuses, then profiles, then base docs.
@@ -886,6 +897,7 @@ async fn build_context(
         used += d.document_id.chars().count()
             + d.category.as_str().chars().count()
             + d.content.chars().count();
+        used_bytes += d.document_id.len() + d.category.as_str().len() + d.content.len();
         active_block = Some(
             json!({"id": d.document_id, "type": d.category.as_str(), "name": d.document_id, "content": d.content}),
         );
@@ -894,6 +906,7 @@ async fn build_context(
     if let Ok(items) = engine.focus_list(seat_id, None).await {
         if !items.is_empty() {
             used += 32;
+            used_bytes += 32;
             focus_block =
                 Some(json!({"id": "active_focuses", "type": "focuses", "count": items.len()}));
         }
@@ -901,10 +914,12 @@ async fn build_context(
     let mut profile_blocks: Vec<Value> = Vec::new();
     if let Ok(Some((content, _))) = engine.get_seat_profile(seat_id).await {
         used += content.chars().count();
+        used_bytes += content.len();
         profile_blocks.push(json!({"id": format!("seat_profile:{seat_id}"), "type": "seat_profile", "content": content}));
     }
     if let Ok(Some(content)) = engine.get_user_profile(seat_id).await {
         used += content.chars().count();
+        used_bytes += content.len();
         profile_blocks
             .push(json!({"id": "user_profile", "type": "user_profile", "content": content}));
     }
@@ -919,6 +934,7 @@ async fn build_context(
         ] {
             if let Ok(Some(d)) = engine.get_document(base).await {
                 used += d.content.chars().count();
+                used_bytes += d.content.len();
                 base_blocks.push(json!({"id": base, "type": "base", "content": d.content}));
             }
         }
@@ -927,11 +943,14 @@ async fn build_context(
     // Compression: drop whole blocks by priority until it fits — по одному,
     // начиная с наименее важных (последних), чтобы манифест и стандарты
     // остались в контексте даже при жёстком лимите.
-    // Core-документы НИКОГДА не дропаются — они являются системным знанием,
-    // без которого модель не может корректно работать.
+    // Условие переполнения — ЛИБО токен-бюджет (символы), ЛИБО байтовый
+    // guard вывода (resultBudget харнеса).
+    let overflow = |used: usize, used_bytes: usize| -> bool {
+        used > limit || (cap_bytes > 0 && used_bytes > cap_bytes)
+    };
     let mut omitted: Vec<String> = Vec::new();
     let mut drop_while_overflow = |blocks: &mut Vec<Value>, omitted: &mut Vec<String>| {
-        while used > limit {
+        while overflow(used, used_bytes) {
             match blocks.pop() {
                 Some(b) => {
                     used = used.saturating_sub(
@@ -940,14 +959,18 @@ async fn build_context(
                             .map(|s| s.chars().count())
                             .unwrap_or(0),
                     );
+                    used_bytes = used_bytes.saturating_sub(
+                        b["content"].as_str().map(|s| s.len()).unwrap_or(0),
+                    );
                     omitted.push(b["id"].as_str().unwrap_or("block").to_string());
                 }
                 None => break,
             }
         }
     };
-    // Only profile blocks are droppable; base (core) docs are mandatory.
+    // Приоритет дропа: профили → base-документы (с наименее важных).
     drop_while_overflow(&mut profile_blocks, &mut omitted);
+    drop_while_overflow(&mut base_blocks, &mut omitted);
     let compressed = !omitted.is_empty();
 
     if let Some(b) = active_block {
@@ -964,11 +987,11 @@ async fn build_context(
     // after dropping blocks. Documents are never truncated by hand;
     // a failed LLM call leaves them whole.
     let mut llm_compressed: Vec<String> = Vec::new();
-    if used > limit && !docs.is_empty() {
+    if overflow(used, used_bytes) && !docs.is_empty() {
         // Compress from the least important end (profiles → active).
         let budget = (limit / 2).max(200);
         for b in docs.iter_mut().rev() {
-            if used <= limit {
+            if !overflow(used, used_bytes) {
                 break;
             }
             let Some(content) = b["content"].as_str() else {
@@ -981,6 +1004,7 @@ async fn build_context(
                 let summary_chars = summary.chars().count();
                 if summary_chars < content.chars().count() {
                     used = used.saturating_sub(content.chars().count()) + summary_chars;
+                    used_bytes = used_bytes.saturating_sub(content.len()) + summary.len();
                     b["content"] = json!(summary);
                     b["llm_compressed"] = json!(true);
                     llm_compressed.push(b["id"].as_str().unwrap_or("?").to_string());
@@ -1013,7 +1037,8 @@ async fn build_context(
     if save_info.is_some() || compressed {
         let _ = events.send(json!({
             "type": "context_updated", "seat_id": seat_id,
-            "compressed": compressed, "used_chars": used, "limit_chars": limit,
+            "compressed": compressed, "used_chars": used,
+            "limit_tokens": limit_tokens, "budget_chars": limit,
             "omitted": omitted,
             "saved": save_info.as_ref().and_then(|v| v.get("document_id")).cloned(),
         }));
@@ -1023,7 +1048,11 @@ async fn build_context(
     // диагностики) — иначе каждая сборка тянула бы всю базу.
     Ok(
         json!({"docs": docs, "seat": seat_id, "save_info": save_info,
-                   "limit_chars": limit, "used_chars": used, "compressed": compressed,
+                   "limit_tokens": limit_tokens, "budget_chars": limit,
+                   "used_tokens": used / slc_core::CHARS_PER_TOKEN,
+                   "used_chars": used, "used_bytes": used_bytes,
+                   "tool_output_cap_bytes": cap_bytes,
+                   "compressed": compressed,
                    "warning": warning}),
     )
 }
@@ -1108,15 +1137,17 @@ async fn call_tool(
                 "limit" => {
                     let n = parts.next().and_then(|v| v.parse::<u64>().ok());
                     let Some(n) = n else {
-                        return Err(json!({"code": -32602, "message": "usage: /limit <chars>"}));
+                        return Err(json!({"code": -32602, "message": "usage: /limit <tokens>"}));
                     };
                     let ok = engine
                         .seats
-                        .set_context_key(seat_id, "context_limit_chars", json!(n))
+                        .set_context_key(seat_id, "context_limit_tokens", json!(n))
                         .await
                         .map_err(json_err)?;
                     Ok(
-                        json!({"success": ok, "context_limit_chars": n, "message": "Context limit set"}),
+                        json!({"success": ok, "context_limit_tokens": n,
+                               "budget_chars": n * slc_core::CHARS_PER_TOKEN as u64,
+                               "message": "Context limit set (tokens; ~3 chars per token)"}),
                     )
                 }
                 "ctx" => {
@@ -1130,7 +1161,9 @@ async fn call_tool(
                     let projects = project_list(engine).await?;
                     let tasks = task_list(engine, Some(seat_id)).await?;
                     Ok(
-                        json!({"limit_chars": limit, "active_document": active.map(|d| d.document_id),
+                        json!({"limit_tokens": limit,
+                           "budget_chars": limit * slc_core::CHARS_PER_TOKEN,
+                           "active_document": active.map(|d| d.document_id),
                            "focus_count": focuses.len(), "seat_context": seat.map(|s| s.context),
                            "projects": projects, "tasks": tasks}),
                     )
@@ -1760,12 +1793,15 @@ async fn call_tool(
     }
     let mut result = json!({"content": [{"type": "text", "text": text}], "isError": false});
     // structuredContent: некоторые клиенты требуют его, когда у тула есть
-    // outputSchema (MCP SDK валидирует). Отдаём всегда — JSON, если текст
-    // парсится, иначе {"text": …}.
-    if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
-        result["structuredContent"] = parsed;
-    } else {
-        result["structuredContent"] = json!({"text": text});
+    // outputSchema. Схем у наших тулов нет, поэтому для БОЛЬШИХ ответов
+    // дубль не отдаём — он удваивал вывод (text + structuredContent) и
+    // выводил за resultBudget харнеса (обрезка strategy=truncate).
+    if text.chars().count() <= 2000 {
+        if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+            result["structuredContent"] = parsed;
+        } else {
+            result["structuredContent"] = json!({"text": text});
+        }
     }
     // Pagination envelope: cache oversized list responses and tag them.
     if text.chars().count() > 20000 {
