@@ -40,6 +40,33 @@ use std::sync::Mutex;
 
 /// Human-readable file name from a unique document id.
 /// Keeps letters/digits/`-`/`_`/`.`/space; path-hostile chars → `-`.
+/// Validate a vault folder path from an untrusted document. Nested
+/// relative paths are fine (`projects/vassista`, `history/2026/08` —
+/// `default_folder` builds those from categories and ids); anything that
+/// could escape the vault root is rejected: absolute paths, `..`
+/// components, backslashes, colons and control characters.
+pub fn sanitize_folder(folder: &str) -> SlcResult<String> {
+    let folder = folder.trim();
+    if folder.is_empty() {
+        return Err(SlcError::Storage("folder must not be empty".into()));
+    }
+    if folder.starts_with('/') {
+        return Err(SlcError::Storage(format!("folder must be relative to the vault: {folder}")));
+    }
+    for part in folder.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(SlcError::Storage(format!("folder contains an invalid component: {folder}")));
+        }
+        if part
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\\' | ':'))
+        {
+            return Err(SlcError::Storage(format!("folder contains invalid characters: {folder}")));
+        }
+    }
+    Ok(folder.to_string())
+}
+
 pub fn safe_file_name(document_id: &str) -> String {
     let mut out = String::with_capacity(document_id.len());
     for c in document_id.chars() {
@@ -393,6 +420,7 @@ impl ObsidianVaultStore {
     /// Write a document note: `{folder}/{safe_name}.md` (frontmatter + body).
     fn write_note(&self, doc: &Document) -> SlcResult<()> {
         let folder = doc.folder.clone().unwrap_or_else(|| doc.default_folder());
+        let folder = sanitize_folder(&folder)?;
         let dir = self.root.join(&folder);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.md", safe_file_name(&doc.document_id)));
@@ -405,7 +433,8 @@ impl ObsidianVaultStore {
 
     /// Read + parse a note into a Document (files are the source of truth).
     fn read_note(&self, entry: &IndexEntry) -> SlcResult<Document> {
-        let path = self.root.join(&entry.folder).join(format!("{}.md", safe_file_name(&entry.id)));
+        let path = self.root.join(&sanitize_folder(&entry.folder)?)
+            .join(format!("{}.md", safe_file_name(&entry.id)));
         let text = std::fs::read_to_string(&path)?;
         let (meta, body) = frontmatter_parse(&text);
         let meta = meta.unwrap_or_default();
@@ -680,7 +709,8 @@ impl StorageBackend for ObsidianVaultStore {
     async fn kb_purge(&self, document_id: &str) -> SlcResult<bool> {
         let entry = self.index.lock().unwrap().remove(document_id);
         let Some(e) = entry else { return Ok(false) };
-        let path = self.root.join(&e.folder).join(format!("{}.md", safe_file_name(&e.id)));
+        let path = self.root.join(&sanitize_folder(&e.folder)?)
+            .join(format!("{}.md", safe_file_name(&e.id)));
         let _ = tokio::fs::remove_file(path).await;
         self.delete_embeddings(document_id).await?;
         self.persist_index()?;
@@ -780,7 +810,8 @@ impl StorageBackend for ObsidianVaultStore {
     async fn episodic_purge(&self, document_id: &str) -> SlcResult<bool> {
         let entry = self.index.lock().unwrap().remove(document_id);
         let Some(e) = entry else { return Ok(false) };
-        let path = self.root.join(&e.folder).join(format!("{}.md", safe_file_name(&e.id)));
+        let path = self.root.join(&sanitize_folder(&e.folder)?)
+            .join(format!("{}.md", safe_file_name(&e.id)));
         let _ = tokio::fs::remove_file(path).await;
         self.persist_index()?;
         self.git_commit().await;
@@ -1120,4 +1151,25 @@ mod tests {
             .unwrap();
         assert_eq!(store.get_embedding("doc-a").await.unwrap(), Some(vec![0.5, 0.25]));
     }
+    #[test]
+    fn sanitize_folder_accepts_nested_relative_and_rejects_escapes() {
+        // Valid Obsidian layouts.
+        assert_eq!(sanitize_folder("projects/vassista").unwrap(), "projects/vassista");
+        assert_eq!(sanitize_folder("history/2026/08").unwrap(), "history/2026/08");
+        // Escapes must be rejected (path traversal / absolute / windows).
+        for bad in [
+            "../../tmp/x",
+            "projects/../..",
+            "/etc",
+            "a/b/../../c",
+            "..",
+            "a\\..\\b",
+            "a:b",
+            "",
+            "  ",
+        ] {
+            assert!(sanitize_folder(bad).is_err(), "must reject {bad:?}");
+        }
+    }
+
 }
