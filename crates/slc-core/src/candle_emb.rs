@@ -21,7 +21,7 @@ use crate::llm::{EmbeddingKind, LlmClient};
 use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 /// GPU-модель по умолчанию: мультиязычная (включая русский), 1024-мер.
 pub const BGE_M3: &str = "BAAI/bge-m3";
@@ -75,13 +75,15 @@ enum LoadState {
 }
 
 /// Onboard embedding client (candle). The model is loaded from the HF cache
-/// in the background; embedding calls block until it is ready. If the model
-/// was never downloaded (`slc-mcp init`), calls fail fast instead.
+/// in the background; embedding calls await it without blocking a tokio
+/// worker (async readiness via `Notify`), and the actual inference runs on
+/// the blocking pool (`spawn_blocking`). If the model was never downloaded
+/// (`slc-mcp init`), calls fail fast instead.
 pub struct CandleEmbeddingLlm {
     repo_id: String,
     device_kind: DeviceKind,
     state: Arc<Mutex<LoadState>>,
-    cond: Arc<Condvar>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl Default for CandleEmbeddingLlm {
@@ -120,7 +122,7 @@ impl CandleEmbeddingLlm {
             repo_id,
             device_kind,
             state: Arc::new(Mutex::new(LoadState::Loading)),
-            cond: Arc::new(Condvar::new()),
+            notify: Arc::new(tokio::sync::Notify::new()),
         };
         if llm.model_cached() {
             let worker = llm.clone_for_loader();
@@ -189,13 +191,13 @@ impl CandleEmbeddingLlm {
         }
     }
 
-    /// Копия для фонового лоадера: разделяет `state`/`cond` с оригиналом.
+    /// Копия для фонового лоадера: разделяет `state`/`notify` с оригиналом.
     fn clone_for_loader(&self) -> Self {
         Self {
             repo_id: self.repo_id.clone(),
             device_kind: self.device_kind,
             state: Arc::clone(&self.state),
-            cond: Arc::clone(&self.cond),
+            notify: Arc::clone(&self.notify),
         }
     }
 
@@ -210,21 +212,28 @@ impl CandleEmbeddingLlm {
                 *self.state.lock().unwrap() = LoadState::Failed(e);
             }
         }
-        self.cond.notify_all();
+        self.notify.notify_waiters();
     }
 
-    fn wait_ready(&self) -> Result<Arc<Loaded>, SlcError> {
-        let mut state = self.state.lock().unwrap();
+    /// Async-ожидание готовности модели — НЕ блокирует tokio-поток
+    /// (в отличие от старого Condvar). Будущее создаётся до проверки
+    /// состояния, поэтому уведомление между проверкой и await не теряется.
+    async fn wait_ready(&self) -> Result<Arc<Loaded>, SlcError> {
         loop {
-            match &*state {
-                LoadState::Ready(l) => return Ok(l.clone()),
-                LoadState::Failed(e) => {
-                    return Err(SlcError::Storage(format!(
-                        "embedding model unavailable: {e}"
-                    )));
+            let notified = self.notify.notified();
+            {
+                let state = self.state.lock().unwrap();
+                match &*state {
+                    LoadState::Ready(l) => return Ok(l.clone()),
+                    LoadState::Failed(e) => {
+                        return Err(SlcError::Storage(format!(
+                            "embedding model unavailable: {e}"
+                        )));
+                    }
+                    LoadState::Loading => {}
                 }
-                LoadState::Loading => state = self.cond.wait(state).unwrap(),
             }
+            notified.await;
         }
     }
 
@@ -351,12 +360,9 @@ impl CandleEmbeddingLlm {
         })
     }
 
-    fn embed_loaded(
-        &self,
-        loaded: &Loaded,
-        text: &str,
-        kind: EmbeddingKind,
-    ) -> SlcResult<Vec<f32>> {
+    /// Синхронный эмбеддинг (токенизация + forward + pooling). Вызывается
+    /// только из `spawn_blocking` — candle-операции блокирующие.
+    fn embed_loaded(loaded: &Loaded, text: &str, kind: EmbeddingKind) -> SlcResult<Vec<f32>> {
         let embed = (|| -> Result<Vec<f32>, String> {
             let text = match (loaded.e5_prefix, kind) {
                 (true, EmbeddingKind::Query) => format!("query: {text}"),
@@ -469,7 +475,7 @@ pub fn model_is_cached(repo_id: &str) -> bool {
         repo_id: repo_id.to_string(),
         device_kind: DeviceKind::Cpu,
         state: Arc::new(Mutex::new(LoadState::Loading)),
-        cond: Arc::new(Condvar::new()),
+        notify: Arc::new(tokio::sync::Notify::new()),
     };
     probe.model_cached()
 }
@@ -510,8 +516,8 @@ impl LlmClient for CandleEmbeddingLlm {
     }
 
     async fn generate_embedding(&self, text: &str) -> SlcResult<Vec<f32>> {
-        let loaded = self.wait_ready()?;
-        self.embed_loaded(&loaded, text, EmbeddingKind::Passage)
+        self.generate_embedding_kind(text, EmbeddingKind::Passage)
+            .await
     }
 
     async fn generate_embedding_kind(
@@ -519,8 +525,13 @@ impl LlmClient for CandleEmbeddingLlm {
         text: &str,
         kind: EmbeddingKind,
     ) -> SlcResult<Vec<f32>> {
-        let loaded = self.wait_ready()?;
-        self.embed_loaded(&loaded, text, kind)
+        let loaded = self.wait_ready().await?;
+        let text = text.to_string();
+        // Инференс на blocking-пуле: candle-операции синхронные и
+        // занимают десятки-сотни мс — tokio-поток не блокируется.
+        tokio::task::spawn_blocking(move || Self::embed_loaded(&loaded, &text, kind))
+            .await
+            .map_err(|e| SlcError::Storage(format!("embed task panicked: {e}")))?
     }
 
     fn embedding_model_name(&self) -> String {
@@ -528,5 +539,39 @@ impl LlmClient for CandleEmbeddingLlm {
             "candle:{}",
             self.repo_id.split('/').next_back().unwrap_or("embed")
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn not_cached_fails_fast() {
+        // Несуществующий репозиторий: модель не в кэше → быстрый Err
+        // с подсказкой про init (никакого скачивания/сети).
+        let llm = CandleEmbeddingLlm::with_config("nonexistent/owner-model-xyz", "cpu");
+        let err = llm
+            .generate_embedding("тест")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("slc-mcp init"),
+            "hint must point to init: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "требует модель в HF-кэше (slc-mcp init)"]
+    async fn cached_model_embeds_via_blocking_pool() {
+        let llm = CandleEmbeddingLlm::with_config("intfloat/multilingual-e5-small", "cpu");
+        let v = llm
+            .generate_embedding("проверка эмбеддинга")
+            .await
+            .expect("embed");
+        assert_eq!(v.len(), 384);
+        let norm: f32 = v.iter().map(|x| x * x).sum();
+        assert!((norm - 1.0).abs() < 1e-3, "L2-normalized, got {norm}");
     }
 }
