@@ -205,24 +205,84 @@ impl Document {
         }
     }
 
-    /// Default folder for a category (used when `folder` is `None`).
+    /// Default folder for a document (used when `folder` is `None`).
+    ///
+    /// Hierarchical layout (user-approved): knowledge categories live under
+    /// `docs/`, projects are folders `docs/projects/<project>/` with their
+    /// own note and per-category subfolders, tasks outside projects go to
+    /// `tasks/`. A document bound to a project
+    /// (`metadata.extra["project"] = <slug>`) is placed inside that project's
+    /// folder. The vault stays human-organized; indexing/RAG are separate
+    /// sidecars (`.slc/`), never mixed into the notes tree.
     pub fn default_folder(&self) -> String {
+        if self.category == DocumentCategory::History {
+            // Human diary layout: history/YYYY/MM/
+            let d = self.created_at;
+            return format!("history/{:04}/{:02}", d.year(), d.month());
+        }
+        if self.category == DocumentCategory::Project {
+            // The project note itself: docs/projects/<slug>/ — the slug comes
+            // from the document id (legacy `project_` prefix stripped).
+            let slug = self
+                .project_slug()
+                .or_else(|| {
+                    slugify_ascii(self.document_id.strip_prefix("project_").unwrap_or(&self.document_id))
+                })
+                .unwrap_or_else(|| "project".into());
+            return format!("docs/projects/{slug}");
+        }
+        if let Some(project) = self.project_slug() {
+            // Document of a project (tasks, docs, custom notes, …) → inside
+            // the project folder, per-category subfolder.
+            return format!("docs/projects/{project}/{}", self.category_dir());
+        }
+        self.category_folder()
+    }
+
+    /// The `docs/<category>` folder for non-project documents.
+    fn category_folder(&self) -> String {
         match self.category {
-            DocumentCategory::History => {
-                // Human diary layout: history/YYYY/MM/
-                let d = self.created_at;
-                format!("history/{:04}/{:02}", d.year(), d.month())
-            }
-            DocumentCategory::Core => "core".into(),
-            DocumentCategory::Module => "modules".into(),
+            DocumentCategory::Core => "docs/core".into(),
+            DocumentCategory::Module => "docs/modules".into(),
             DocumentCategory::Task => "tasks".into(),
-            DocumentCategory::Project => "projects".into(),
             DocumentCategory::CodeSnippet => "code".into(),
             DocumentCategory::Documentation => "docs".into(),
-            DocumentCategory::Skill => "skills".into(),
-            DocumentCategory::Custom => "custom".into(),
+            DocumentCategory::Skill => "docs/skills".into(),
+            DocumentCategory::Custom => "docs/custom".into(),
             DocumentCategory::System => "system".into(),
+            DocumentCategory::Project | DocumentCategory::History => {
+                unreachable!("project/history folders handled in default_folder")
+            }
         }
+    }
+
+    /// Leaf directory used INSIDE a project folder (`docs/projects/<p>/<leaf>`).
+    fn category_dir(&self) -> &'static str {
+        match self.category {
+            DocumentCategory::Core => "core",
+            DocumentCategory::Module => "modules",
+            DocumentCategory::Task => "tasks",
+            DocumentCategory::CodeSnippet => "code",
+            DocumentCategory::Documentation => "docs",
+            DocumentCategory::Skill => "skills",
+            DocumentCategory::Custom => "custom",
+            DocumentCategory::System => "system",
+            DocumentCategory::Project | DocumentCategory::History => {
+                unreachable!("project/history folders handled in default_folder")
+            }
+        }
+    }
+
+    /// Project binding from `metadata.extra["project"]` (a lowercase slug,
+    /// e.g. `slc`, `confcall`) — sanitized so it can never escape the
+    /// `docs/projects/` tree.
+    pub fn project_slug(&self) -> Option<String> {
+        slugify_ascii(
+            self.metadata
+                .extra
+                .get("project")
+                .and_then(|v| v.as_str())?,
+        )
     }
 }
 
@@ -367,6 +427,27 @@ pub struct Notification {
     pub metadata: serde_json::Map<String, serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub delivered_at: Option<DateTime<Utc>>,
+}
+
+/// Lowercase ascii slug (words joined with `_`, ≤48 chars); `None` when the
+/// result would be empty. Used for folder segments so user/LLM-supplied
+/// project names can never escape the intended tree.
+pub fn slugify_ascii(raw: &str) -> Option<String> {
+    let slug: String = raw
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .split('_')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    let slug = slug.chars().take(48).collect::<String>();
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
 }
 
 /// sha256 hex of the document content — dedup / content identity only.

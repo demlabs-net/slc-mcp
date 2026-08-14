@@ -58,7 +58,7 @@ slc-mcp serve --port 3000          # MCP: POST /mcp, SSE /sse, /health
 | `slc-mcp status` | Бэкенд и путь хранилища |
 | `slc-mcp remember/compress/consolidate` | Эпизодика и суммаризация |
 | `slc-mcp migrate --from <legacy>` | Миграция легаси-ваулта (id → слаги, папки) |
-| `slc-mcp migrate --from-mongo [URI] --db slc_mcp [--rename-with-ai]` | Миграция легаси-Mongo (БЗ + history → episodic + сиды); `--rename-with-ai` переименовывает id через LLM из `.env` и правит `auto_load`/`references` |
+| `slc-mcp migrate --from-mongo [URI] --db slc_mcp [--rename-with-ai]` | Миграция легаси-Mongo: БЗ + history → episodic + проекты/задачи (`docs/projects/<p>/`) + сиды; `--rename-with-ai` переименовывает id через LLM из `.env` и правит `auto_load`/`references` |
 
 Сменил модель в `init`? Пересобери эмбеддинги:
 

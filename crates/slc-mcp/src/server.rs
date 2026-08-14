@@ -1097,7 +1097,7 @@ async fn call_tool(
                 .get("folder")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let doc = Document::with_folder(
+            let mut doc = Document::with_folder(
                 id,
                 category,
                 folder,
@@ -1106,8 +1106,11 @@ async fn call_tool(
                 vec![],
                 Some(seat_id.into()),
             );
-            engine.add_document(&doc).await.map_err(json_err)?;
-            json!({"document_id": doc.document_id})
+            engine.add_document(&mut doc).await.map_err(json_err)?;
+            json!({
+                "document_id": doc.document_id,
+                "folder": doc.folder.clone().unwrap_or_else(|| doc.default_folder()),
+            })
         }
         "remember" => {
             let event_id = args.get("event_id").and_then(|v| v.as_str()).unwrap_or("");

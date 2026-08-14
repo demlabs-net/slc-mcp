@@ -315,9 +315,13 @@ async fn main() -> anyhow::Result<()> {
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "doc".into());
-            let doc = slc_core::Document::new(name, cat, content, Default::default(), vec![], seat);
-            engine.add_document(&doc).await?;
-            println!("imported {}", doc.document_id);
+            let mut doc = slc_core::Document::new(name, cat, content, Default::default(), vec![], seat);
+            engine.add_document(&mut doc).await?;
+            println!(
+                "imported {} → {}",
+                doc.document_id,
+                doc.folder.clone().unwrap_or_else(|| doc.default_folder())
+            );
             Ok(())
         }
         Cmd::Graveyard { action } => {

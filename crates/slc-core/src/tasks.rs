@@ -386,10 +386,10 @@ mod tests {
             vec![],
             None,
         );
-        assert_eq!(skill_doc.default_folder(), "skills");
+        assert_eq!(skill_doc.default_folder(), "docs/skills");
 
         // Activate a skill document.
-        let skill = crate::model::Document::new(
+        let mut skill = crate::model::Document::new(
             "skill_rust",
             crate::model::DocumentCategory::Skill,
             "Rust basics: borrow checker",
@@ -397,14 +397,14 @@ mod tests {
             vec![],
             Some("seat_a".into()),
         );
-        engine.add_document(&skill).await.unwrap();
+        engine.add_document(&mut skill).await.unwrap();
         assert!(engine.document_activate("seat_a", "skill_rust").await.unwrap());
         let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
         assert_eq!(active.document_id, "skill_rust");
         assert_eq!(active.category, crate::model::DocumentCategory::Skill);
 
         // Activate a project — same effect.
-        let proj = crate::model::Document::new(
+        let mut proj = crate::model::Document::new(
             "project_vassista",
             crate::model::DocumentCategory::Project,
             "Vassista voice platform",
@@ -412,13 +412,13 @@ mod tests {
             vec![],
             Some("seat_a".into()),
         );
-        engine.add_document(&proj).await.unwrap();
+        engine.add_document(&mut proj).await.unwrap();
         assert!(engine.document_activate("seat_a", "project_vassista").await.unwrap());
         let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
         assert_eq!(active.category, crate::model::DocumentCategory::Project);
 
         // Task activation keeps the unified pointer AND the legacy task one.
-        let task = crate::model::Document::new(
+        let mut task = crate::model::Document::new(
             "task_x",
             crate::model::DocumentCategory::Task,
             "do things",
@@ -426,7 +426,7 @@ mod tests {
             vec![],
             Some("seat_a".into()),
         );
-        engine.add_document(&task).await.unwrap();
+        engine.add_document(&mut task).await.unwrap();
         assert!(engine.document_activate("seat_a", "task_x").await.unwrap());
         let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
         assert_eq!(active.category, crate::model::DocumentCategory::Task);
