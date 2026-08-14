@@ -769,9 +769,9 @@ pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инс�
 
 ## Лимиты и компрессия контекста
 
-- `update_context` возвращает `limit_chars`/`used_chars`/`compressed` и,
-  при сжатии, `warning`. Бюджет SLC = 50% окна модели клиента (авто при
-  подключении) или `/limit <chars>`.
+- `update_context` возвращает `limit_tokens`/`used_tokens`/`compressed` и,
+  при сжатии, `warning`. Бюджет SLC — ТОКЕНЫ: 80% окна модели клиента (авто
+  при подключении) или `/limit <tokens>`.
 - **Документы НИКОГДА не обрезаются.** Если лимит превышен, компрессия:
   1) исключаются целые блоки по приоритету (base-документы, затем
      профили; активный документ и фокусы остаются);
@@ -874,30 +874,22 @@ async fn build_context(
     //    then profiles), keeping the active document and focuses.
     // 3. The model is warned about the compression in the reply.
     let limit_tokens = engine.context_limit_for(seat_id).await.map_err(json_err)?;
-    // Лимит задаётся в ТОКЕНАХ (окно модели), компрессия работает в
-    // символах: budget = tokens × ~3 симв/токен (RU/EN смесь).
-    let limit = limit_tokens.saturating_mul(slc_core::CHARS_PER_TOKEN).max(200);
-    // Байтовый guard вывода: харнесы режут вывод тула по resultBudget
-    // (~50K байт, strategy=truncate — молча, с потерей хвоста). Считаем
-    // used_bytes честно (UTF-8) и дропаем блоки при превышении.
-    // Выключается SLC_TOOL_OUTPUT_MAX_BYTES=0.
-    let cap_bytes: usize = std::env::var("SLC_TOOL_OUTPUT_MAX_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(48_000);
     let mut docs: Vec<Value> = Vec::new();
-    // used — символы (для токен-бюджета); used_bytes — UTF-8 байты (guard).
-    let mut used = 0usize;
-    let mut used_bytes = 0usize;
+    // ЕДИНАЯ единица бюджета — ТОКЕНЫ (~3 симв/токен, RU/EN смесь).
+    // Никаких байтовых ограничений вывода: размер окна определяет клиент
+    // (initialize / /limit), а об обрезке на своей стороне заботится харнес.
+    let to_tokens = |chars: usize| chars.div_ceil(slc_core::CHARS_PER_TOKEN).max(1);
+    let mut used_tokens = 0usize;
 
     // Blocks in priority order: active document FIRST (never dropped),
     // then focuses, then profiles, then base docs.
     let mut active_block: Option<Value> = None;
     if let Ok(Some(d)) = engine.document_get_active(seat_id).await {
-        used += d.document_id.chars().count()
-            + d.category.as_str().chars().count()
-            + d.content.chars().count();
-        used_bytes += d.document_id.len() + d.category.as_str().len() + d.content.len();
+        used_tokens += to_tokens(
+            d.document_id.chars().count()
+                + d.category.as_str().chars().count()
+                + d.content.chars().count(),
+        );
         active_block = Some(
             json!({"id": d.document_id, "type": d.category.as_str(), "name": d.document_id, "content": d.content}),
         );
@@ -905,21 +897,18 @@ async fn build_context(
     let mut focus_block: Option<Value> = None;
     if let Ok(items) = engine.focus_list(seat_id, None).await {
         if !items.is_empty() {
-            used += 32;
-            used_bytes += 32;
+            used_tokens += to_tokens(32);
             focus_block =
                 Some(json!({"id": "active_focuses", "type": "focuses", "count": items.len()}));
         }
     }
     let mut profile_blocks: Vec<Value> = Vec::new();
     if let Ok(Some((content, _))) = engine.get_seat_profile(seat_id).await {
-        used += content.chars().count();
-        used_bytes += content.len();
+        used_tokens += to_tokens(content.chars().count());
         profile_blocks.push(json!({"id": format!("seat_profile:{seat_id}"), "type": "seat_profile", "content": content}));
     }
     if let Ok(Some(content)) = engine.get_user_profile(seat_id).await {
-        used += content.chars().count();
-        used_bytes += content.len();
+        used_tokens += to_tokens(content.chars().count());
         profile_blocks
             .push(json!({"id": "user_profile", "type": "user_profile", "content": content}));
     }
@@ -933,34 +922,26 @@ async fn build_context(
             "core_slc_best_practice",
         ] {
             if let Ok(Some(d)) = engine.get_document(base).await {
-                used += d.content.chars().count();
-                used_bytes += d.content.len();
+                used_tokens += to_tokens(d.content.chars().count());
                 base_blocks.push(json!({"id": base, "type": "base", "content": d.content}));
             }
         }
     }
 
-    // Compression: drop whole blocks by priority until it fits — по одному,
-    // начиная с наименее важных (последних), чтобы манифест и стандарты
-    // остались в контексте даже при жёстком лимите.
-    // Условие переполнения — ЛИБО токен-бюджет (символы), ЛИБО байтовый
-    // guard вывода (resultBudget харнеса).
-    let overflow = |used: usize, used_bytes: usize| -> bool {
-        used > limit || (cap_bytes > 0 && used_bytes > cap_bytes)
-    };
+    // Compression: drop whole blocks by priority until the TOKEN budget
+    // fits — по одному, начиная с наименее важных (последних), чтобы
+    // манифест и стандарты остались в контексте даже при жёстком лимите.
+    let overflow = |used_tokens: usize| -> bool { used_tokens > limit_tokens };
     let mut omitted: Vec<String> = Vec::new();
     let mut drop_while_overflow = |blocks: &mut Vec<Value>, omitted: &mut Vec<String>| {
-        while overflow(used, used_bytes) {
+        while overflow(used_tokens) {
             match blocks.pop() {
                 Some(b) => {
-                    used = used.saturating_sub(
+                    used_tokens = used_tokens.saturating_sub(
                         b["content"]
                             .as_str()
-                            .map(|s| s.chars().count())
+                            .map(|s| to_tokens(s.chars().count()))
                             .unwrap_or(0),
-                    );
-                    used_bytes = used_bytes.saturating_sub(
-                        b["content"].as_str().map(|s| s.len()).unwrap_or(0),
                     );
                     omitted.push(b["id"].as_str().unwrap_or("block").to_string());
                 }
@@ -987,11 +968,12 @@ async fn build_context(
     // after dropping blocks. Documents are never truncated by hand;
     // a failed LLM call leaves them whole.
     let mut llm_compressed: Vec<String> = Vec::new();
-    if overflow(used, used_bytes) && !docs.is_empty() {
+    if overflow(used_tokens) && !docs.is_empty() {
         // Compress from the least important end (profiles → active).
-        let budget = (limit / 2).max(200);
+        // summarize_text принимает размер в символах — конвертируем.
+        let budget = ((limit_tokens / 2).max(100)) * slc_core::CHARS_PER_TOKEN;
         for b in docs.iter_mut().rev() {
-            if !overflow(used, used_bytes) {
+            if !overflow(used_tokens) {
                 break;
             }
             let Some(content) = b["content"].as_str() else {
@@ -1003,8 +985,8 @@ async fn build_context(
             if let Ok(summary) = engine.summarize_text(content, budget).await {
                 let summary_chars = summary.chars().count();
                 if summary_chars < content.chars().count() {
-                    used = used.saturating_sub(content.chars().count()) + summary_chars;
-                    used_bytes = used_bytes.saturating_sub(content.len()) + summary.len();
+                    used_tokens = used_tokens.saturating_sub(to_tokens(content.chars().count()))
+                        + to_tokens(summary_chars);
                     b["content"] = json!(summary);
                     b["llm_compressed"] = json!(true);
                     llm_compressed.push(b["id"].as_str().unwrap_or("?").to_string());
@@ -1037,8 +1019,8 @@ async fn build_context(
     if save_info.is_some() || compressed {
         let _ = events.send(json!({
             "type": "context_updated", "seat_id": seat_id,
-            "compressed": compressed, "used_chars": used,
-            "limit_tokens": limit_tokens, "budget_chars": limit,
+            "compressed": compressed, "used_tokens": used_tokens,
+            "limit_tokens": limit_tokens,
             "omitted": omitted,
             "saved": save_info.as_ref().and_then(|v| v.get("document_id")).cloned(),
         }));
@@ -1048,10 +1030,8 @@ async fn build_context(
     // диагностики) — иначе каждая сборка тянула бы всю базу.
     Ok(
         json!({"docs": docs, "seat": seat_id, "save_info": save_info,
-                   "limit_tokens": limit_tokens, "budget_chars": limit,
-                   "used_tokens": used / slc_core::CHARS_PER_TOKEN,
-                   "used_chars": used, "used_bytes": used_bytes,
-                   "tool_output_cap_bytes": cap_bytes,
+                   "limit_tokens": limit_tokens,
+                   "used_tokens": used_tokens,
                    "compressed": compressed,
                    "warning": warning}),
     )
@@ -1146,8 +1126,7 @@ async fn call_tool(
                         .map_err(json_err)?;
                     Ok(
                         json!({"success": ok, "context_limit_tokens": n,
-                               "budget_chars": n * slc_core::CHARS_PER_TOKEN as u64,
-                               "message": "Context limit set (tokens; ~3 chars per token)"}),
+                               "message": "Context limit set (tokens)"}),
                     )
                 }
                 "ctx" => {
@@ -1162,7 +1141,6 @@ async fn call_tool(
                     let tasks = task_list(engine, Some(seat_id)).await?;
                     Ok(
                         json!({"limit_tokens": limit,
-                           "budget_chars": limit * slc_core::CHARS_PER_TOKEN,
                            "active_document": active.map(|d| d.document_id),
                            "focus_count": focuses.len(), "seat_context": seat.map(|s| s.context),
                            "projects": projects, "tasks": tasks}),
