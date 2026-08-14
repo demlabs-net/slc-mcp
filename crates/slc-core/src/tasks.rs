@@ -360,6 +360,100 @@ mod tests {
         (WorkItemManager::new(store.clone()), store)
     }
 
+    fn engine(store: std::sync::Arc<dyn StorageBackend>) -> crate::SlcEngine {
+        let llm: std::sync::Arc<dyn crate::LlmClient> =
+            std::sync::Arc::new(crate::MockLlm::new(vec![]));
+        crate::SlcEngine::with(store, llm, crate::SlcConfig::default())
+    }
+
+    /// Activation works for ANY document (skill, project, task) — the
+    /// unified context anchor — and Skill is a first-class category.
+    #[tokio::test]
+    async fn document_activation_any_category_and_skill() {
+        let (_, store) = mgr();
+        let engine = engine(store);
+        engine.seats.ensure_seat("seat_a").await.unwrap();
+
+        // Skill is a document: parse + folder + RAG-eligible.
+        assert_eq!(crate::model::DocumentCategory::parse("skill"), Some(crate::model::DocumentCategory::Skill));
+        assert_eq!(crate::model::DocumentCategory::parse("skills"), Some(crate::model::DocumentCategory::Skill));
+        assert!(crate::model::DocumentCategory::Skill.is_kb());
+        let skill_doc = crate::model::Document::new(
+            "skill_demo",
+            crate::model::DocumentCategory::Skill,
+            "demo",
+            Default::default(),
+            vec![],
+            None,
+        );
+        assert_eq!(skill_doc.default_folder(), "skills");
+
+        // Activate a skill document.
+        let skill = crate::model::Document::new(
+            "skill_rust",
+            crate::model::DocumentCategory::Skill,
+            "Rust basics: borrow checker",
+            Default::default(),
+            vec![],
+            Some("seat_a".into()),
+        );
+        engine.add_document(&skill).await.unwrap();
+        assert!(engine.document_activate("seat_a", "skill_rust").await.unwrap());
+        let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
+        assert_eq!(active.document_id, "skill_rust");
+        assert_eq!(active.category, crate::model::DocumentCategory::Skill);
+
+        // Activate a project — same effect.
+        let proj = crate::model::Document::new(
+            "project_vassista",
+            crate::model::DocumentCategory::Project,
+            "Vassista voice platform",
+            Default::default(),
+            vec![],
+            Some("seat_a".into()),
+        );
+        engine.add_document(&proj).await.unwrap();
+        assert!(engine.document_activate("seat_a", "project_vassista").await.unwrap());
+        let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
+        assert_eq!(active.category, crate::model::DocumentCategory::Project);
+
+        // Task activation keeps the unified pointer AND the legacy task one.
+        let task = crate::model::Document::new(
+            "task_x",
+            crate::model::DocumentCategory::Task,
+            "do things",
+            Default::default(),
+            vec![],
+            Some("seat_a".into()),
+        );
+        engine.add_document(&task).await.unwrap();
+        assert!(engine.document_activate("seat_a", "task_x").await.unwrap());
+        let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
+        assert_eq!(active.category, crate::model::DocumentCategory::Task);
+        let t = engine.task_get_active("seat_a").await.unwrap().unwrap();
+        assert_eq!(t.task_id, "task_x");
+
+        // Unknown document → false; deactivate clears both pointers.
+        assert!(!engine.document_activate("seat_a", "missing_doc").await.unwrap());
+        engine.document_deactivate("seat_a").await.unwrap();
+        assert!(engine.document_get_active("seat_a").await.unwrap().is_none());
+        assert!(engine.task_get_active("seat_a").await.unwrap().is_none());
+    }
+
+    /// Legacy task activation (activate_task tool) also lands in the
+    /// unified active-document pointer.
+    #[tokio::test]
+    async fn task_activation_sets_unified_pointer() {
+        let (m, store) = mgr();
+        let sm = crate::seat::SeatManager::new(store.clone(), 3600);
+        sm.ensure_seat("seat_a").await.unwrap();
+        let t = m.create_task("seat_a", "Task A", "", None, &[], &json!({})).await.unwrap();
+        assert!(m.set_active_task("seat_a", &t.task_id).await.unwrap());
+        let engine = engine(store);
+        let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
+        assert_eq!(active.document_id, t.task_id);
+    }
+
     #[tokio::test]
     async fn task_crud_and_visibility() {
         let (m, _) = mgr();

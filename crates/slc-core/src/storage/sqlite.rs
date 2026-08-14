@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS seats (
     metadata       TEXT NOT NULL,
     active_task_id TEXT,
     context        TEXT NOT NULL,
-    usage_stats    TEXT NOT NULL
+    usage_stats    TEXT NOT NULL,
+    active_document_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS timers (
@@ -115,6 +116,16 @@ impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> SlcResult<Self> {
         let conn = Connection::open(path.as_ref())?;
         conn.execute_batch(SCHEMA)?;
+        // Migration: older vaults lack the unified active-document column.
+        let has_col: bool = conn
+            .prepare("PRAGMA table_info(seats)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == "active_document_id");
+        if !has_col {
+            conn.execute("ALTER TABLE seats ADD COLUMN active_document_id TEXT", [])?;
+        }
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -731,7 +742,7 @@ impl StorageBackend for SqliteStore {
     // ── seats ───────────────────────────────────────────────────
 
     async fn insert_seat(&self, seat: &Seat) -> SlcResult<()> {
-        let (seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats) = (
+        let (seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats, active_document_id) = (
             seat.seat_id.clone(),
             seat.name.clone(),
             seat.status.as_str().to_string(),
@@ -742,12 +753,13 @@ impl StorageBackend for SqliteStore {
             seat.active_task_id.clone(),
             serde_json::to_string(&seat.context)?,
             serde_json::to_string(&seat.usage_stats)?,
+            seat.active_document_id.clone(),
         );
         self.blocking(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO seats (seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params![seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats],
+                "INSERT OR REPLACE INTO seats (seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats, active_document_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats, active_document_id],
             )?;
             Ok(())
         })
@@ -803,8 +815,39 @@ impl StorageBackend for SqliteStore {
     async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
         let (id, task) = (seat_id.to_string(), task_id.to_string());
         self.blocking(move |conn| {
-            let n = conn.execute("UPDATE seats SET active_task_id = ?2 WHERE seat_id = ?1", params![id, task])?;
+            // Task activation is document activation too (unified anchor).
+            let n = conn.execute(
+                "UPDATE seats SET active_task_id = ?2, active_document_id = ?2 WHERE seat_id = ?1",
+                params![id, task],
+            )?;
             Ok(n > 0)
+        })
+        .await
+    }
+
+    async fn set_seat_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool> {
+        let (id, doc) = (seat_id.to_string(), document_id.map(String::from));
+        self.blocking(move |conn| {
+            let n = conn.execute(
+                "UPDATE seats SET active_document_id = ?2 WHERE seat_id = ?1",
+                params![id, doc],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
+    async fn get_seat_active_document(&self, seat_id: &str) -> SlcResult<Option<String>> {
+        let id = seat_id.to_string();
+        self.blocking(move |conn| {
+            let row = conn.query_row(
+                "SELECT active_document_id, active_task_id FROM seats WHERE seat_id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+            ).optional()?;
+            // Unified field first; fall back to the legacy task pointer so
+            // seats activated before the migration keep working.
+            Ok(row.and_then(|(doc, task)| doc.or(task)))
         })
         .await
     }
@@ -997,6 +1040,7 @@ fn row_to_seat(row: &Row) -> rusqlite::Result<Seat> {
         active_task_id: row.get(7)?,
         context: row.get::<_, String>(8).map(|s| serde_json::from_str(&s).unwrap_or_default())?,
         usage_stats: row.get::<_, String>(9).map(|s| serde_json::from_str(&s).unwrap_or_default())?,
+        active_document_id: row.get(10)?,
     })
 }
 
@@ -1163,6 +1207,7 @@ mod tests {
             expires_at: None,
             metadata: Default::default(),
             active_task_id: None,
+            active_document_id: None,
             context: Default::default(),
             usage_stats: Default::default(),
         };

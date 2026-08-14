@@ -221,7 +221,7 @@ fn tools() -> Vec<Value> {
         "description": "Add a knowledge document (projects/tasks/docs are all documents)",
         "inputSchema": {"type":"object","properties":{
             "document_id": {"type":"string"},
-            "category": {"type":"string","enum":["core","module","task","project","code_snippet","documentation","custom","system"]},
+            "category": {"type":"string","enum":["core","module","task","project","code_snippet","documentation","skill","custom","system"]},
             "content": {"type":"string"},
             "folder": {"type":"string","description":"vault folder, e.g. projects/vassista"}
         },"required":["document_id","category","content"]}
@@ -408,6 +408,23 @@ fn tools() -> Vec<Value> {
     json!({
         "name": "get_active_task",
         "description": "Get the currently active task",
+        "inputSchema": {"type":"object","properties":{},"required":[]}
+    }),
+    json!({
+        "name": "activate_document",
+        "description": "Activate ANY document (task, project, skill, knowledge doc…) as the seat's context anchor — it is included in update_context and its auto_load links are followed on updates. The effect is identical to activate_task, but for every category.",
+        "inputSchema": {"type":"object","properties":{
+            "document_id": {"type":"string"}
+        },"required":["document_id"]}
+    }),
+    json!({
+        "name": "deactivate_document",
+        "description": "Clear the seat's active document (any category)",
+        "inputSchema": {"type":"object","properties":{},"required":[]}
+    }),
+    json!({
+        "name": "get_active_document",
+        "description": "Get the currently active document (any category)",
         "inputSchema": {"type":"object","properties":{},"required":[]}
     }),
     json!({
@@ -759,6 +776,25 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value) 
                 None => json!({"success": true, "has_active_task": false, "message": "No active task"}),
             }
         }
+        "activate_document" => {
+            let document_id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let ok = engine.document_activate(seat_id, document_id).await.map_err(json_err)?;
+            if ok {
+                json!({"success": true, "document_id": document_id, "message": "Document activated (context anchor)"})
+            } else {
+                json!({"success": false, "error": format!("document not found: {document_id}")})
+            }
+        }
+        "deactivate_document" => {
+            engine.document_deactivate(seat_id).await.map_err(json_err)?;
+            json!({"success": true, "message": "Active document cleared"})
+        }
+        "get_active_document" => {
+            match engine.document_get_active(seat_id).await.map_err(json_err)? {
+                Some(d) => json!({"success": true, "has_active_document": true, "document_id": d.document_id, "category": d.category.as_str(), "content": truncate(&d.content, 2000), "tags": d.tags}),
+                None => json!({"success": true, "has_active_document": false, "message": "No active document"}),
+            }
+        }
         "list_tasks" => {
             let project_id = args.get("project_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
             let status = args.get("status").and_then(|v| v.as_str());
@@ -882,8 +918,10 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value) 
                     }
                 }
             }
-            if let Ok(Some(t)) = engine.task_get_active(seat_id).await {
-                docs.push(json!({"id": t.task_id, "type": "task", "name": t.name, "description": truncate(&t.description, 2000)}));
+            // Active document — any category (task/project/skill/knowledge).
+            // Task activation also lands here via the unified anchor.
+            if let Ok(Some(d)) = engine.document_get_active(seat_id).await {
+                docs.push(json!({"id": d.document_id, "type": d.category.as_str(), "name": d.document_id, "content": truncate(&d.content, 2000)}));
             }
             if let Ok(Some((content, _))) = engine.get_seat_profile(seat_id).await {
                 docs.push(json!({"id": format!("seat_profile:{seat_id}"), "type": "seat_profile", "content": truncate(&content, 2000)}));
