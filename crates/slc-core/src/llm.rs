@@ -28,6 +28,13 @@ pub enum EmbeddingKind {
 pub trait LlmClient: Send + Sync {
     /// Free-form reasoning/summarization call.
     async fn reason(&self, prompt: &str) -> SlcResult<String>;
+
+    /// Reasoning with the seat context. Background jobs (compression,
+    /// insights) call this so seat-scoped clients (MCP sampling) can route
+    /// the request to the right SSE subscriber; default is the plain call.
+    async fn reason_for(&self, _seat: &str, prompt: &str) -> SlcResult<String> {
+        self.reason(prompt).await
+    }
     /// Text embedding vector.
     async fn generate_embedding(&self, text: &str) -> SlcResult<Vec<f32>>;
     /// Embedding with the text role; default is the plain call. Overridden by
@@ -65,6 +72,9 @@ pub trait LlmClient: Send + Sync {
 impl LlmClient for std::sync::Arc<dyn LlmClient> {
     async fn reason(&self, prompt: &str) -> SlcResult<String> {
         self.as_ref().reason(prompt).await
+    }
+    async fn reason_for(&self, seat: &str, prompt: &str) -> SlcResult<String> {
+        self.as_ref().reason_for(seat, prompt).await
     }
     async fn generate_embedding(&self, text: &str) -> SlcResult<Vec<f32>> {
         self.as_ref().generate_embedding(text).await
@@ -375,13 +385,24 @@ impl McpSamplingLlm {
 
 #[async_trait]
 impl LlmClient for McpSamplingLlm {
+    /// No seat context here — the event carries an empty seat and the SSE
+    /// filter (deny-by-default on missing seat) drops it. Seat-scoped calls
+    /// must go through [`reason_for`](Self::reason_for).
     async fn reason(&self, prompt: &str) -> SlcResult<String> {
+        self.reason_for("", prompt).await
+    }
+
+    /// The sampling event carries the seat so the SSE fan-out only delivers
+    /// it to that seat's subscriber — compression prompts contain document
+    /// contents and must never leak to other seats.
+    async fn reason_for(&self, seat: &str, prompt: &str) -> SlcResult<String> {
         let request_id = format!("smp-{}", uuid::Uuid::new_v4());
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         self.pending.lock().unwrap().insert(request_id.clone(), tx);
         let msg = json!({
             "type": "sampling_request",
             "request_id": request_id.clone(),
+            "seat_id": seat,
             "message": {
                 "jsonrpc": "2.0",
                 "id": request_id.clone(),

@@ -145,8 +145,9 @@ async fn sse_endpoint(
         loop {
             match rx.recv().await {
                 Ok(evt) => {
-                    // Only forward events for this seat.
-                    let seat_matches = evt.get("seat_id").and_then(|v| v.as_str()).map(|s| s == seat).unwrap_or(true);
+                    // Only forward events for this seat (deny-by-default —
+                    // see seat_matches_event).
+                    let seat_matches = seat_matches_event(&evt, &seat);
                     if seat_matches {
                         // JSON-RPC replies (legacy SSE protocol) → `message`
                         // event with the response as data; everything else is
@@ -239,10 +240,11 @@ async fn mcp(
 ) -> (StatusCode, Json<Value>) {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    let params = req.get("params").cloned().unwrap_or(Value::Null);
-
-    // A response to one of our sampling requests (client answered via
+        // A response to one of our sampling requests (client answered via
     // POST /messages): resolve the pending channel and reply with nothing.
+    // Runs AFTER authentication (any unauthenticated client who learned a
+    // request_id from SSE must not be able to inject text into the
+    // compression pipeline — that would poison the agent's memory).
     if method.is_empty() && id.is_some() {
         if let Some(rid) = id.as_ref().and_then(|v| v.as_str()) {
             if let Some(tx) = state.sampling.lock().unwrap().remove(rid) {
@@ -260,6 +262,8 @@ async fn mcp(
             }
         }
     }
+
+let params = req.get("params").cloned().unwrap_or(Value::Null);
 
     let engine = state.engine.as_ref();
     let seat_hdr = seat_from_request(&headers);
@@ -1802,5 +1806,35 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(max).collect()
+    }
+}
+
+/// SSE fan-out filter: forward `evt` only to the subscriber of `seat`.
+/// Deny-by-default — an event WITHOUT a `seat_id` goes to nobody: it carries
+/// no routing context, and broadcasting it to every subscriber would leak
+/// (e.g. a sampling prompt with document contents).
+fn seat_matches_event(evt: &serde_json::Value, seat: &str) -> bool {
+    evt.get("seat_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s == seat)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod seat_filter_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn seat_filter_is_deny_by_default() {
+        // Same seat → delivered.
+        assert!(seat_matches_event(&json!({"type": "x", "seat_id": "cursor-1"}), "cursor-1"));
+        // Other seat → withheld.
+        assert!(!seat_matches_event(&json!({"type": "x", "seat_id": "cursor-1"}), "cursor-2"));
+        // NO seat_id at all → withheld (regression: it used to be broadcast
+        // to every subscriber — sampling prompts leaked across seats).
+        assert!(!seat_matches_event(&json!({"type": "sampling_request"}), "cursor-1"));
+        // Malformed seat → withheld.
+        assert!(!seat_matches_event(&json!({"type": "x", "seat_id": 42}), "cursor-1"));
     }
 }

@@ -90,7 +90,7 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
         let prompt = format!(
             "Summarize this day's work log into a concise daily summary (3-5 bullet points):\n\n{combined}"
         );
-        let Ok(summary) = self.llm.reason(&prompt).await else {
+        let Ok(summary) = self.llm.reason_for(seat_id, &prompt).await else {
             return Ok(0); // LLM unavailable — keep sources unmarked, retry next run
         };
 
@@ -145,7 +145,7 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
         let prompt = format!(
             "Summarize this week's daily summaries into a weekly digest (key achievements, decisions, blockers):\n\n{combined}"
         );
-        let Ok(summary) = self.llm.reason(&prompt).await else {
+        let Ok(summary) = self.llm.reason_for(seat_id, &prompt).await else {
             return Ok(0);
         };
 
@@ -217,7 +217,7 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
                 "Distill these weekly digests into high-level project insights (key learnings, architectural patterns, team dynamics):\n\n{combined}"
             ),
         };
-        let Ok(insights) = self.llm.reason(&prompt).await else {
+        let Ok(insights) = self.llm.reason_for(seat_id, &prompt).await else {
             return Ok(0);
         };
 
@@ -294,7 +294,7 @@ impl<S: StorageBackend, L: LlmClient> MemoryConsolidator<S, L> {
 
         let combined: Vec<String> = sources.iter().map(|d| truncate(&d.content, 500)).collect();
         let prompt = CONSOLIDATION_PROMPT.replace("{summaries}", &truncate(&combined.join("\n\n"), PROMPT_CHARS));
-        let Ok(raw) = self.llm.reason(&prompt).await else {
+        let Ok(raw) = self.llm.reason_for(seat_id, &prompt).await else {
             return Ok(ConsolidationReport::default());
         };
 
