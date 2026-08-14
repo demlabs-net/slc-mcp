@@ -15,6 +15,7 @@ pub mod error;
 pub mod focus;
 pub mod llm;
 pub mod memory;
+pub mod migrate;
 pub mod model;
 pub mod notifications;
 pub mod pagination;
@@ -151,8 +152,7 @@ impl SlcEngine {
                 std::sync::Arc::new(storage::sqlite::SqliteStore::open(path)?)
             }
             StorageKind::MongoDB => {
-                // TEMP verification: mongodb module disabled
-                return Err(SlcError::Storage("mongodb backend disabled (temp)".into()));
+                std::sync::Arc::new(storage::mongodb::MongoStore::connect(config.mongodb_uri.as_deref()).await?)
             }
         };
         Ok(Self::with(store, Self::pick_llm(&config), config))

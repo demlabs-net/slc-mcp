@@ -546,7 +546,7 @@ impl StorageBackend for SqliteStore {
             let n = conn.execute(
                 "UPDATE episodic SET folder = ?3, content = ?4, content_hash = ?5, metadata = ?6, tags = ?7, version = version + 1, updated_at = ?12
                  WHERE document_id = ?1",
-                params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11, row.12, row.13],
+                params![row.0, row.2, row.3, row.4, row.5, row.6, row.11],
             )?;
             if n > 0 {
                 return Ok(true);
