@@ -147,6 +147,11 @@ impl IndexEntry {
                 return false;
             }
         }
+        if let Some(ids) = &f.document_ids {
+            if !ids.iter().any(|id| id == &self.id) {
+                return false;
+            }
+        }
         if let Some(dt) = &f.doc_type {
             if self.doc_type.as_deref() != Some(dt.as_str()) {
                 return false;

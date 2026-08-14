@@ -969,6 +969,10 @@ impl SlcEngine {
         if guard.is_some() {
             return Ok(());
         }
+        // Housekeeping: expire delivered notifications (24h TTL) and
+        // paginated responses (10 min TTL). The cleanup functions existed
+        // but NOTHING called them — both queues grew without bound.
+        spawn_ttl_cleanup(self.store.clone());
         let registry = timer::TimerRegistry::new(self.store.clone());
 
         let compressor = self.compressor.clone();
@@ -1207,4 +1211,45 @@ mod engine_tests {
             .unwrap();
         assert!(out2.len() > 5, "no manual truncation: {out2}");
     }
+}
+
+/// Periodically expire old housekeeping records: delivered notifications
+/// (24h) and paginated responses (10 min). Runs every 5 minutes; failures
+/// are logged, never fatal.
+fn spawn_ttl_cleanup(store: std::sync::Arc<dyn crate::storage::StorageBackend>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            // Notifications are per-seat.
+            match store.list_active_seats(1000).await {
+                Ok(seats) => {
+                    for seat in seats {
+                        let queue = crate::notifications::NotificationQueue::new(store.clone());
+                        match queue
+                            .cleanup(&seat.seat_id, crate::notifications::TTL_SECONDS)
+                            .await
+                        {
+                            Ok(n) if n > 0 => tracing::info!(
+                                seat = %seat.seat_id,
+                                removed = n,
+                                "expired notifications cleaned"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("notification cleanup: {e}"),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("ttl cleanup: list_active_seats: {e}"),
+            }
+            // Paginated responses are global.
+            let paginator = crate::pagination::Paginator::new(store.clone());
+            match paginator.cleanup(crate::pagination::TTL_SECONDS).await {
+                Ok(n) if n > 0 => tracing::info!(removed = n, "expired paginated responses cleaned"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("pagination cleanup: {e}"),
+            }
+        }
+    });
 }

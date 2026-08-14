@@ -30,6 +30,9 @@ use std::sync::Arc;
 /// Filter for document queries — typed subset the engine actually uses.
 #[derive(Debug, Clone, Default)]
 pub struct DocFilter {
+    /// Explicit document-id allowlist (compression marks exactly the docs it
+    /// consumed — filtering by predicates alone used to over-mark).
+    pub document_ids: Option<Vec<String>>,
     pub category: Option<DocumentCategory>,
     /// Exact owner match (`None` = unfiltered).
     pub seat_id: Option<String>,

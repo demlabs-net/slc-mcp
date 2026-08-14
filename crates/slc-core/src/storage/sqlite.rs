@@ -207,6 +207,17 @@ fn build_where(f: &DocFilter) -> (String, Vec<String>) {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<String> = Vec::new();
 
+    if let Some(ids) = &f.document_ids {
+        if ids.is_empty() {
+            clauses.push("0 = 1".to_string()); // empty allowlist matches nothing
+        } else {
+            let placeholders: Vec<String> = (1..=ids.len())
+                .map(|i| format!("?{i}"))
+                .collect();
+            clauses.push(format!("document_id IN ({})", placeholders.join(", ")));
+            params.extend(ids.iter().cloned());
+        }
+    }
     if let Some(cat) = f.category {
         clauses.push("category = ?".to_string());
         params.push(cat.as_str().to_string());

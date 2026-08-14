@@ -152,6 +152,9 @@ fn bson_to_doc(b: BsonDoc) -> SlcResult<Document> {
 /// Build the query for a `DocFilter` plus the kind discriminator.
 fn filter_query(kind: &str, f: &DocFilter) -> BsonDoc {
     let mut q = doc! { "kind": kind };
+    if let Some(ids) = &f.document_ids {
+        q.insert("document_id", doc! { "$in": ids.iter().map(|i| Bson::String(i.clone())).collect::<Vec<_>>() });
+    }
     if let Some(cat) = f.category {
         q.insert("category", Bson::String(cat.as_str().into()));
     }
