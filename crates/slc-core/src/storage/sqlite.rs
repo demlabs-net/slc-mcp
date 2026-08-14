@@ -544,7 +544,7 @@ impl StorageBackend for SqliteStore {
         let _ = existing;
         self.blocking(move |conn| {
             let n = conn.execute(
-                "UPDATE episodic SET folder = ?3, content = ?4, content_hash = ?5, metadata = ?6, tags = ?7, version = version + 1, updated_at = ?12
+                "UPDATE episodic SET folder = ?2, content = ?3, content_hash = ?4, metadata = ?5, tags = ?6, version = version + 1, updated_at = ?7
                  WHERE document_id = ?1",
                 params![row.0, row.2, row.3, row.4, row.5, row.6, row.11],
             )?;
