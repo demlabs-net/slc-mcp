@@ -211,7 +211,7 @@ fn estimate_chars(v: &Value) -> usize {
 /// First key whose value is a non-empty list.
 fn find_list_key(result: &Value) -> Option<String> {
     let obj = result.as_object()?;
-    for key in ["results", "content", "items", "focuses", "ideas", "reminders", "notifications", "tasks", "projects", "docs", "events"] {
+    for key in ["results", "content", "items", "focuses", "reminders", "notifications", "tasks", "projects", "docs", "events"] {
         if let Some(v) = obj.get(key) {
             if v.is_array() {
                 return Some(key.to_string());

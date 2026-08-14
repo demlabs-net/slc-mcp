@@ -13,7 +13,6 @@
 pub mod auth;
 pub mod error;
 pub mod focus;
-pub mod ideas;
 pub mod llm;
 pub mod memory;
 pub mod model;
@@ -31,7 +30,6 @@ pub mod timer;
 
 pub use error::{SlcError, SlcResult};
 pub use auth::{authenticate, auth_mode_from_env, Principal, AuthMode};pub use focus::{FocusItem, FocusManager};
-pub use ideas::{IdeaItem, IdeaPool};
 pub use llm::{LlmClient, LmStudioClient, MockLlm, OllamaClient};
 pub use memory::{ConsolidationReport, CompressionReport, HistoryCompressor, MemoryConsolidator};
 pub use model::*;
@@ -39,7 +37,7 @@ pub use notifications::NotificationQueue;
 pub use pagination::Paginator;
 pub use proactivity::{mind_matches, normalize_write_mind_type, MindType};
 pub use profiles::ProfileManager;
-pub use reflection::{parse_ideas, ReflectionEngine};
+pub use reflection::{parse_focuses, ReflectionEngine};
 pub use reminders::{parse_remind_at, ReminderManager};
 pub use search::{RankWeights, SearchHit, SearchService};
 pub use seat::SeatManager;
@@ -210,7 +208,7 @@ impl SlcEngine {
         self.store.episodic_find(&f, &DocSort::by_created(SortDir::Desc), limit).await
     }
 
-    // ── proactive loop: focuses + ideas ─────────────────────────
+    // ── proactive loop: focuses ────────────────────────────────────
 
     /// Add a focus; returns the created item.
     pub async fn focus_add(
@@ -247,34 +245,6 @@ impl SlcEngine {
     pub async fn focus_list(&self, seat_id: &str, mind_type: Option<MindType>) -> SlcResult<Vec<FocusItem>> {
         let fm = FocusManager::new(self.store.clone());
         fm.get_active(seat_id, mind_type).await
-    }
-
-    /// Add an idea (source `manual`); optional pre-computed embedding.
-    pub async fn idea_add(
-        &self,
-        seat_id: &str,
-        content: &str,
-        source: &str,
-        embedding: Option<Vec<f32>>,
-        mind_type: Option<&str>,
-    ) -> SlcResult<IdeaItem> {
-        let pool = IdeaPool::new(self.store.clone());
-        pool.add(seat_id, content, source, embedding, mind_type).await
-    }
-
-    pub async fn idea_remove(&self, seat_id: &str, idea_id: &str) -> SlcResult<bool> {
-        let pool = IdeaPool::new(self.store.clone());
-        pool.remove(idea_id, Some(seat_id)).await
-    }
-
-    pub async fn idea_list(&self, seat_id: &str, limit: usize, mind_type: Option<MindType>) -> SlcResult<Vec<IdeaItem>> {
-        let pool = IdeaPool::new(self.store.clone());
-        pool.list_active(seat_id, limit, mind_type).await
-    }
-
-    pub async fn idea_random(&self, seat_id: &str, mind_type: Option<MindType>) -> SlcResult<Option<IdeaItem>> {
-        let pool = IdeaPool::new(self.store.clone());
-        pool.get_weighted_random(seat_id, mind_type).await
     }
 
     /// Run one reflection pass for a seat (the `REFLECTION` timer handler).
@@ -601,19 +571,6 @@ impl SlcEngine {
                 })
             })),
         );
-        let store_for_handlers = self.store.clone();
-        registry.set_handler(
-            model::TimerType::IdeaReminder,
-            std::sync::Arc::new(timer::AsyncFnHandler::new(move |t| {
-                let store = store_for_handlers.clone();
-                let timer = t.clone();
-                Box::pin(async move {
-                    handle_idea_reminder(&store, &timer).await?;
-                    Ok(())
-                })
-            })),
-        );
-
         // Defaults for every active seat, then start the loops.
         for seat in self.store.list_active_seats(1000).await? {
             let created = registry.create_defaults(&seat.seat_id).await?;
@@ -668,18 +625,6 @@ async fn handle_focus_reminder(store: &std::sync::Arc<dyn StorageBackend>, timer
     }
     let queue = NotificationQueue::new(store.clone());
     queue.push(&timer.seat_id, "FOCUS_REMINDER", "🎯 Текущие фокусы", &body, Default::default()).await?;
-    Ok(())
-}
-
-/// Periodic surfacing of an idea from the pool (`IdeaReminderHandler`).
-async fn handle_idea_reminder(store: &std::sync::Arc<dyn StorageBackend>, timer: &model::PersistedTimer) -> SlcResult<()> {
-    let Some(idea) = IdeaPool::new(store.clone()).get_weighted_random(&timer.seat_id, None).await? else {
-        return Ok(());
-    };
-    let mut meta = serde_json::Map::new();
-    meta.insert("idea_id".into(), serde_json::Value::String(idea.idea_id));
-    let queue = NotificationQueue::new(store.clone());
-    queue.push(&timer.seat_id, "IDEA_REMINDER", "💡 Идея из пула", &idea.content, meta).await?;
     Ok(())
 }
 

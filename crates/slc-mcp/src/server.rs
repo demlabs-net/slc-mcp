@@ -292,40 +292,13 @@ fn tools() -> Vec<Value> {
             "focus_id": {"type":"string"}
         },"required":["focus_id"]}
     }),
-    json!({
-        "name": "idea_add",
-        "description": "Add an idea to the proactive idea pool",
-        "inputSchema": {"type":"object","properties":{
-            "content": {"type":"string"},
-            "source": {"type":"string","default":"manual"},
-            "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]}
-        },"required":["content"]}
-    }),
-    json!({
-        "name": "idea_list",
-        "description": "List active ideas for the seat",
-        "inputSchema": {"type":"object","properties":{
-            "limit": {"type":"number","default":20},
-            "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]}
-        },"required":[]}
-    }),
-    json!({
-        "name": "idea_random",
-        "description": "Surface a random idea, weighted toward fresh rarely-shown ones",
-        "inputSchema": {"type":"object","properties":{
-            "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]}
-        },"required":[]}
-    }),
-    json!({
-        "name": "idea_remove",
-        "description": "Remove an idea from the pool",
-        "inputSchema": {"type":"object","properties":{
-            "idea_id": {"type":"string"}
-        },"required":["idea_id"]}
-    }),
+    
+    
+    
+    
     json!({
         "name": "reflect_now",
-        "description": "Run one reflection pass: recent history + focuses → new ideas",
+        "description": "Run one reflection pass: recent history + focuses → new focus proposals",
         "inputSchema": {"type":"object","properties":{},"required":[]}
     }),
     json!({
@@ -660,33 +633,10 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value) 
             let ok = engine.focus_remove(seat_id, focus_id).await.map_err(json_err)?;
             json!({"removed": ok})
         }
-        "idea_add" => {
-            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("manual");
-            let mind_type = args.get("mind_type").and_then(|v| v.as_str()).map(String::from);
-            let item = engine.idea_add(seat_id, content, source, None, mind_type.as_deref()).await.map_err(json_err)?;
-            json!({"idea_id": item.idea_id, "source": item.source})
-        }
-        "idea_list" => {
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-            let mind_type = args.get("mind_type").and_then(|v| v.as_str()).and_then(parse_mind);
-            let items = engine.idea_list(seat_id, limit, mind_type).await.map_err(json_err)?;
-            json!({"ideas": items.iter().map(|i| json!({
-                "idea_id": i.idea_id, "content": i.content, "source": i.source,
-            })).collect::<Vec<_>>()})
-        }
-        "idea_random" => {
-            let mind_type = args.get("mind_type").and_then(|v| v.as_str()).and_then(parse_mind);
-            match engine.idea_random(seat_id, mind_type).await.map_err(json_err)? {
-                Some(i) => json!({"idea_id": i.idea_id, "content": i.content, "source": i.source}),
-                None => json!({"idea_id": null, "message": "no active ideas"}),
-            }
-        }
-        "idea_remove" => {
-            let idea_id = args.get("idea_id").and_then(|v| v.as_str()).unwrap_or("");
-            let ok = engine.idea_remove(seat_id, idea_id).await.map_err(json_err)?;
-            json!({"removed": ok})
-        }
+        
+        
+        
+        
         "reflect_now" => {
             engine.reflect(seat_id).await.map_err(json_err)?;
             json!({"reflected": true})
