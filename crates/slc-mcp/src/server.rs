@@ -168,13 +168,16 @@ async fn mcp(
             // Auto-apply the client's context budget when it advertises one
             // (capabilities.experimental.context_limit_chars) — the per-seat
             // override used by update_context compression.
-            if let Some(limit) = params
+            if let Some(window) = params
                 .pointer("/capabilities/experimental/context_limit_chars")
                 .and_then(|v| v.as_u64())
             {
                 if let Some(seat) = seat_hdr.as_deref() {
                     // The seat may not exist yet — create it first.
                     let _ = engine.seats.ensure_seat(seat).await;
+                    // SLC budget = 50% of the client's model window: the rest
+                    // is left for the conversation itself.
+                    let limit = window / 2;
                     let _ = engine.seats.set_context_key(seat, "context_limit_chars", json!(limit)).await;
                 }
             }
@@ -545,7 +548,7 @@ fn tools() -> Vec<Value> {
     }),
     json!({
         "name": "command",
-        "description": "Slash-команды для управления памятью: `/limit N` — установить лимит контекста (символы), `/context` — показать текущий срез и лимит, `/help` — список команд. Вызывай, когда пользователь пишет сообщение, начинающееся с '/'.",
+        "description": "Slash-команды для управления памятью: `/limit N` — лимит контекста, `/ctx` — текущий срез, `/update_context [summary]` / `/save_context <summary>` — как MCP-тулы, `/help` — список. Вызывай, когда пользователь пишет сообщение, начинающееся с '/'.",
         "inputSchema": {"type":"object","properties":{
             "input": {"type":"string","description":"строка, начинающаяся с /"}
         },"required":["input"]}
@@ -623,19 +626,198 @@ pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инс�
 5. **Результат рефлексии** — это изменённые/новые документы и фокусы, а
    не текст «я порефлексировал». Если менять нечего — так и скажи кратко.
 
-## Лимиты контекста
+## Лимиты и компрессия контекста
 
-`update_context` возвращает `limit_chars`/`used_chars`/`compressed` — суммарный
-бюджет контекста и степень сжатия. При `compressed: true` сокращай ответы и
-сохраняй снимок чаще. Лимит можно изменить: `/limit <chars>` (или клиент
-передаёт его при подключении). `used_chars` около лимита — сигнал провести
-рефлексию (см. выше) и ужать документы.
+- `update_context` возвращает `limit_chars`/`used_chars`/`compressed` и,
+  при сжатии, `warning`. Бюджет SLC = 50% окна модели клиента (авто при
+  подключении) или `/limit <chars>`.
+- **Документы НИКОГДА не обрезаются.** Если лимит превышен, компрессия:
+  1) исключаются целые блоки по приоритету (base-документы, затем
+     профили; активный документ и фокусы остаются);
+  2) если всё ещё не влезает — оставшиеся документы интеллектуально
+     сжимаются LLM (ключевые факты, имена, цифры).
+- При `compressed: true` реагируй на `warning`: сокращай ответы, сохраняй
+  снимок (`/save_context`), при необходимости верни исключённые документы
+  через поиск/активацию.
+
+## Хуки для кодинг-агента (автоматизация контекста)
+
+Работая над кодом/задачами, автоматически:
+
+1. **`update_context`** — после каждого значимого шага (закрыл задачу,
+   изменил план, принял решение): контекст всегда актуален.
+2. **`/save_context <summary>`** — в конце крупного этапа: снимок уходит
+   в историю для рефлексии и консолидации.
+3. **`activate_document`** — при смене темы работы (новая задача/проект/
+   скил) сразу переключай контекст-якорь.
+4. Сервер шлёт по SSE-каналу события `context_updated` и
+   `document_activated` — обёртки агента могут слушать их для триггеров
+   (например, авто-сохранение контекста после больших изменений).
 
 ## Напоминания
 
 `check_notifications` в начале каждого хода — там могут быть фокус- или
 таймер-напоминания, требующие действий.
 "#;
+
+async fn build_context(
+    engine: &SlcEngine,
+    seat_id: &str,
+    summary: &str,
+    include_base: bool,
+    events: &tokio::sync::broadcast::Sender<Value>,
+) -> Result<Value, Value> {
+                        let changes: Vec<String> = Vec::new();
+            let decisions: Vec<String> = Vec::new();
+            let next_steps: Vec<String> = Vec::new();
+                        // persist a context snapshot if summary provided
+            let mut save_info = None;
+            if !summary.is_empty() {
+                let mut content = format!("# Context Snapshot\n\n{summary}");
+                if !changes.is_empty() { content.push_str(&format!("\n\n## Changes\n{}", changes.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"))); }
+                if !decisions.is_empty() { content.push_str(&format!("\n\n## Decisions\n{}", decisions.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"))); }
+                if !next_steps.is_empty() { content.push_str(&format!("\n\n## Next Steps\n{}", next_steps.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"))); }
+                let mut meta = slc_core::DocMeta::default();
+                meta.doc_type = Some("CONTEXT_SNAPSHOT".into());
+                meta.seat_id = Some(seat_id.into());
+                let doc_id = uid("ctx");
+                let doc = slc_core::Document::new(doc_id.clone(), slc_core::DocumentCategory::History, content, meta, vec!["context_snapshot".into()], Some(seat_id.into()));
+                engine.store().episodic_insert(&doc).await.map_err(json_err)?;
+                save_info = Some(json!({"success": true, "document_id": doc_id, "message": "Context saved as history snapshot."}));
+            }
+            // Context assembly policy (user-approved):
+            // 1. Documents are NEVER truncated — every included document is
+            //    put in whole. No char-budget truncation, ever.
+            // 2. If the seat's context limit is exceeded, COMPRESSION kicks
+            //    in by dropping whole low-priority blocks (base docs first,
+            //    then profiles), keeping the active document and focuses.
+            // 3. The model is warned about the compression in the reply.
+            let limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
+            let mut docs: Vec<Value> = Vec::new();
+            let mut used = 0usize;
+            let mut push_doc = |docs: &mut Vec<Value>, used: &mut usize, id: &str, ty: &str, content: &str| {
+                *used += id.len() + ty.len() + content.len();
+                docs.push(json!({"id": id, "type": ty, "content": content}));
+            };
+
+            // Blocks in priority order: active document FIRST (never dropped),
+            // then focuses, then profiles, then base docs.
+            let mut active_block: Option<Value> = None;
+            if let Ok(Some(d)) = engine.document_get_active(seat_id).await {
+                used += d.document_id.len() + d.category.as_str().len() + d.content.len();
+                active_block = Some(json!({"id": d.document_id, "type": d.category.as_str(), "name": d.document_id, "content": d.content}));
+            }
+            let mut focus_block: Option<Value> = None;
+            if let Ok(items) = engine.focus_list(seat_id, None).await {
+                if !items.is_empty() {
+                    used += 32;
+                    focus_block = Some(json!({"id": "active_focuses", "type": "focuses", "count": items.len()}));
+                }
+            }
+            let mut profile_blocks: Vec<Value> = Vec::new();
+            if let Ok(Some((content, _))) = engine.get_seat_profile(seat_id).await {
+                used += content.len();
+                profile_blocks.push(json!({"id": format!("seat_profile:{seat_id}"), "type": "seat_profile", "content": content}));
+            }
+            if let Ok(Some(content)) = engine.get_user_profile(seat_id).await {
+                used += content.len();
+                profile_blocks.push(json!({"id": "user_profile", "type": "user_profile", "content": content}));
+            }
+            let mut base_blocks: Vec<Value> = Vec::new();
+            if include_base {
+                for base in ["core_slc_manifest", "core_standards"] {
+                    if let Ok(Some(d)) = engine.get_document(base).await {
+                        used += d.content.len();
+                        base_blocks.push(json!({"id": base, "type": "base", "content": d.content}));
+                    }
+                }
+            }
+
+            // Compression: drop whole blocks by priority until it fits.
+            let mut omitted: Vec<&str> = Vec::new();
+            if used > limit && !base_blocks.is_empty() {
+                for b in &base_blocks {
+                    used = used.saturating_sub(b["content"].as_str().map(str::len).unwrap_or(0));
+                }
+                omitted.push("base_docs");
+                base_blocks.clear();
+            }
+            if used > limit && !profile_blocks.is_empty() {
+                for b in &profile_blocks {
+                    used = used.saturating_sub(b["content"].as_str().map(str::len).unwrap_or(0));
+                }
+                omitted.push("profiles");
+                profile_blocks.clear();
+            }
+            let compressed = !omitted.is_empty();
+
+            if let Some(b) = active_block {
+                docs.push(b);
+            }
+            if let Some(b) = focus_block {
+                docs.push(b);
+            }
+            docs.extend(profile_blocks);
+            docs.extend(base_blocks);
+
+            // Step 2 — intelligent compression of the REMAINING documents
+            // via the reasoning LLM, ONLY when the budget still does not fit
+            // after dropping blocks. Documents are never truncated by hand;
+            // a failed LLM call leaves them whole.
+            let mut llm_compressed: Vec<String> = Vec::new();
+            if used > limit && !docs.is_empty() {
+                // Compress from the least important end (profiles → active).
+                let budget = (limit / 2).max(200);
+                for b in docs.iter_mut().rev() {
+                    if used <= limit {
+                        break;
+                    }
+                    let Some(content) = b["content"].as_str() else { continue };
+                    if content.chars().count() <= budget {
+                        continue;
+                    }
+                    if let Ok(summary) = engine.summarize_text(content, budget).await {
+                        if summary.len() < content.len() {
+                            used = used.saturating_sub(content.len()) + summary.len();
+                            b["content"] = json!(summary);
+                            b["llm_compressed"] = json!(true);
+                            llm_compressed.push(b["id"].as_str().unwrap_or("?").to_string());
+                        }
+                    }
+                }
+            }
+
+            // Warn the model about the compression (never silent).
+            let warning = if compressed || !llm_compressed.is_empty() {
+                let mut parts = Vec::new();
+                if !omitted.is_empty() {
+                    parts.push(format!("исключены целые блоки: {}", omitted.join(", ")));
+                }
+                if !llm_compressed.is_empty() {
+                    parts.push(format!("документы сжаты LLM: {}", llm_compressed.join(", ")));
+                }
+                Some(format!(
+                    "ВНИМАНИЕ: контекст сжат — {}.                      Используй save_context/обогащение, чтобы вернуть нужное.",
+                    parts.join("; ")
+                ))
+            } else {
+                None
+            };
+            // Hook: notify subscribers (SSE) after a context refresh/save so
+            // automation can react (e.g. persist the snapshot elsewhere).
+            if save_info.is_some() || compressed {
+                let _ = events.send(json!({
+                    "type": "context_updated", "seat_id": seat_id,
+                    "compressed": compressed, "used_chars": used, "limit_chars": limit,
+                    "omitted": omitted,
+                    "saved": save_info.as_ref().and_then(|v| v.get("document_id")).cloned(),
+                }));
+            }
+            Ok(json!({"docs": docs, "seat": seat_id, "save_info": save_info,
+                   "limit_chars": limit, "used_chars": used, "compressed": compressed,
+                   "warning": warning}))
+        }
+
 
 async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, events: &tokio::sync::broadcast::Sender<Value>) -> Result<Value, Value> {
     engine.seats.ensure_seat(seat_id).await.map_err(|e| json!({"code": -32000, "message": e.to_string()}))?;
@@ -647,29 +829,47 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, 
             }
             let mut parts = input[1..].split_whitespace();
             let cmd = parts.next().unwrap_or("");
-            match cmd {
+            let cmd_result: Result<Value, Value> = match cmd {
                 "limit" => {
                     let n = parts.next().and_then(|v| v.parse::<u64>().ok());
                     let Some(n) = n else {
                         return Err(json!({"code": -32602, "message": "usage: /limit <chars>"}));
                     };
                     let ok = engine.seats.set_context_key(seat_id, "context_limit_chars", json!(n)).await.map_err(json_err)?;
-                    json!({"success": ok, "context_limit_chars": n, "message": "Context limit set"})
+                    Ok(json!({"success": ok, "context_limit_chars": n, "message": "Context limit set"}))
                 }
-                "context" => {
+                "ctx" => {
                     let limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
                     let seat = engine.seats.get_seat(seat_id).await.map_err(json_err)?;
                     let active = engine.document_get_active(seat_id).await.map_err(json_err)?;
-                    json!({"limit_chars": limit, "active_document": active.map(|d| d.document_id),
-                           "seat_context": seat.map(|s| s.context)})
+                    let focuses = engine.focus_list(seat_id, None).await.map_err(json_err)?;
+                    Ok(json!({"limit_chars": limit, "active_document": active.map(|d| d.document_id),
+                           "focus_count": focuses.len(), "seat_context": seat.map(|s| s.context)}))
                 }
-                "help" => json!({"commands": [
+                "update_context" => {
+                    // Slash-команда = тот же MCP-тул update_context; summary
+                    // берётся из остатка строки.
+                    let summary = parts.collect::<Vec<_>>().join(" ");
+                    build_context(engine, seat_id, &summary, true, events).await
+                }
+                "save_context" => {
+                    // Сохранить снимок = update_context со summary.
+                    let summary = parts.collect::<Vec<_>>().join(" ");
+                    if summary.is_empty() {
+                        return Err(json!({"code": -32602, "message": "usage: /save_context <summary>"}));
+                    }
+                    build_context(engine, seat_id, &summary, true, events).await
+                }
+                "help" => Ok(json!({"commands": [
                     "/limit <chars> — установить лимит контекста (символы)",
-                    "/context — показать текущий срез контекста и лимит",
+                    "/ctx — показать текущий срез контекста (лимит, активный документ, фокусы)",
+                    "/update_context [summary] — собрать контекст (как MCP-тул)",
+                    "/save_context <summary> — сохранить снимок контекста в историю",
                     "/help — этот список",
-                ]}),
+                ]})),
                 other => return Err(json!({"code": -32602, "message": format!("unknown command: /{other} — use /help")})),
-            }
+            };
+            cmd_result?
         }
         "search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -970,81 +1170,8 @@ async fn call_tool(engine: &SlcEngine, seat_id: &str, name: &str, args: &Value, 
         }
         "update_context" => {
             let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-            let changes = str_array(args, "changes");
-            let decisions = str_array(args, "decisions");
-            let next_steps = str_array(args, "next_steps");
             let include_base = args.get("include_base_docs").and_then(|v| v.as_bool()).unwrap_or(true);
-            // persist a context snapshot if summary provided
-            let mut save_info = None;
-            if !summary.is_empty() {
-                let mut content = format!("# Context Snapshot\n\n{summary}");
-                if !changes.is_empty() { content.push_str(&format!("\n\n## Changes\n{}", changes.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"))); }
-                if !decisions.is_empty() { content.push_str(&format!("\n\n## Decisions\n{}", decisions.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"))); }
-                if !next_steps.is_empty() { content.push_str(&format!("\n\n## Next Steps\n{}", next_steps.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"))); }
-                let mut meta = slc_core::DocMeta::default();
-                meta.doc_type = Some("CONTEXT_SNAPSHOT".into());
-                meta.seat_id = Some(seat_id.into());
-                let doc_id = uid("ctx");
-                let doc = slc_core::Document::new(doc_id.clone(), slc_core::DocumentCategory::History, content, meta, vec!["context_snapshot".into()], Some(seat_id.into()));
-                engine.store().episodic_insert(&doc).await.map_err(json_err)?;
-                save_info = Some(json!({"success": true, "document_id": doc_id, "message": "Context saved as history snapshot."}));
-            }
-            // base docs + active document (any category) + profiles + focuses,
-            // bounded by the seat's context budget: the active document is
-            // always kept complete, the rest is truncated to fit — that is
-            // the context compression policy.
-            let limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
-            let mut docs = Vec::new();
-            let mut used = 0usize;
-            let mut push_doc = |docs: &mut Vec<Value>, used: &mut usize, budget: usize, id: &str, ty: &str, content: &str| {
-                let content = truncate(content, budget);
-                *used += id.len() + ty.len() + content.len();
-                docs.push(json!({"id": id, "type": ty, "content": content}));
-            };
-            if include_base {
-                for base in ["core_slc_manifest", "core_standards"] {
-                    if let Ok(Some(d)) = engine.get_document(base).await {
-                        // Base docs are truncated harder when over budget.
-                        let b = if used > limit { 800 } else { 3000 };
-                        push_doc(&mut docs, &mut used, b, base, "base", &d.content);
-                    }
-                }
-            }
-            // Active document — any category (task/project/skill/knowledge).
-            // Task activation also lands here via the unified anchor.
-            if let Ok(Some(d)) = engine.document_get_active(seat_id).await {
-                let remaining = limit.saturating_sub(used);
-                let b = remaining.min(2000);
-                push_doc(&mut docs, &mut used, b, &d.document_id, d.category.as_str(), &d.content);
-            }
-            if let Ok(Some((content, _))) = engine.get_seat_profile(seat_id).await {
-                let remaining = limit.saturating_sub(used);
-                let over = used > limit;
-                let b = remaining.min(2000).min(if over { 500 } else { 2000 });
-                push_doc(&mut docs, &mut used, b, &format!("seat_profile:{seat_id}"), "seat_profile", &content);
-            }
-            if let Ok(Some(content)) = engine.get_user_profile(seat_id).await {
-                let b = if used > limit { 500 } else { 2000 };
-                push_doc(&mut docs, &mut used, b, "user_profile", "user_profile", &content);
-            }
-            if let Ok(items) = engine.focus_list(seat_id, None).await {
-                if !items.is_empty() {
-                    used += 32;
-                    docs.push(json!({"id": "active_focuses", "type": "focuses", "count": items.len()}));
-                }
-            }
-            let compressed = used > limit;
-            // Hook: notify subscribers (SSE) after a context refresh/save so
-            // automation can react (e.g. persist the snapshot elsewhere).
-            if save_info.is_some() || compressed {
-                let _ = events.send(json!({
-                    "type": "context_updated", "seat_id": seat_id,
-                    "compressed": compressed, "used_chars": used, "limit_chars": limit,
-                    "saved": save_info.as_ref().and_then(|v| v.get("document_id")).cloned(),
-                }));
-            }
-            json!({"docs": docs, "seat": seat_id, "save_info": save_info,
-                   "limit_chars": limit, "used_chars": used, "compressed": compressed})
+            build_context(engine, seat_id, summary, include_base, events).await?
         }
         "load_module" => {
             // Requires knowledge:public:write; in embedded/legacy modes every
