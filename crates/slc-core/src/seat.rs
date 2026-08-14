@@ -46,6 +46,7 @@ impl<S: StorageBackend> SeatManager<S> {
             expires_at: if self.ttl > 0 { Some(now + Duration::seconds(self.ttl)) } else { None },
             metadata: metadata.unwrap_or_default(),
             active_task_id: None,
+            active_document_id: None,
             context: Map::new(),
             usage_stats: UsageStats::default(),
         };
@@ -97,6 +98,8 @@ impl<S: StorageBackend> SeatManager<S> {
     pub async fn set_active_task(&self, seat_id: &str, task_id: Option<&str>, context: Option<Value>) -> SlcResult<bool> {
         let Some(mut seat) = self.store.get_seat(seat_id).await? else { return Ok(false) };
         seat.active_task_id = task_id.map(String::from);
+        // A task is a document — keep the unified anchor in sync.
+        seat.active_document_id = task_id.map(String::from);
         if let Some(ctx) = context {
             if let Some(obj) = ctx.as_object() {
                 seat.context.extend(obj.clone());
@@ -104,6 +107,20 @@ impl<S: StorageBackend> SeatManager<S> {
         }
         self.store.insert_seat(&seat).await?;
         Ok(true)
+    }
+
+    /// Set the seat's active document (any category) — the context anchor
+    /// included in `update_context`. `None` clears it.
+    pub async fn set_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool> {
+        let Some(mut seat) = self.store.get_seat(seat_id).await? else { return Ok(false) };
+        seat.active_document_id = document_id.map(String::from);
+        self.store.insert_seat(&seat).await?;
+        Ok(true)
+    }
+
+    /// The seat's active document id (unified field with task fallback).
+    pub async fn get_active_document(&self, seat_id: &str) -> SlcResult<Option<String>> {
+        self.store.get_seat_active_document(seat_id).await
     }
 }
 

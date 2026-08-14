@@ -28,6 +28,9 @@ pub enum DocumentCategory {
     History,
     CodeSnippet,
     Documentation,
+    /// A skill — the same unified `Document`, just named a skill
+    /// (procedural knowledge: how to do things).
+    Skill,
     Custom,
     System,
 }
@@ -42,6 +45,7 @@ impl DocumentCategory {
             DocumentCategory::History => "history",
             DocumentCategory::CodeSnippet => "code_snippet",
             DocumentCategory::Documentation => "documentation",
+            DocumentCategory::Skill => "skill",
             DocumentCategory::Custom => "custom",
             DocumentCategory::System => "system",
         }
@@ -56,6 +60,7 @@ impl DocumentCategory {
             "history" | "episodic" => Some(Self::History),
             "code_snippet" => Some(Self::CodeSnippet),
             "documentation" => Some(Self::Documentation),
+            "skill" | "skills" => Some(Self::Skill),
             "custom" => Some(Self::Custom),
             "system" => Some(Self::System),
             _ => None,
@@ -214,6 +219,7 @@ impl Document {
             DocumentCategory::Project => "projects".into(),
             DocumentCategory::CodeSnippet => "code".into(),
             DocumentCategory::Documentation => "docs".into(),
+            DocumentCategory::Skill => "skills".into(),
             DocumentCategory::Custom => "custom".into(),
             DocumentCategory::System => "system".into(),
         }
@@ -252,6 +258,10 @@ pub struct Seat {
     pub expires_at: Option<DateTime<Utc>>,
     pub metadata: serde_json::Map<String, serde_json::Value>,
     pub active_task_id: Option<String>,
+    /// The active document (any category) — the "context anchor" of the
+    /// seat: it is included in `update_context` and its auto_load links are
+    /// followed. Task activation also writes this field (unified).
+    pub active_document_id: Option<String>,
     pub context: serde_json::Map<String, serde_json::Value>,
     pub usage_stats: UsageStats,
 }

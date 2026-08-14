@@ -882,10 +882,29 @@ impl StorageBackend for ObsidianVaultStore {
         let mut seats = self.seats.lock().unwrap();
         let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
         seat.active_task_id = Some(task_id.into());
+        // Task activation is document activation too (unified anchor).
+        seat.active_document_id = Some(task_id.into());
         let seat = seat.clone();
         drop(seats);
         self.persist_seat(&seat)?;
         Ok(true)
+    }
+
+    async fn set_seat_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool> {
+        let mut seats = self.seats.lock().unwrap();
+        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+        seat.active_document_id = document_id.map(String::from);
+        let seat = seat.clone();
+        drop(seats);
+        self.persist_seat(&seat)?;
+        Ok(true)
+    }
+
+    async fn get_seat_active_document(&self, seat_id: &str) -> SlcResult<Option<String>> {
+        let seats = self.seats.lock().unwrap();
+        let Some(seat) = seats.get(seat_id) else { return Ok(None) };
+        // Unified field first; fall back to the legacy task pointer.
+        Ok(seat.active_document_id.clone().or_else(|| seat.active_task_id.clone()))
     }
 
     async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool> {

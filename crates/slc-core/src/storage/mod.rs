@@ -148,6 +148,12 @@ pub trait StorageBackend: Send + Sync {
     async fn set_seat_status(&self, seat_id: &str, status: SeatStatus) -> SlcResult<bool>;
     /// Set the seat's active-task pointer (working-memory context).
     async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool>;
+    /// Set the seat's active-document pointer — any category (the context
+    /// anchor included in `update_context`).
+    async fn set_seat_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool>;
+    /// The seat's active document id; falls back to the legacy active-task
+    /// pointer for seats activated before the unified field existed.
+    async fn get_seat_active_document(&self, seat_id: &str) -> SlcResult<Option<String>>;
     async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool>;
 
     // ── Timers ──────────────────────────────────────────────────
@@ -205,6 +211,8 @@ impl StorageBackend for Arc<dyn StorageBackend> {
     async fn touch_seat(&self, seat_id: &str) -> SlcResult<bool> { self.as_ref().touch_seat(seat_id).await }
     async fn set_seat_status(&self, seat_id: &str, status: SeatStatus) -> SlcResult<bool> { self.as_ref().set_seat_status(seat_id, status).await }
     async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> { self.as_ref().set_seat_active_task(seat_id, task_id).await }
+    async fn set_seat_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool> { self.as_ref().set_seat_active_document(seat_id, document_id).await }
+    async fn get_seat_active_document(&self, seat_id: &str) -> SlcResult<Option<String>> { self.as_ref().get_seat_active_document(seat_id).await }
     async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool> { self.as_ref().incr_seat_stats(seat_id, tool_name, tokens_used).await }
 
     async fn insert_timer(&self, timer: &PersistedTimer) -> SlcResult<()> { self.as_ref().insert_timer(timer).await }

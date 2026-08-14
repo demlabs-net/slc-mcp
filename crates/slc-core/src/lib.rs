@@ -408,6 +408,39 @@ impl SlcEngine {
         m.set_active_task(seat_id, task_id).await
     }
 
+    // ── active document (unified activation — any category) ────────────
+
+    /// Activate ANY document (task, project, skill, knowledge doc…) as the
+    /// seat's context anchor: it is included in `update_context` and its
+    /// auto_load links are followed. Task activation additionally keeps the
+    /// legacy active-task pointer in sync.
+    pub async fn document_activate(&self, seat_id: &str, document_id: &str) -> SlcResult<bool> {
+        let Some(doc) = self.get_document(document_id).await? else {
+            return Ok(false);
+        };
+        self.store
+            .set_seat_active_document(seat_id, Some(document_id))
+            .await?;
+        if doc.category == DocumentCategory::Task {
+            self.store.set_seat_active_task(seat_id, document_id).await?;
+        }
+        Ok(true)
+    }
+
+    /// Clear the seat's active document (both unified and task pointers).
+    pub async fn document_deactivate(&self, seat_id: &str) -> SlcResult<()> {
+        self.seats.set_active_task(seat_id, None, None).await?;
+        Ok(())
+    }
+
+    /// The seat's active document, if any (task fallback included).
+    pub async fn document_get_active(&self, seat_id: &str) -> SlcResult<Option<Document>> {
+        let Some(id) = self.store.get_seat_active_document(seat_id).await? else {
+            return Ok(None);
+        };
+        self.get_document(&id).await
+    }
+
     pub async fn task_get_active(&self, seat_id: &str) -> SlcResult<Option<tasks::TaskInfo>> {
         let m = tasks::WorkItemManager::new(self.store.clone());
         m.get_active_task(seat_id).await
