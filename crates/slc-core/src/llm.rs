@@ -14,12 +14,31 @@ use crate::error::{SlcError, SlcResult};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+/// Роль текста при эмбеддинге. Некоторые модели (e5-семейство) требуют
+/// префиксов `query:`/`passage:` — запросы и документы кодируются по-разному.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingKind {
+    /// Пользовательский запрос (поисковый).
+    Query,
+    /// Индексируемый документ/факт.
+    Passage,
+}
+
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     /// Free-form reasoning/summarization call.
     async fn reason(&self, prompt: &str) -> SlcResult<String>;
     /// Text embedding vector.
     async fn generate_embedding(&self, text: &str) -> SlcResult<Vec<f32>>;
+    /// Embedding with the text role; default is the plain call. Overridden by
+    /// models that distinguish queries from passages (e5-style prefixes).
+    async fn generate_embedding_kind(&self, text: &str, _kind: EmbeddingKind) -> SlcResult<Vec<f32>> {
+        self.generate_embedding(text).await
+    }
+    /// Human-readable name of the embedding model (logs, record metadata).
+    fn embedding_model_name(&self) -> String {
+        "unknown".into()
+    }
 }
 
 /// Delegation: `Arc<dyn LlmClient>` is itself a client (shared across the
@@ -31,6 +50,12 @@ impl LlmClient for std::sync::Arc<dyn LlmClient> {
     }
     async fn generate_embedding(&self, text: &str) -> SlcResult<Vec<f32>> {
         self.as_ref().generate_embedding(text).await
+    }
+    async fn generate_embedding_kind(&self, text: &str, kind: EmbeddingKind) -> SlcResult<Vec<f32>> {
+        self.as_ref().generate_embedding_kind(text, kind).await
+    }
+    fn embedding_model_name(&self) -> String {
+        self.as_ref().embedding_model_name()
     }
 }
 
@@ -137,6 +162,10 @@ impl LlmClient for LmStudioClient {
             .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
             .ok_or_else(|| SlcError::Llm("lmstudio embeddings: missing data[0].embedding".into()))
     }
+
+    fn embedding_model_name(&self) -> String {
+        self.embed_model.clone()
+    }
 }
 
 /// Ollama HTTP client (matches the legacy `ollama_client.py`).
@@ -216,6 +245,10 @@ impl LlmClient for OllamaClient {
             .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
             .ok_or_else(|| SlcError::Llm("ollama embeddings: missing `embedding`".into()))
     }
+
+    fn embedding_model_name(&self) -> String {
+        self.embedding_model.clone()
+    }
 }
 
 /// Deterministic in-memory client for tests and offline operation.
@@ -250,6 +283,10 @@ impl LlmClient for MockLlm {
         h.update(text.as_bytes());
         let digest = h.finalize();
         Ok(digest.iter().take(16).map(|b| *b as f32 / 255.0).collect())
+    }
+
+    fn embedding_model_name(&self) -> String {
+        "mock".into()
     }
 }
 
@@ -311,6 +348,10 @@ impl LlmClient for McpSamplingLlm {
             "sampling client cannot embed — text-only search fallback".into(),
         ))
     }
+
+    fn embedding_model_name(&self) -> String {
+        "mcp-sampling".into()
+    }
 }
 
 /// CPU-only fallback LLM for weak machines/virtual machines: embeddings
@@ -348,6 +389,10 @@ impl LlmClient for CpuHashLlm {
             *v /= norm;
         }
         Ok(out)
+    }
+
+    fn embedding_model_name(&self) -> String {
+        "cpu-hash".into()
     }
 }
 

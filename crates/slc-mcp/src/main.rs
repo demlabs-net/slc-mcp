@@ -87,6 +87,26 @@ enum Cmd {
         #[arg(long)]
         to_vault: Option<PathBuf>,
     },
+    /// Консольный визард развертывания: выбрать провайдера эмбеддингов,
+    /// при необходимости скачать модель, записать .env. Без флагов —
+    /// интерактивно.
+    Init {
+        /// Провайдер: candle | ollama | lmstudio | hash (без вопросов).
+        #[arg(long)]
+        llm: Option<String>,
+        /// Устройство для candle: auto | cuda | metal | cpu.
+        #[arg(long)]
+        device: Option<String>,
+        /// Модель для candle (HF repo id, напр. BAAI/bge-m3).
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Пересобрать эмбеддинги всех документов (или одного сита) текущим
+    /// провайдером — после смены модели в настройках.
+    ReindexEmbeddings {
+        #[arg(long)]
+        seat: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -270,5 +290,130 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Init { llm, device, model } => cmd_init(config, llm, device, model).await,
+        Cmd::ReindexEmbeddings { seat } => {
+            let engine = SlcEngine::open_async(config).await?;
+            let report = engine.reindex_embeddings(seat.as_deref()).await?;
+            println!("reindex complete: {report:?}");
+            Ok(())
+        }
     }
+}
+
+// ── `slc-mcp init` — консольный визард развертывания ───────────────
+
+/// Прочитать строку ответа (пустая строка → default).
+fn ask(prompt: &str, default: &str) -> String {
+    print!("{prompt}");
+    if !default.is_empty() {
+        print!(" [{}]", default);
+    }
+    print!(": ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok();
+    let answer = line.trim().to_string();
+    if answer.is_empty() {
+        default.to_string()
+    } else {
+        answer
+    }
+}
+
+/// Записать/обновить ключ в .env (cwd). Существующие строки заменяются.
+fn set_env_line(key: &str, value: &str) -> std::io::Result<PathBuf> {
+    let path = std::env::current_dir()?.join(".env");
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .map(|s| s.lines().map(String::from).collect())
+        .unwrap_or_default();
+    let entry = format!("{key}={value}");
+    match lines.iter().position(|l| l.starts_with(&format!("{key}="))) {
+        Some(i) => lines[i] = entry.clone(),
+        None => lines.push(entry.clone()),
+    }
+    std::fs::write(&path, lines.join("\n") + "\n")?;
+    Ok(path)
+}
+
+async fn cmd_init(
+    config: SlcConfig,
+    llm_arg: Option<String>,
+    device_arg: Option<String>,
+    model_arg: Option<String>,
+) -> anyhow::Result<()> {
+    use slc_core::LlmClient as _;
+
+    println!("── SLC setup ────────────────────────────────────────────");
+
+    // 1. Провайдер.
+    let llm = match llm_arg {
+        Some(v) => v,
+        None => ask(
+            "LLM-провайдер (1: candle, 2: ollama, 3: lmstudio, 4: hash)",
+            "candle",
+        ),
+    };
+    let llm = match llm.as_str() {
+        "1" | "candle" => "candle".to_string(),
+        "2" | "ollama" => "ollama".to_string(),
+        "3" | "lmstudio" => "lmstudio".to_string(),
+        "4" | "hash" => "hash".to_string(),
+        other => {
+            anyhow::bail!("unknown provider: {other} (candle|ollama|lmstudio|hash)")
+        }
+    };
+
+    let mut device = device_arg;
+    let mut model = model_arg;
+
+    if llm == "candle" {
+        // 2. Устройство: показываем автодетект.
+        let detected = slc_core::candle_emb::detect_device_name();
+        println!("определено устройство: {detected}");
+        if device.is_none() {
+            device = Some(ask("устройство (auto|cuda|metal|cpu)", "auto"));
+        }
+        // 3. Модель: дефолт по устройству.
+        let dev = device.as_deref().unwrap_or("auto");
+        let default_model = slc_core::candle_emb::default_model_for(dev);
+        if model.is_none() {
+            model = Some(ask("модель (HF repo id)", &default_model));
+        }
+        let repo_id = model.as_deref().unwrap_or(&default_model).to_string();
+
+        // 4. Скачивание (единственное место, где качается модель).
+        if !slc_core::candle_emb::model_is_cached(&repo_id) {
+            println!("скачиваю модель {repo_id} в кэш Hugging Face…");
+            slc_core::candle_emb::download_embedding_model(&repo_id)?;
+        } else {
+            println!("модель {repo_id} уже в кэше");
+        }
+
+        // 5. Запись в .env.
+        let env_path = set_env_line("SLC_LLM", "candle")?;
+        set_env_line("SLC_EMBED_DEVICE", dev)?;
+        set_env_line("SLC_EMBED_MODEL", &repo_id)?;
+
+        // 6. Проверка: загрузить и сделать контрольный эмбеддинг.
+        let llm: std::sync::Arc<dyn slc_core::LlmClient> =
+            std::sync::Arc::new(slc_core::candle_emb::CandleEmbeddingLlm::new());
+        match tokio::time::timeout(std::time::Duration::from_secs(120), llm.generate_embedding("проверка эмбеддинга")).await {
+            Ok(Ok(v)) => println!("✅ модель готова: dim={} (device={dev})", v.len()),
+            Ok(Err(e)) => anyhow::bail!("модель не загрузилась: {e}"),
+            Err(_) => anyhow::bail!("таймаут загрузки модели"),
+        }
+        println!("конфигурация записана в {}", env_path.display());
+        println!("дальше: slc-mcp serve (эмбеддинги уже в кэше, автоскачивание не требуется)");
+    } else {
+        // Внешний провайдер / hash: только .env.
+        let env_path = set_env_line("SLC_LLM", &llm)?;
+        println!("конфигурация записана в {}", env_path.display());
+        match llm.as_str() {
+            "ollama" => println!("убедись, что Ollama запущен (OLLAMA_ENDPOINT, default http://localhost:11434)"),
+            "lmstudio" => println!("укажи LMSTUDIO_URL (OpenAI-совместимый сервер) в .env"),
+            _ => println!("CPU-hash: эмбеддинги без моделей; семантика ограниченная"),
+        }
+    }
+    let _ = config;
+    Ok(())
 }
