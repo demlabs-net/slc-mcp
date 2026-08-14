@@ -31,21 +31,22 @@ pub mod storage;
 pub mod tasks;
 pub mod timer;
 
+pub use auth::{AuthMode, Principal, auth_mode_from_env, authenticate};
 pub use error::{SlcError, SlcResult};
-pub use auth::{authenticate, auth_mode_from_env, Principal, AuthMode};pub use focus::{FocusItem, FocusManager};
+pub use focus::{FocusItem, FocusManager};
 pub use llm::{LlmClient, LmStudioClient, McpSamplingLlm, MockLlm, OllamaClient};
-pub use memory::{ConsolidationReport, CompressionReport, HistoryCompressor, MemoryConsolidator};
+pub use memory::{CompressionReport, ConsolidationReport, HistoryCompressor, MemoryConsolidator};
 pub use model::*;
 pub use notifications::NotificationQueue;
 pub use pagination::Paginator;
-pub use proactivity::{mind_matches, normalize_write_mind_type, MindType};
+pub use proactivity::{MindType, mind_matches, normalize_write_mind_type};
 pub use profiles::ProfileManager;
-pub use reminders::{parse_remind_at, ReminderManager};
+pub use reminders::{ReminderManager, parse_remind_at};
 pub use search::{RankWeights, SearchHit, SearchService};
 pub use seat::SeatManager;
-pub use timer::{TimerHandler, TimerRegistry};
 pub use storage::{DocFilter, DocSort, MetaPatch, SortDir, SortField, StorageBackend};
 pub use tasks::{ProjectInfo, TaskInfo, WorkItemManager};
+pub use timer::{TimerHandler, TimerRegistry};
 
 /// Which storage backend to open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,55 @@ pub enum StorageKind {
     Sqlite,
     /// MongoDB (self-hosted or Atlas) — shared-server option.
     MongoDB,
+}
+
+/// Пересобрать эмбеддинги документов БАТЧЕМ: один forward на чанк
+/// (по 32 документа), вместо последовательных вызовов. Best-effort —
+/// ошибка модели (например, ещё грузится) пропускает чанк целиком,
+/// следующий запуск повторит. Возвращает число успешно пересобранных.
+pub async fn reembed_documents(
+    store: &dyn StorageBackend,
+    llm: &dyn LlmClient,
+    docs: &[model::Document],
+) -> usize {
+    const CHUNK: usize = 32;
+    let mut done = 0usize;
+    for chunk in docs.chunks(CHUNK) {
+        let texts: Vec<String> = chunk.iter().map(|d| d.content.clone()).collect();
+        let embs = match llm
+            .generate_embeddings(&texts, crate::llm::EmbeddingKind::Passage)
+            .await
+        {
+            Ok(embs) => embs,
+            Err(e) => {
+                tracing::debug!("reembed: chunk skipped: {e}");
+                continue; // модель не готова — следующий запуск повторит
+            }
+        };
+        for (doc, emb) in chunk.iter().zip(embs) {
+            let (scope, seat_id) = match &doc.seat_id {
+                Some(s) => (model::EmbeddingScope::Private, Some(s.clone())),
+                None => (model::EmbeddingScope::Public, None),
+            };
+            let rec = model::EmbeddingRecord {
+                document_id: doc.document_id.clone(),
+                chunk_index: 0,
+                chunk_total: 1,
+                embedding: emb.clone(),
+                embedding_model: llm.embedding_model_name(),
+                embedding_dimension: emb.len(),
+                generated_at: chrono::Utc::now(),
+                scope,
+                seat_id,
+            };
+            if store.delete_embeddings(&doc.document_id).await.is_ok()
+                && store.insert_embeddings(&[rec]).await.is_ok()
+            {
+                done += 1;
+            }
+        }
+    }
+    done
 }
 
 /// Отчёт пересборки эмбеддингов (`reindex-embeddings`).
@@ -104,11 +154,18 @@ impl Default for SlcConfig {
             storage: StorageKind::ObsidianVault, // DEFAULT = Obsidian vault
             path: std::env::var("SLC_VAULT_PATH").unwrap_or_else(|_| "~/.slc/vault".into()),
             auto_git_commit: std::env::var("OBSIDIAN_AUTO_GIT_COMMIT").is_ok_and(|v| v == "true"),
-            ollama_endpoint: std::env::var("OLLAMA_ENDPOINT").unwrap_or_else(|_| "http://localhost:11434".into()),
-            ollama_reasoning_model: std::env::var("OLLAMA_REASONING_MODEL").unwrap_or_else(|_| "gemma3:latest".into()),
-            ollama_embedding_model: std::env::var("OLLAMA_EMBEDDING_MODEL").unwrap_or_else(|_| "bge-m3".into()),
-            lmstudio_url: std::env::var("LMSTUDIO_URL").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
-            lmstudio_model: std::env::var("LMSTUDIO_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".into()),
+            ollama_endpoint: std::env::var("OLLAMA_ENDPOINT")
+                .unwrap_or_else(|_| "http://localhost:11434".into()),
+            ollama_reasoning_model: std::env::var("OLLAMA_REASONING_MODEL")
+                .unwrap_or_else(|_| "gemma3:latest".into()),
+            ollama_embedding_model: std::env::var("OLLAMA_EMBEDDING_MODEL")
+                .unwrap_or_else(|_| "bge-m3".into()),
+            lmstudio_url: std::env::var("LMSTUDIO_URL")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            lmstudio_model: std::env::var("LMSTUDIO_MODEL")
+                .unwrap_or_else(|_| "google/gemma-4-e4b".into()),
             lmstudio_embed_model: std::env::var("LMSTUDIO_EMBED_MODEL")
                 .unwrap_or_else(|_| "text-embedding-nomic-embed-text-v1.5".into()),
             semantic_weight: 0.7,
@@ -130,8 +187,10 @@ pub struct SlcEngine {
     llm: std::sync::Arc<dyn LlmClient>,
     pub seats: SeatManager<std::sync::Arc<dyn StorageBackend>>,
     search: SearchService,
-    compressor: HistoryCompressor<std::sync::Arc<dyn StorageBackend>, std::sync::Arc<dyn LlmClient>>,
-    consolidator: MemoryConsolidator<std::sync::Arc<dyn StorageBackend>, std::sync::Arc<dyn LlmClient>>,
+    compressor:
+        HistoryCompressor<std::sync::Arc<dyn StorageBackend>, std::sync::Arc<dyn LlmClient>>,
+    consolidator:
+        MemoryConsolidator<std::sync::Arc<dyn StorageBackend>, std::sync::Arc<dyn LlmClient>>,
     pub config: SlcConfig,
     scheduler: std::sync::Mutex<Option<timer::TimerRegistry>>,
 }
@@ -147,7 +206,10 @@ impl SlcEngine {
         let store: std::sync::Arc<dyn StorageBackend> = match config.storage {
             StorageKind::ObsidianVault => {
                 let path = expand_tilde(&config.path);
-                std::sync::Arc::new(storage::obsidian::ObsidianVaultStore::open(path, config.auto_git_commit)?)
+                std::sync::Arc::new(storage::obsidian::ObsidianVaultStore::open(
+                    path,
+                    config.auto_git_commit,
+                )?)
             }
             StorageKind::Sqlite => {
                 let path = expand_tilde(&config.path);
@@ -178,15 +240,18 @@ impl SlcEngine {
         Ok(match config.storage {
             StorageKind::ObsidianVault => {
                 let path = expand_tilde(&config.path);
-                std::sync::Arc::new(storage::obsidian::ObsidianVaultStore::open(path, config.auto_git_commit)?)
+                std::sync::Arc::new(storage::obsidian::ObsidianVaultStore::open(
+                    path,
+                    config.auto_git_commit,
+                )?)
             }
             StorageKind::Sqlite => {
                 let path = expand_tilde(&config.path);
                 std::sync::Arc::new(storage::sqlite::SqliteStore::open(path)?)
             }
-            StorageKind::MongoDB => {
-                std::sync::Arc::new(storage::mongodb::MongoStore::connect(config.mongodb_uri.as_deref()).await?)
-            }
+            StorageKind::MongoDB => std::sync::Arc::new(
+                storage::mongodb::MongoStore::connect(config.mongodb_uri.as_deref()).await?,
+            ),
         })
     }
 
@@ -222,7 +287,9 @@ impl SlcEngine {
         #[cfg(feature = "candle-emb")]
         {
             if !candle_emb::CandleEmbeddingLlm::gpu_available() {
-                tracing::warn!("no GPU — CPU-hash embeddings by default; force local CPU inference with SLC_LLM=candle");
+                tracing::warn!(
+                    "no GPU — CPU-hash embeddings by default; force local CPU inference with SLC_LLM=candle"
+                );
                 return std::sync::Arc::new(llm::CpuHashLlm);
             }
             let onboard = candle_emb::CandleEmbeddingLlm::new();
@@ -230,7 +297,9 @@ impl SlcEngine {
                 tracing::info!("GPU detected — onboard candle embeddings (bge-m3)");
                 return std::sync::Arc::new(onboard);
             }
-            tracing::warn!("GPU detected, but the embedding model is not downloaded — run `slc-mcp init`; CPU-hash embeddings for now");
+            tracing::warn!(
+                "GPU detected, but the embedding model is not downloaded — run `slc-mcp init`; CPU-hash embeddings for now"
+            );
             std::sync::Arc::new(llm::CpuHashLlm)
         }
         #[cfg(not(feature = "candle-emb"))]
@@ -247,10 +316,24 @@ impl SlcEngine {
         config: SlcConfig,
     ) -> Self {
         let seats = SeatManager::new(store.clone(), config.seat_ttl_seconds);
-        let search = SearchService::new(store.clone(), llm.clone(), config.semantic_weight, config.text_weight);
+        let search = SearchService::new(
+            store.clone(),
+            llm.clone(),
+            config.semantic_weight,
+            config.text_weight,
+        );
         let compressor = HistoryCompressor::new(store.clone(), llm.clone());
         let consolidator = MemoryConsolidator::new(store.clone(), llm.clone());
-        SlcEngine { store, llm, seats, search, compressor, consolidator, config, scheduler: std::sync::Mutex::new(None) }
+        SlcEngine {
+            store,
+            llm,
+            seats,
+            search,
+            compressor,
+            consolidator,
+            config,
+            scheduler: std::sync::Mutex::new(None),
+        }
     }
 
     pub fn store(&self) -> &dyn StorageBackend {
@@ -275,7 +358,11 @@ impl SlcEngine {
     /// (`seat.context["context_limit_chars"]`) wins over the config default.
     pub async fn context_limit_for(&self, seat_id: &str) -> SlcResult<usize> {
         if let Ok(Some(seat)) = self.seats.get_seat(seat_id).await {
-            if let Some(v) = seat.context.get("context_limit_chars").and_then(|v| v.as_u64()) {
+            if let Some(v) = seat
+                .context
+                .get("context_limit_chars")
+                .and_then(|v| v.as_u64())
+            {
                 return Ok(v as usize);
             }
         }
@@ -333,28 +420,40 @@ impl SlcEngine {
     pub async fn reindex_embeddings(&self, seat: Option<&str>) -> SlcResult<ReindexReport> {
         let docs = self
             .store
-            .kb_find(&storage::DocFilter::default(), &storage::DocSort::by_updated(storage::SortDir::Desc), usize::MAX)
+            .kb_find(
+                &storage::DocFilter::default(),
+                &storage::DocSort::by_updated(storage::SortDir::Desc),
+                usize::MAX,
+            )
             .await?;
-        let mut done = 0usize;
-        let mut skipped = 0usize;
-        for doc in &docs {
-            if let Some(s) = seat {
-                if doc.seat_id.as_deref() != Some(s) {
-                    skipped += 1;
-                    continue;
-                }
-            }
-            self.embed_document(doc).await;
-            done += 1;
-        }
-        Ok(ReindexReport { total: docs.len(), reindexed: done, skipped })
+        let selected: Vec<model::Document> = docs
+            .iter()
+            .filter(|d| {
+                seat.map(|s| d.seat_id.as_deref() == Some(s))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        let skipped = docs.len() - selected.len();
+        // Батч-пересборка (один forward на чанк документов).
+        let done = reembed_documents(self.store.as_ref(), self.llm.as_ref(), &selected).await;
+        Ok(ReindexReport {
+            total: docs.len(),
+            reindexed: done,
+            skipped,
+        })
     }
 
     pub async fn get_document(&self, document_id: &str) -> SlcResult<Option<Document>> {
         self.store.kb_get(document_id).await
     }
 
-    pub async fn search(&self, query: &str, seat_id: Option<&str>, limit: usize) -> SlcResult<Vec<SearchHit>> {
+    pub async fn search(
+        &self,
+        query: &str,
+        seat_id: Option<&str>,
+        limit: usize,
+    ) -> SlcResult<Vec<SearchHit>> {
         self.search.search(query, None, None, limit, seat_id).await
     }
 
@@ -389,8 +488,13 @@ impl SlcEngine {
 
     /// Episodic recall — search HISTORY only (separate from KB search).
     pub async fn recall(&self, seat_id: &str, limit: usize) -> SlcResult<Vec<Document>> {
-        let f = DocFilter { seat_id: Some(seat_id.into()), ..Default::default() };
-        self.store.episodic_find(&f, &DocSort::by_created(SortDir::Desc), limit).await
+        let f = DocFilter {
+            seat_id: Some(seat_id.into()),
+            ..Default::default()
+        };
+        self.store
+            .episodic_find(&f, &DocSort::by_created(SortDir::Desc), limit)
+            .await
     }
 
     // ── proactive loop: focuses ────────────────────────────────────
@@ -406,7 +510,8 @@ impl SlcEngine {
         mind_type: Option<&str>,
     ) -> SlcResult<FocusItem> {
         let fm = FocusManager::new(self.store.clone());
-        fm.add(seat_id, title, description, priority, depends_on, mind_type).await
+        fm.add(seat_id, title, description, priority, depends_on, mind_type)
+            .await
     }
 
     pub async fn focus_remove(&self, seat_id: &str, focus_id: &str) -> SlcResult<bool> {
@@ -424,14 +529,25 @@ impl SlcEngine {
         depends_on: Option<&[String]>,
     ) -> SlcResult<bool> {
         let fm = FocusManager::new(self.store.clone());
-        fm.update(focus_id, title, description, priority, depends_on, Some(seat_id)).await
+        fm.update(
+            focus_id,
+            title,
+            description,
+            priority,
+            depends_on,
+            Some(seat_id),
+        )
+        .await
     }
 
-    pub async fn focus_list(&self, seat_id: &str, mind_type: Option<MindType>) -> SlcResult<Vec<FocusItem>> {
+    pub async fn focus_list(
+        &self,
+        seat_id: &str,
+        mind_type: Option<MindType>,
+    ) -> SlcResult<Vec<FocusItem>> {
         let fm = FocusManager::new(self.store.clone());
         fm.get_active(seat_id, mind_type).await
     }
-
 
     // ── reminders + notifications ────────────────────────────────
 
@@ -443,9 +559,13 @@ impl SlcEngine {
         remind_at: chrono::DateTime<chrono::Utc>,
         mind_type: Option<&str>,
     ) -> SlcResult<model::Reminder> {
-        let registry = self.scheduler().unwrap_or_else(|| timer::TimerRegistry::new(self.store.clone()));
+        let registry = self
+            .scheduler()
+            .unwrap_or_else(|| timer::TimerRegistry::new(self.store.clone()));
         let manager = ReminderManager::new(self.store.clone(), registry);
-        manager.create(seat_id, content, remind_at, None, None, false, mind_type).await
+        manager
+            .create(seat_id, content, remind_at, None, None, false, mind_type)
+            .await
     }
 
     pub async fn reminder_list(&self, seat_id: &str) -> SlcResult<Vec<model::Reminder>> {
@@ -455,13 +575,19 @@ impl SlcEngine {
     }
 
     pub async fn reminder_cancel(&self, seat_id: &str, reminder_id: &str) -> SlcResult<bool> {
-        let registry = self.scheduler().unwrap_or_else(|| timer::TimerRegistry::new(self.store.clone()));
+        let registry = self
+            .scheduler()
+            .unwrap_or_else(|| timer::TimerRegistry::new(self.store.clone()));
         let manager = ReminderManager::new(self.store.clone(), registry);
         manager.cancel(reminder_id, Some(seat_id)).await
     }
 
     /// Pop pending notifications for the seat (marks them delivered).
-    pub async fn pop_notifications(&self, seat_id: &str, limit: usize) -> SlcResult<Vec<model::Notification>> {
+    pub async fn pop_notifications(
+        &self,
+        seat_id: &str,
+        limit: usize,
+    ) -> SlcResult<Vec<model::Notification>> {
         let queue = NotificationQueue::new(self.store.clone());
         queue.pop_pending(seat_id, limit).await
     }
@@ -473,12 +599,22 @@ impl SlcEngine {
 
     // ── pagination ───────────────────────────────────────────────
 
-    pub async fn paginate(&self, seat_id: &str, response_id: &str, data: &serde_json::Value) -> SlcResult<serde_json::Value> {
+    pub async fn paginate(
+        &self,
+        seat_id: &str,
+        response_id: &str,
+        data: &serde_json::Value,
+    ) -> SlcResult<serde_json::Value> {
         let p = Paginator::new(self.store.clone());
         p.paginate(seat_id, response_id, data).await
     }
 
-    pub async fn get_page(&self, seat_id: &str, response_id: &str, page: usize) -> SlcResult<serde_json::Value> {
+    pub async fn get_page(
+        &self,
+        seat_id: &str,
+        response_id: &str,
+        page: usize,
+    ) -> SlcResult<serde_json::Value> {
         let p = Paginator::new(self.store.clone());
         p.get_page(seat_id, response_id, page).await
     }
@@ -510,10 +646,15 @@ impl SlcEngine {
         metadata: &serde_json::Value,
     ) -> SlcResult<tasks::TaskInfo> {
         let m = tasks::WorkItemManager::new(self.store.clone());
-        m.create_task(seat_id, name, description, project_id, auto_load, metadata).await
+        m.create_task(seat_id, name, description, project_id, auto_load, metadata)
+            .await
     }
 
-    pub async fn task_get(&self, seat_id: &str, task_id: &str) -> SlcResult<Option<tasks::TaskInfo>> {
+    pub async fn task_get(
+        &self,
+        seat_id: &str,
+        task_id: &str,
+    ) -> SlcResult<Option<tasks::TaskInfo>> {
         let m = tasks::WorkItemManager::new(self.store.clone());
         m.get_task(seat_id, task_id).await
     }
@@ -530,7 +671,17 @@ impl SlcEngine {
         metadata: Option<&serde_json::Value>,
     ) -> SlcResult<Option<tasks::TaskInfo>> {
         let m = tasks::WorkItemManager::new(self.store.clone());
-        m.update_task(seat_id, task_id, name, description, project_id, auto_load, status, metadata).await
+        m.update_task(
+            seat_id,
+            task_id,
+            name,
+            description,
+            project_id,
+            auto_load,
+            status,
+            metadata,
+        )
+        .await
     }
 
     pub async fn task_delete(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
@@ -538,7 +689,13 @@ impl SlcEngine {
         m.delete_task(seat_id, task_id).await
     }
 
-    pub async fn task_list(&self, seat_id: &str, project_id: Option<&str>, status: Option<&str>, limit: usize) -> SlcResult<Vec<tasks::TaskInfo>> {
+    pub async fn task_list(
+        &self,
+        seat_id: &str,
+        project_id: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> SlcResult<Vec<tasks::TaskInfo>> {
         let m = tasks::WorkItemManager::new(self.store.clone());
         m.list_tasks(seat_id, project_id, status, limit).await
     }
@@ -562,7 +719,9 @@ impl SlcEngine {
             .set_seat_active_document(seat_id, Some(document_id))
             .await?;
         if doc.category == DocumentCategory::Task {
-            self.store.set_seat_active_task(seat_id, document_id).await?;
+            self.store
+                .set_seat_active_task(seat_id, document_id)
+                .await?;
         }
         Ok(true)
     }
@@ -595,10 +754,15 @@ impl SlcEngine {
         metadata: &serde_json::Value,
     ) -> SlcResult<tasks::ProjectInfo> {
         let m = tasks::WorkItemManager::new(self.store.clone());
-        m.create_project(seat_id, name, description, auto_load, metadata).await
+        m.create_project(seat_id, name, description, auto_load, metadata)
+            .await
     }
 
-    pub async fn project_get(&self, seat_id: &str, project_id: &str) -> SlcResult<Option<tasks::ProjectInfo>> {
+    pub async fn project_get(
+        &self,
+        seat_id: &str,
+        project_id: &str,
+    ) -> SlcResult<Option<tasks::ProjectInfo>> {
         let m = tasks::WorkItemManager::new(self.store.clone());
         m.get_project(seat_id, project_id).await
     }
@@ -614,7 +778,16 @@ impl SlcEngine {
         metadata: Option<&serde_json::Value>,
     ) -> SlcResult<Option<tasks::ProjectInfo>> {
         let m = tasks::WorkItemManager::new(self.store.clone());
-        m.update_project(seat_id, project_id, name, description, auto_load, status, metadata).await
+        m.update_project(
+            seat_id,
+            project_id,
+            name,
+            description,
+            auto_load,
+            status,
+            metadata,
+        )
+        .await
     }
 
     pub async fn project_delete(&self, seat_id: &str, project_id: &str) -> SlcResult<bool> {
@@ -622,7 +795,12 @@ impl SlcEngine {
         m.delete_project(seat_id, project_id).await
     }
 
-    pub async fn project_list(&self, seat_id: &str, status: Option<&str>, limit: usize) -> SlcResult<Vec<tasks::ProjectInfo>> {
+    pub async fn project_list(
+        &self,
+        seat_id: &str,
+        status: Option<&str>,
+        limit: usize,
+    ) -> SlcResult<Vec<tasks::ProjectInfo>> {
         let m = tasks::WorkItemManager::new(self.store.clone());
         m.list_projects(seat_id, status, limit).await
     }
@@ -646,7 +824,12 @@ impl SlcEngine {
         pm.get_seat_profile(seat_id).await
     }
 
-    pub async fn upsert_seat_profile(&self, seat_id: &str, content: &str, timezone: Option<&str>) -> SlcResult<bool> {
+    pub async fn upsert_seat_profile(
+        &self,
+        seat_id: &str,
+        content: &str,
+        timezone: Option<&str>,
+    ) -> SlcResult<bool> {
         let pm = ProfileManager::new(self.store.clone());
         pm.upsert_seat_profile(seat_id, content, timezone).await
     }
@@ -687,7 +870,12 @@ impl SlcEngine {
                 let seat = t.seat_id.clone();
                 Box::pin(async move {
                     let report = compressor.compress(&seat).await?;
-                    tracing::info!("history compression [{seat}]: L1→L2 {}, L2→L3 {}, L3→L4 {}", report.l1_to_l2, report.l2_to_l3, report.l3_to_l4);
+                    tracing::info!(
+                        "history compression [{seat}]: L1→L2 {}, L2→L3 {}, L3→L4 {}",
+                        report.l1_to_l2,
+                        report.l2_to_l3,
+                        report.l3_to_l4
+                    );
                     Ok(())
                 })
             })),
@@ -733,7 +921,11 @@ impl SlcEngine {
         for seat in self.store.list_active_seats(1000).await? {
             let created = registry.create_defaults(&seat.seat_id).await?;
             if !created.is_empty() {
-                tracing::debug!("seat {}: default timers {}", seat.seat_id, created.join(","));
+                tracing::debug!(
+                    "seat {}: default timers {}",
+                    seat.seat_id,
+                    created.join(",")
+                );
             }
         }
         registry.start().await?;
@@ -748,9 +940,15 @@ impl SlcEngine {
 
 /// Timer handler for a user-created `REMINDER`: mark fired + push a
 /// notification (mirrors `ReminderHandler` in the legacy).
-async fn handle_reminder(store: &std::sync::Arc<dyn StorageBackend>, timer: &model::PersistedTimer) -> SlcResult<()> {
+async fn handle_reminder(
+    store: &std::sync::Arc<dyn StorageBackend>,
+    timer: &model::PersistedTimer,
+) -> SlcResult<()> {
     let Some(reminder_id) = timer.metadata.get("reminder_id").and_then(|v| v.as_str()) else {
-        tracing::warn!("REMINDER timer {} has no reminder_id in metadata", timer.timer_id);
+        tracing::warn!(
+            "REMINDER timer {} has no reminder_id in metadata",
+            timer.timer_id
+        );
         return Ok(());
     };
     let manager = ReminderManager::new(store.clone(), timer::TimerRegistry::new(store.clone()));
@@ -758,19 +956,35 @@ async fn handle_reminder(store: &std::sync::Arc<dyn StorageBackend>, timer: &mod
         tracing::warn!("Reminder {reminder_id} not found in DB");
         return Ok(());
     };
-    manager.mark_fired(reminder_id, Some(&timer.seat_id)).await?;
+    manager
+        .mark_fired(reminder_id, Some(&timer.seat_id))
+        .await?;
     let queue = NotificationQueue::new(store.clone());
     let mut meta = serde_json::Map::new();
-    meta.insert("reminder_id".into(), serde_json::Value::String(reminder_id.into()));
+    meta.insert(
+        "reminder_id".into(),
+        serde_json::Value::String(reminder_id.into()),
+    );
     queue
-        .push(&timer.seat_id, "REMINDER", "⏰ Напоминание", &reminder.content, meta)
+        .push(
+            &timer.seat_id,
+            "REMINDER",
+            "⏰ Напоминание",
+            &reminder.content,
+            meta,
+        )
         .await?;
     Ok(())
 }
 
 /// Periodic nudge about active focuses (`FocusReminderHandler`).
-async fn handle_focus_reminder(store: &std::sync::Arc<dyn StorageBackend>, timer: &model::PersistedTimer) -> SlcResult<()> {
-    let focuses = FocusManager::new(store.clone()).get_active(&timer.seat_id, None).await?;
+async fn handle_focus_reminder(
+    store: &std::sync::Arc<dyn StorageBackend>,
+    timer: &model::PersistedTimer,
+) -> SlcResult<()> {
+    let focuses = FocusManager::new(store.clone())
+        .get_active(&timer.seat_id, None)
+        .await?;
     if focuses.is_empty() {
         return Ok(());
     }
@@ -782,7 +996,15 @@ async fn handle_focus_reminder(store: &std::sync::Arc<dyn StorageBackend>, timer
         body.push_str(&format!("...и ещё {}", focuses.len() - 5));
     }
     let queue = NotificationQueue::new(store.clone());
-    queue.push(&timer.seat_id, "FOCUS_REMINDER", "🎯 Текущие фокусы", &body, Default::default()).await?;
+    queue
+        .push(
+            &timer.seat_id,
+            "FOCUS_REMINDER",
+            "🎯 Текущие фокусы",
+            &body,
+            Default::default(),
+        )
+        .await?;
     Ok(())
 }
 
@@ -805,7 +1027,12 @@ use std::ffi::{CStr, CString};
 /// # Safety: `engine` must point to a live SlcEngine; `seat`, `event_id`,
 /// `content` must be valid NUL-terminated UTF-8 for the call duration.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn slc_remember(engine: *const SlcEngine, seat: *const std::os::raw::c_char, event_id: *const std::os::raw::c_char, content: *const std::os::raw::c_char) -> i32 {
+pub unsafe extern "C" fn slc_remember(
+    engine: *const SlcEngine,
+    seat: *const std::os::raw::c_char,
+    event_id: *const std::os::raw::c_char,
+    content: *const std::os::raw::c_char,
+) -> i32 {
     let (Ok(seat), Ok(event_id), Ok(content)) = (
         // SAFETY: caller guarantees NUL-terminated UTF-8 pointers.
         unsafe { CStr::from_ptr(seat) }.to_str(),
@@ -855,14 +1082,20 @@ mod engine_tests {
         let llm: std::sync::Arc<dyn LlmClient> =
             std::sync::Arc::new(MockLlm::new(vec!["краткий факт".into()]));
         let engine = SlcEngine::with(store.clone(), llm, SlcConfig::default());
-        let out = engine.summarize_text("очень длинный текст", 100).await.unwrap();
+        let out = engine
+            .summarize_text("очень длинный текст", 100)
+            .await
+            .unwrap();
         assert_eq!(out, "краткий факт");
 
         // LLM yields a long echo (no real compression) → the text is never
         // truncated by hand to the budget.
         let llm2: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
         let engine2 = SlcEngine::with(store, llm2, SlcConfig::default());
-        let out2 = engine2.summarize_text("очень длинный текст", 5).await.unwrap();
+        let out2 = engine2
+            .summarize_text("очень длинный текст", 5)
+            .await
+            .unwrap();
         assert!(out2.len() > 5, "no manual truncation: {out2}");
     }
 }

@@ -39,6 +39,20 @@ pub trait LlmClient: Send + Sync {
     ) -> SlcResult<Vec<f32>> {
         self.generate_embedding(text).await
     }
+    /// Batch embedding (indexing/refresh/reindex paths). Default: sequential
+    /// per-text calls; on-device clients (candle) override with a single
+    /// batched forward — much faster for many short documents.
+    async fn generate_embeddings(
+        &self,
+        texts: &[String],
+        kind: EmbeddingKind,
+    ) -> SlcResult<Vec<Vec<f32>>> {
+        let mut out = Vec::with_capacity(texts.len());
+        for t in texts {
+            out.push(self.generate_embedding_kind(t, kind).await?);
+        }
+        Ok(out)
+    }
     /// Human-readable name of the embedding model (logs, record metadata).
     fn embedding_model_name(&self) -> String {
         "unknown".into()
@@ -61,6 +75,13 @@ impl LlmClient for std::sync::Arc<dyn LlmClient> {
         kind: EmbeddingKind,
     ) -> SlcResult<Vec<f32>> {
         self.as_ref().generate_embedding_kind(text, kind).await
+    }
+    async fn generate_embeddings(
+        &self,
+        texts: &[String],
+        kind: EmbeddingKind,
+    ) -> SlcResult<Vec<Vec<f32>>> {
+        self.as_ref().generate_embeddings(texts, kind).await
     }
     fn embedding_model_name(&self) -> String {
         self.as_ref().embedding_model_name()
