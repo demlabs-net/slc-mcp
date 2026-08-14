@@ -28,8 +28,11 @@ pub const BGE_M3: &str = "BAAI/bge-m3";
 /// CPU-модель по умолчанию: лёгкая, 384-мер, тоже мультиязычная.
 pub const E5_SMALL: &str = "intfloat/multilingual-e5-small";
 
-/// Файлы модели, необходимые для загрузки.
+/// Файлы модели (safetensors-вариант; часть моделей, например bge-m3,
+/// публикует только `pytorch_model.bin` — см. [`PTH_FILE`]).
 const MODEL_FILES: [&str; 3] = ["model.safetensors", "config.json", "tokenizer.json"];
+/// Fallback для моделей без safetensors (torch-формат, читается candle'ом).
+const PTH_FILE: &str = "pytorch_model.bin";
 
 /// Максимальная длина токенов для эмбеддинга (у e5-small лимит 512).
 const MAX_TOKENS: usize = 512;
@@ -77,52 +80,20 @@ enum LoadState {
 pub struct CandleEmbeddingLlm {
     repo_id: String,
     device_kind: DeviceKind,
-    state: Mutex<LoadState>,
-    cond: Condvar,
+    state: Arc<Mutex<LoadState>>,
+    cond: Arc<Condvar>,
 }
 
 impl CandleEmbeddingLlm {
-    /// Resolve the device kind from `SLC_EMBED_DEVICE` (auto-detected
-    /// otherwise) and pick the model: GPU → bge-m3, CPU → e5-small.
-    /// `SLC_EMBED_MODEL` overrides the model for any device.
-    ///
-    /// No network traffic happens here: the model is only loaded if it is
-    /// already in the Hugging Face cache; otherwise the state is set to
-    /// `Failed` with a pointer to `slc-mcp init`.
+    /// Общий конструктор: резолвит настройки из env.
     pub fn new() -> Self {
-        let device_kind = match std::env::var("SLC_EMBED_DEVICE").as_deref() {
-            Ok("cuda") => DeviceKind::Cuda,
-            Ok("metal") => DeviceKind::Metal,
-            Ok("cpu") => DeviceKind::Cpu,
-            Ok("auto") | Ok("") | Err(_) => detect_device(),
-            Ok(other) => {
-                tracing::warn!(device = other, "unknown SLC_EMBED_DEVICE — auto-detecting");
-                detect_device()
-            }
+        let device = std::env::var("SLC_EMBED_DEVICE").unwrap_or_default();
+        let device = match device.as_str() {
+            "cuda" | "metal" | "cpu" => device,
+            _ => "auto".to_string(),
         };
-        let repo_id = std::env::var("SLC_EMBED_MODEL").unwrap_or_else(|_| match device_kind {
-            DeviceKind::Cuda | DeviceKind::Metal => BGE_M3.to_string(),
-            DeviceKind::Auto | DeviceKind::Cpu => E5_SMALL.to_string(),
-        });
-        let llm = Self { repo_id, device_kind, state: Mutex::new(LoadState::Loading), cond: Condvar::new() };
-        if llm.model_cached() {
-            // Фоновая загрузка из кэша: старт сервера не блокируется.
-            let worker = llm.clone_for_loader();
-            std::thread::Builder::new()
-                .name("slc-embed-loader".into())
-                .spawn(move || worker.load_in_background())
-                .expect("spawn slc-embed-loader");
-        } else {
-            tracing::warn!(
-                model = %llm.repo_id,
-                "embedding model is not downloaded — run `slc-mcp init` (auto-download is disabled)"
-            );
-            *llm.state.lock().unwrap() = LoadState::Failed(format!(
-                "model {} is not in the cache — run `slc-mcp init` to download it",
-                llm.repo_id
-            ));
-        }
-        llm
+        let repo = std::env::var("SLC_EMBED_MODEL").ok();
+        Self::with_config(repo.unwrap_or_else(|| Self::default_model_for(&device)), &device)
     }
 
     /// Конструктор с явной конфигурацией (используется `slc-mcp init`
@@ -136,7 +107,12 @@ impl CandleEmbeddingLlm {
             _ => detect_device(),
         };
         let repo_id = repo_id.into();
-        let llm = Self { repo_id, device_kind, state: Mutex::new(LoadState::Loading), cond: Condvar::new() };
+        let llm = Self {
+            repo_id,
+            device_kind,
+            state: Arc::new(Mutex::new(LoadState::Loading)),
+            cond: Arc::new(Condvar::new()),
+        };
         if llm.model_cached() {
             let worker = llm.clone_for_loader();
             std::thread::Builder::new()
@@ -172,31 +148,37 @@ impl CandleEmbeddingLlm {
             Err(_) => return false,
         };
         let repo = client.model(owner, name);
-        MODEL_FILES.iter().all(|file| {
+        let cached = |file: &str| {
             repo.download_file()
                 .filename(file.to_string())
                 .local_files_only(true)
                 .send()
                 .is_ok()
-        })
+        };
+        // Вес — safetensors ИЛИ torch-фоллбэк.
+        (cached(MODEL_FILES[0]) || cached(PTH_FILE)) && cached(MODEL_FILES[1]) && cached(MODEL_FILES[2])
     }
 
     /// Default model for a device kind (what `slc-mcp init` proposes).
+    /// `auto` resolves the real device first: GPU → bge-m3, CPU → e5-small.
     pub fn default_model_for(device_kind: &str) -> String {
         match device_kind {
             "cuda" | "metal" => BGE_M3.to_string(),
-            _ => E5_SMALL.to_string(),
+            "cpu" => E5_SMALL.to_string(),
+            _ => match detect_device() {
+                DeviceKind::Cuda | DeviceKind::Metal => BGE_M3.to_string(),
+                _ => E5_SMALL.to_string(),
+            },
         }
     }
 
-    /// Cheap copy used only by the background loader (thread-safety of the
-    /// shared state is enough; repo_id/device_kind are Copy/owned).
+    /// Копия для фонового лоадера: разделяет `state`/`cond` с оригиналом.
     fn clone_for_loader(&self) -> Self {
         Self {
             repo_id: self.repo_id.clone(),
             device_kind: self.device_kind,
-            state: Mutex::new(LoadState::Loading),
-            cond: Condvar::new(),
+            state: Arc::clone(&self.state),
+            cond: Arc::clone(&self.cond),
         }
     }
 
@@ -271,9 +253,15 @@ impl CandleEmbeddingLlm {
                 .send()
                 .map_err(|e| format!("{file} (запусти `slc-mcp init`, чтобы скачать модель): {e}"))
         };
-        let model_path = dl("model.safetensors")?;
-        let config_path = dl("config.json")?;
-        let tokenizer_path = dl("tokenizer.json")?;
+        // Веса: предпочитаем safetensors, иначе torch-файл (bge-m3 и др.).
+        let safetensors = dl(MODEL_FILES[0]).is_ok();
+        let weights = if safetensors {
+            dl(MODEL_FILES[0])?
+        } else {
+            dl(PTH_FILE)?
+        };
+        let config_path = dl(MODEL_FILES[1])?;
+        let tokenizer_path = dl(MODEL_FILES[2])?;
 
         let config_json = std::fs::read_to_string(config_path).map_err(|e| format!("read config: {e}"))?;
         let cfg: serde_json::Value = serde_json::from_str(&config_json).map_err(|e| format!("parse config: {e}"))?;
@@ -288,8 +276,14 @@ impl CandleEmbeddingLlm {
             .unwrap_or("BertModel")
             .to_string();
 
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], DType::F32, &device) }
-            .map_err(|e| format!("load safetensors: {e}"))?;
+        let vb = if safetensors {
+            unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device) }
+                .map_err(|e| format!("load safetensors: {e}"))?
+        } else {
+            // torch-формат читается целиком (pickle) — 4-5 ГБ в RAM для
+            // bge-m3; это GPU-путь, для слабых машин есть e5-small/hash.
+            VarBuilder::from_pth(&weights, DType::F32, &device).map_err(|e| format!("load pytorch_model.bin: {e}"))?
+        };
         let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
             .map_err(|e| format!("load tokenizer: {e}"))?;
         tokenizer
@@ -365,7 +359,8 @@ impl CandleEmbeddingLlm {
                 .map_err(|e| e.to_string())?
                 .sqrt()
                 .map_err(|e| e.to_string())?;
-            let vec: Vec<f32> = (pooled / norm)
+            let vec: Vec<f32> = pooled
+                .broadcast_div(&norm)
                 .map_err(|e| e.to_string())?
                 .to_vec1()
                 .map_err(|e| e.to_string())?;
@@ -383,13 +378,32 @@ pub fn download_embedding_model(repo_id: &str) -> Result<(), String> {
         .ok_or_else(|| format!("model repo id must be owner/name, got: {repo_id}"))?;
     let client = hf_hub::HFClientSync::new().map_err(|e| format!("hf-hub: {e}"))?;
     let repo = client.model(owner, name);
-    for file in MODEL_FILES {
+    // Веса: safetensors, а если репозиторий их не публикует (bge-m3) — torch.
+    let weights = match repo
+        .download_file()
+        .filename(MODEL_FILES[0].to_string())
+        .send()
+    {
+        Ok(p) => {
+            tracing::info!(model = repo_id, file = MODEL_FILES[0], "downloaded");
+            p
+        }
+        Err(_) => {
+            tracing::info!(model = repo_id, file = PTH_FILE, "no safetensors — downloading torch weights");
+            repo.download_file()
+                .filename(PTH_FILE.to_string())
+                .send()
+                .map_err(|e| format!("download {PTH_FILE}: {e}"))?
+        }
+    };
+    for file in [MODEL_FILES[1], MODEL_FILES[2]] {
         tracing::info!(model = repo_id, file, "downloading model file");
         repo.download_file()
             .filename(file.to_string())
             .send()
             .map_err(|e| format!("download {file}: {e}"))?;
     }
+    let _ = weights;
     Ok(())
 }
 
@@ -408,23 +422,23 @@ pub fn model_is_cached(repo_id: &str) -> bool {
     let probe = CandleEmbeddingLlm {
         repo_id: repo_id.to_string(),
         device_kind: DeviceKind::Cpu,
-        state: Mutex::new(LoadState::Loading),
-        cond: Condvar::new(),
+        state: Arc::new(Mutex::new(LoadState::Loading)),
+        cond: Arc::new(Condvar::new()),
     };
     probe.model_cached()
 }
 
 /// Detect the GPU type available at runtime (cheap, no downloads).
-fn detect_device() -> DeviceKind {    #[cfg(feature = "cuda")]
+///
+/// NOTE: the candle Metal backend lacks layer-norm (verified e2e — bge-m3 on
+/// macOS fails with "no metal implementation for layer-norm"), so macOS is
+/// treated as CPU here; candle runs on Accelerate-optimized CPU. CUDA is
+/// used only when built with the `cuda` feature.
+fn detect_device() -> DeviceKind {
+    #[cfg(feature = "cuda")]
     {
         if Device::cuda_if_available(0).is_ok() {
             return DeviceKind::Cuda;
-        }
-    }
-    #[cfg(all(target_os = "macos", feature = "candle-emb"))]
-    {
-        if Device::new_metal(0).is_ok() {
-            return DeviceKind::Metal;
         }
     }
     DeviceKind::Cpu
