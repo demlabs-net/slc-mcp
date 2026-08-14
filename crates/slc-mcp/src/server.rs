@@ -1063,12 +1063,15 @@ async fn task_list(engine: &SlcEngine, _seat_id: Option<&str>) -> Result<Vec<Val
     Ok(tasks
         .iter()
         .map(|t| {
-            json!({
+            let mut v = json!({
                 "document_id": t.document_id,
-                "status": t.metadata.extra.get("status").and_then(|v| v.as_str()).unwrap_or("active"),
                 "project": t.project_slug(),
                 "updated_at": t.updated_at.to_rfc3339(),
-            })
+            });
+            if let Some(st) = t.metadata.extra.get("status").and_then(|x| x.as_str()) {
+                v["status"] = json!(st);
+            }
+            v
         })
         .collect())
 }
