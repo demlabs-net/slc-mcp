@@ -508,11 +508,16 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_task",
-            "description": "Update an existing task",
+            "description": "Update an existing task. Для РЕДАКТИРОВАНИЯ большого тела используй description_patch (дифф: append/prepend/replace_section/remove_section) — НЕ пересылай всю description целиком. Полная description — только для полной замены.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "name": {"type":"string"},
-                "description": {"type":"string"},
+                "description": {"type":"string","description":"полная замена тела (не используй вместе с description_patch)"},
+                "description_patch": {"type":"array","items":{"type":"object","properties":{
+                    "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
+                    "content": {"type":"string"},
+                    "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
+                },"required":["op"]},"description":"дифф-операции, применяются по порядку"},
                 "project_id": {"type":"string"},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "status": {"type":"string","enum":["pending","active","completed","cancelled"]},
@@ -582,11 +587,16 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_project",
-            "description": "Update an existing project",
+            "description": "Update an existing project. Для редактирования большого тела используй description_patch (дифф), полную description — только для полной замены.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
                 "name": {"type":"string"},
-                "description": {"type":"string"},
+                "description": {"type":"string","description":"полная замена тела"},
+                "description_patch": {"type":"array","items":{"type":"object","properties":{
+                    "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
+                    "content": {"type":"string"},
+                    "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
+                },"required":["op"]}},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "status": {"type":"string","enum":["active","archived"]},
                 "metadata": {"type":"object"}
@@ -735,7 +745,9 @@ pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инс�
 4. **Обогащай по ходу.** После значимых шагов обновляй документы
    (`add_document` с тем же document_id — upsert): статусы, решения,
    новые факты. История (remember) — это сырьё, а документы — рабочий
-   артефакт.
+   артефакт. Задачи/проекты обновляй ДИФФОМ (`update_task` c
+   `description_patch`: append / replace_section / remove_section) —
+   НЕ пересылай всю description целиком, если меняешь часть тела.
 5. **auto_load vs references (важно, не путай).**
    - `auto_load` — РАБОЧИЕ связи: документы, которые должны подтягиваться
      в контекст при обновлении этого документа (состав, зависимости,
@@ -1452,6 +1464,10 @@ async fn call_tool(
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
             let description = args.get("description").and_then(|v| v.as_str());
+            let description_patch = args.get("description_patch").cloned();
+            if description.is_some() && description_patch.is_some() {
+                return Err(json!({"code": -32602, "message": "pass either description (полная замена) or description_patch (дифф), не оба"}));
+            }
             let project_id = args
                 .get("project_id")
                 .and_then(|v| v.as_str())
@@ -1467,6 +1483,7 @@ async fn call_tool(
                     task_id,
                     name,
                     description,
+                    description_patch.as_ref(),
                     project_id,
                     auto_load.as_deref(),
                     status,
@@ -1475,7 +1492,11 @@ async fn call_tool(
                 .await
                 .map_err(json_err)?
             {
-                Some(_) => json!({"success": true, "task_id": task_id, "message": "Task updated"}),
+                Some(_) => {
+                    // Тело изменилось — пере-эмбеддинг для семантического поиска.
+                    let _ = engine.reembed_document(task_id).await;
+                    json!({"success": true, "task_id": task_id, "message": "Task updated"})
+                }
                 None => json!({"success": false, "error": format!("Task not found: {task_id}")}),
             }
         }
@@ -1588,6 +1609,10 @@ async fn call_tool(
                 .unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
             let description = args.get("description").and_then(|v| v.as_str());
+            let description_patch = args.get("description_patch").cloned();
+            if description.is_some() && description_patch.is_some() {
+                return Err(json!({"code": -32602, "message": "pass either description (полная замена) or description_patch (дифф), не оба"}));
+            }
             let auto_load = args.get("auto_load").map(|_| str_array(args, "auto_load"));
             let status = args.get("status").and_then(|v| v.as_str());
             let metadata = args.get("metadata").cloned();
@@ -1597,6 +1622,7 @@ async fn call_tool(
                     project_id,
                     name,
                     description,
+                    description_patch.as_ref(),
                     auto_load.as_deref(),
                     status,
                     metadata.as_ref(),
@@ -1605,6 +1631,7 @@ async fn call_tool(
                 .map_err(json_err)?
             {
                 Some(_) => {
+                    let _ = engine.reembed_document(project_id).await;
                     json!({"success": true, "project_id": project_id, "message": "Project updated"})
                 }
                 None => {
