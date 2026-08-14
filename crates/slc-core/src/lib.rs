@@ -146,6 +146,12 @@ pub struct SlcConfig {
     /// Use the MCP client's own inference (sampling) as the LLM — the
     /// fallback for weak machines without a local GPU/LLM server.
     pub mcp_sampling: bool,
+    /// AI document placement: on `add_document` the reasoning LLM decides
+    /// which existing project the document belongs to (folder resolved from
+    /// `metadata.extra["project"]`). Best-effort — hash/candle providers
+    /// without reasoning simply keep the default folder. Disable with
+    /// `SLC_AI_ORGANIZE=false`.
+    pub ai_organize: bool,
 }
 
 impl Default for SlcConfig {
@@ -177,7 +183,85 @@ impl Default for SlcConfig {
                 .unwrap_or(8000),
             mongodb_uri: std::env::var("SLC_MONGODB_URI").ok(),
             mcp_sampling: std::env::var("SLC_MCP_SAMPLING").is_ok_and(|v| v == "true" || v == "1"),
+            ai_organize: std::env::var("SLC_AI_ORGANIZE")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
         }
+    }
+}
+
+/// AI document placement: ask the reasoning LLM which existing project the
+/// document belongs to; on a match, bind it via `metadata.extra["project"]`
+/// (the folder is resolved from that by [`model::Document::default_folder`]).
+/// Best-effort by design — any failure leaves the document at its default
+/// folder (hash/candle providers without reasoning simply never match).
+async fn organize_document(
+    llm: &dyn LlmClient,
+    store: &dyn StorageBackend,
+    doc: &mut model::Document,
+) {
+    if doc.category == model::DocumentCategory::History
+        || doc.category == model::DocumentCategory::Project
+    {
+        return;
+    }
+    let Ok(projects) = store
+        .kb_find(
+            &DocFilter {
+                category: Some(model::DocumentCategory::Project),
+                ..Default::default()
+            },
+            &DocSort::by_created(SortDir::Asc),
+            200,
+        )
+        .await
+    else {
+        return;
+    };
+    if projects.is_empty() {
+        return;
+    }
+    let names: Vec<String> = projects
+        .iter()
+        .map(|p| {
+            let name = p
+                .metadata
+                .extra
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&p.document_id);
+            format!("{}: {}", p.document_id, name)
+        })
+        .collect();
+    let snippet: String = doc.content.chars().take(800).collect();
+    let prompt = format!(
+        "Ты — организатор документов памяти SLC. Определи, к какому проекту относится документ.\n\
+         Существующие проекты (id: имя):\n{}\n\
+         Категория документа: {}\n\
+         Если документ явно относится к одному из проектов — ответь ТОЛЬКО его id.\n\
+         Иначе ответь: none\n\n\
+         Документ:\n{snippet}",
+        names.join("\n"),
+        doc.category.as_str(),
+    );
+    let Ok(answer) = llm.reason(&prompt).await else { return };
+    let answer = answer.trim().to_lowercase();
+    if answer.is_empty() || answer == "none" {
+        return;
+    }
+    let matched = projects.iter().find(|p| p.document_id == answer).or_else(|| {
+        projects.iter().find(|p| {
+            p.metadata
+                .extra
+                .get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| n.to_lowercase() == answer)
+        })
+    });
+    if let Some(p) = matched {
+        doc.metadata
+            .extra
+            .insert("project".into(), serde_json::json!(p.document_id));
     }
 }
 
@@ -376,7 +460,19 @@ impl SlcEngine {
 
     // ── knowledge base (RAG-eligible) ────────────────────────────
 
-    pub async fn add_document(&self, doc: &Document) -> SlcResult<()> {
+    /// Add a KB document. With `config.ai_organize` and no explicit
+    /// `folder`, the reasoning LLM first decides which existing project the
+    /// document belongs to — the folder is then resolved hierarchically
+    /// (`docs/projects/<p>/<category>/` or `docs/<category>/`). Best-effort:
+    /// any LLM failure/timeout keeps the default folder.
+    pub async fn add_document(&self, doc: &mut Document) -> SlcResult<()> {
+        if self.config.ai_organize && doc.folder.is_none() {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(25),
+                organize_document(&*self.llm, self.store.as_ref(), doc),
+            )
+            .await;
+        }
         self.store.kb_insert(doc).await?;
         // Best-effort embedding so semantic search covers KB documents (never
         // fails the insert; the model may still be downloading).

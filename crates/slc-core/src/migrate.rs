@@ -112,13 +112,14 @@ fn human_id(prefix: &str, fm: &Map<String, Value>, body: &str) -> String {
     }
 }
 
+/// Category id prefix. Only the diary keeps a prefix (`history_…`); all
+/// other documents are named without one — the folder tree (`docs/`,
+/// `docs/projects/<p>/`, `tasks/`) already carries the category context.
 fn category_prefix(cat: DocumentCategory) -> &'static str {
-    match cat {
-        DocumentCategory::Project => "project_",
-        DocumentCategory::Task => "task_",
-        DocumentCategory::Skill => "skill_",
-        DocumentCategory::History => "history_",
-        _ => "doc_",
+    if cat == DocumentCategory::History {
+        "history_"
+    } else {
+        ""
     }
 }
 
@@ -319,6 +320,10 @@ pub struct MongoMigrateReport {
     pub documents: usize,
     /// Episodic history docs imported (diary, not RAG).
     pub history: usize,
+    /// Project documents imported (`docs/projects/<slug>/<slug>.md`).
+    pub projects: usize,
+    /// Task documents imported (`docs/projects/<p>/tasks/` or `tasks/`).
+    pub tasks: usize,
     /// Seats imported.
     pub seats: usize,
     /// KB ids renamed by the LLM (`--rename-with-ai`).
@@ -484,8 +489,9 @@ fn unique(base: String, used: &mut HashSet<String>) -> String {
     }
 }
 
-/// KB id: AI slug (if provided) or deterministic fallback, with the category
-/// prefix; deduped against `used`.
+/// KB id: AI slug (if provided) or deterministic fallback (heading slug →
+/// sanitized legacy id), deduped against `used`. No category prefixes —
+/// the folder tree carries the category context.
 fn new_kb_id(doc: &LegacyDoc, ai: Option<String>, used: &mut HashSet<String>) -> String {
     let base = match ai {
         Some(slug) if !slug.is_empty() => {
@@ -494,15 +500,13 @@ fn new_kb_id(doc: &LegacyDoc, ai: Option<String>, used: &mut HashSet<String>) ->
         _ => {
             let slug = doc_slug(doc);
             if slug.is_empty() {
-                format!(
-                    "{}legacy_{}",
-                    category_prefix(doc_category(doc)),
-                    doc.document_id
-                        .chars()
-                        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .take(24)
-                        .collect::<String>()
-                )
+                // Deterministic fallback on the legacy id itself (readable
+                // and stable: `core_slc_manifest`, `documentation_abc…`).
+                doc.document_id
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .take(64)
+                    .collect::<String>()
             } else {
                 format!("{}{}", category_prefix(doc_category(doc)), slug)
             }
@@ -622,13 +626,17 @@ fn extract_legacy_seat(raw: &BsonDoc) -> Option<Seat> {
     })
 }
 
-/// Migrate the legacy Python MongoDB (`knowledge_base` + `seats` collections)
-/// into `target` (any new backend; Obsidian vault by default).
+/// Migrate the legacy Python MongoDB (`knowledge_base`, `projects`, `tasks`
+/// and `seats` collections) into `target` (any new backend; Obsidian vault
+/// by default).
 ///
 /// - KB documents keep their ids by default; with `rename_with_ai` the
 ///   reasoning LLM from the environment proposes meaningful ids and
 ///   `auto_load`/`references` are rewritten to the new ids.
 /// - `history` docs go to the episodic store (diary layout), not the KB.
+/// - Projects become `Project` documents (`docs/projects/<slug>/`), tasks
+///   are bound to their legacy project via `metadata.extra["project"]` and
+///   land in `docs/projects/<p>/tasks/` (or `tasks/` without a project).
 /// - Seats are imported Active and non-expiring (all seat ids keep working);
 ///   the original status/expiry survive in `metadata.legacy_*`.
 pub async fn migrate_legacy_mongo(
@@ -642,6 +650,163 @@ pub async fn migrate_legacy_mongo(
         .map_err(|e| SlcError::Storage(format!("mongodb connect: {e}")))?;
     let db = client.database(&opts.database);
     let mut report = MongoMigrateReport::default();
+    let now = Utc::now();
+
+    // ── projects → Project documents ──
+    let mut project_by_id: HashMap<String, String> = HashMap::new(); // legacy project_id → new id
+    let mut jobs: Vec<(Document, bool)> = Vec::new(); // (document, is_history)
+    let mut used = HashSet::new();
+    {
+        let projects: Collection<BsonDoc> = db.collection("projects");
+        let mut cursor = projects
+            .find(doc! {})
+            .await
+            .map_err(|e| SlcError::Storage(format!("projects find: {e}")))?;
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let raw: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+            let Some(project_id) = raw.get_str("project_id").ok().map(String::from) else {
+                continue;
+            };
+            let name = raw.get_str("name").unwrap_or("").to_string();
+            let slug = slugify(&name);
+            let new_id = unique(
+                if slug.is_empty() {
+                    project_id
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .take(64)
+                        .collect::<String>()
+                } else {
+                    slug
+                },
+                &mut used,
+            );
+            let mut meta = DocMeta::default();
+            meta.extra.insert("legacy_id".into(), json!(project_id));
+            meta.extra.insert("name".into(), json!(name));
+            let content = raw.get_str("description").unwrap_or("").to_string();
+            let doc = Document {
+                document_id: new_id.clone(),
+                category: DocumentCategory::Project,
+                folder: None,
+                content,
+                content_hash: String::new(),
+                metadata: meta,
+                tags: vec![],
+                auto_load: vec![],
+                references: vec![],
+                seat_id: None,
+                created_at: raw
+                    .get_datetime("created_at")
+                    .ok()
+                    .map(|d| d.to_chrono())
+                    .unwrap_or(now),
+                updated_at: raw
+                    .get_datetime("updated_at")
+                    .ok()
+                    .map(|d| d.to_chrono())
+                    .unwrap_or(now),
+                version: 1,
+                deleted_at: None,
+            };
+            project_by_id.insert(project_id, new_id);
+            jobs.push((doc, false));
+        }
+    }
+
+    // ── tasks → Task documents (bound to projects via metadata.project) ──
+    {
+        let tasks: Collection<BsonDoc> = db.collection("tasks");
+        let mut cursor = tasks
+            .find(doc! {})
+            .await
+            .map_err(|e| SlcError::Storage(format!("tasks find: {e}")))?;
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let raw: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+            let Some(task_id) = raw.get_str("task_id").ok().map(String::from) else {
+                continue;
+            };
+            let slug = slugify(&task_id);
+            let new_id = unique(
+                if slug.is_empty() {
+                    task_id
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .take(64)
+                        .collect::<String>()
+                } else {
+                    slug
+                },
+                &mut used,
+            );
+            let mut meta = DocMeta::default();
+            meta.extra.insert("legacy_id".into(), json!(task_id));
+            for k in ["name", "status", "priority"] {
+                if let Ok(v) = raw.get_str(k) {
+                    meta.extra.insert(k.into(), json!(v));
+                }
+            }
+            if let Ok(pid) = raw.get_str("project_id") {
+                match project_by_id.get(pid) {
+                    Some(p) => {
+                        meta.extra.insert("project".into(), json!(p));
+                    }
+                    None => {
+                        meta.extra.insert("legacy_project_id".into(), json!(pid));
+                    }
+                }
+            }
+            // Body: description; if empty — the original task data survives
+            // in metadata (original_data), so dump it as the content.
+            let mut content = raw.get_str("description").unwrap_or("").to_string();
+            if content.trim().is_empty() {
+                if let Ok(od) = raw
+                    .get_document("metadata")
+                    .and_then(|m| m.get_document("original_data"))
+                {
+                    content = serde_json::to_string_pretty(&bson_doc_to_map(od)).unwrap_or_default();
+                }
+            }
+            let seat_id = raw.get_str("seat_id").ok().map(String::from);
+            let doc = Document {
+                document_id: new_id,
+                category: DocumentCategory::Task,
+                folder: None,
+                content,
+                content_hash: String::new(),
+                metadata: meta,
+                tags: vec![],
+                auto_load: bson_strs(&raw, "auto_load"),
+                references: vec![],
+                seat_id,
+                created_at: raw
+                    .get_datetime("created_at")
+                    .ok()
+                    .map(|d| d.to_chrono())
+                    .unwrap_or(now),
+                updated_at: raw
+                    .get_datetime("updated_at")
+                    .ok()
+                    .map(|d| d.to_chrono())
+                    .unwrap_or(now),
+                version: 1,
+                deleted_at: None,
+            };
+            jobs.push((doc, false));
+        }
+    }
 
     // ── knowledge_base → KB documents + episodic diary ──
     let kb: Collection<BsonDoc> = db.collection("knowledge_base");
@@ -668,14 +833,13 @@ pub async fn migrate_legacy_mongo(
     // Deterministic order → stable ids across runs.
     docs.sort_by_key(|d| d.created_at);
 
-    let mut used = HashSet::new();
     let mut id_map: HashMap<String, String> = HashMap::new();
-    let mut jobs = Vec::with_capacity(docs.len());
-    for (i, doc) in docs.into_iter().enumerate() {
+    let mut kb_jobs: Vec<(LegacyDoc, String)> = Vec::with_capacity(docs.len());
+    for doc in docs {
         if doc_category(&doc) == DocumentCategory::History {
             let new_id = unique(history_id(&doc.document_id, doc.created_at), &mut used);
             id_map.insert(doc.document_id.clone(), new_id.clone());
-            jobs.push((doc, new_id));
+            kb_jobs.push((doc, new_id));
             continue;
         }
         let ai = if rename_with_ai {
@@ -697,54 +861,44 @@ pub async fn migrate_legacy_mongo(
         if new_id != doc.document_id {
             id_map.insert(doc.document_id.clone(), new_id.clone());
         }
-        jobs.push((doc, new_id));
-        if (i + 1) % 25 == 0 {
-            tracing::info!("migrate: обработано {} документов", i + 1);
-        }
+        kb_jobs.push((doc, new_id));
     }
 
-    let now = Utc::now();
-    for (doc, new_id) in jobs {
-        let cat = doc_category(&doc);
-        let legacy_id = doc.document_id.clone();
-        let mut meta = DocMeta {
-            doc_type: doc.doc_type,
-            ..Default::default()
-        };
-        meta.extra = doc.metadata;
-        meta.extra.insert("legacy_id".into(), json!(legacy_id));
-        let content = doc.content;
-        let content_hash_value = content_hash(&content);
-        let document = Document {
-            document_id: new_id,
-            category: cat,
-            folder: None,
-            content,
-            content_hash: content_hash_value,
-            metadata: meta,
-            tags: doc.tags,
-            auto_load: fix_links(&doc.auto_load, &id_map),
-            references: fix_links(&doc.references, &id_map),
-            seat_id: doc.seat_id,
-            created_at: doc.created_at.unwrap_or(now),
-            updated_at: doc.updated_at.unwrap_or(now),
-            version: doc.version.max(1),
-            deleted_at: None,
-        };
-        let res = if cat == DocumentCategory::History {
+    // Insert KB docs (links rewritten only after the FULL id map is known).
+    for (doc, new_id) in kb_jobs {
+        let is_history = doc_category(&doc) == DocumentCategory::History;
+        let document = build_migrated_doc(doc, new_id, &id_map, now);
+        let res = if is_history {
             target.episodic_upsert(&document).await
         } else {
             target.kb_upsert(&document).await
         };
         match res {
             Ok(_) => {
-                if cat == DocumentCategory::History {
+                if is_history {
                     report.history += 1;
                 } else {
                     report.documents += 1;
                 }
             }
-            Err(e) => report.errors.push(format!("{} ({})", document.document_id, e)),
+            Err(e) => report.errors.push(format!("{} ({e})", document.document_id)),
+        }
+    }
+
+    // ── projects / tasks (planned above) ──
+    for (mut document, _) in jobs {
+        document.content_hash = content_hash(&document.content);
+        document.auto_load = fix_links(&document.auto_load, &id_map);
+        document.references = fix_links(&document.references, &id_map);
+        match target.kb_upsert(&document).await {
+            Ok(_) => {
+                if document.category == DocumentCategory::Project {
+                    report.projects += 1;
+                } else {
+                    report.tasks += 1;
+                }
+            }
+            Err(e) => report.errors.push(format!("{} ({e})", document.document_id)),
         }
     }
 
@@ -771,6 +925,40 @@ pub async fn migrate_legacy_mongo(
     }
 
     Ok(report)
+}
+
+/// Build the final `Document` for a migrated KB doc (folder auto-resolved
+/// by the engine, links rewritten through `id_map`).
+fn build_migrated_doc(
+    doc: LegacyDoc,
+    new_id: String,
+    id_map: &HashMap<String, String>,
+    now: DateTime<Utc>,
+) -> Document {
+    let cat = doc_category(&doc);
+    let legacy_id = doc.document_id.clone();
+    let mut meta = DocMeta {
+        doc_type: doc.doc_type,
+        ..Default::default()
+    };
+    meta.extra = doc.metadata;
+    meta.extra.insert("legacy_id".into(), json!(legacy_id));
+    Document {
+        document_id: new_id,
+        category: cat,
+        folder: None,
+        content: doc.content,
+        content_hash: String::new(),
+        metadata: meta,
+        tags: doc.tags,
+        auto_load: fix_links(&doc.auto_load, id_map),
+        references: fix_links(&doc.references, id_map),
+        seat_id: doc.seat_id,
+        created_at: doc.created_at.unwrap_or(now),
+        updated_at: doc.updated_at.unwrap_or(now),
+        version: doc.version.max(1),
+        deleted_at: None,
+    }
 }
 
 #[cfg(test)]
@@ -849,7 +1037,8 @@ mod tests {
 
         // Human-readable ids: slug from the name/title (here the legacy id
         // already equals the slug, so the same document is found by it).
-        let proj = store.kb_get("project_vassista_plan").await.unwrap().expect("project doc");
+        // No category prefixes anymore — the folder tree carries context.
+        let proj = store.kb_get("vassista_plan").await.unwrap().expect("project doc");
         assert_eq!(proj.category, DocumentCategory::Project);
         let by_new = store
             .kb_find(
@@ -863,11 +1052,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(by_new.len(), 1);
-        assert_eq!(by_new[0].document_id, "project_vassista_plan");
+        assert_eq!(by_new[0].document_id, "vassista_plan");
         assert_eq!(by_new[0].content, "План платформы Vassista");
         assert_eq!(by_new[0].seat_id.as_deref(), Some("seat_a"));
 
-        let skill = store.kb_get("skill_rust_basics").await.unwrap().expect("slugged skill id");
+        let skill = store.kb_get("rust_basics").await.unwrap().expect("slugged skill id");
         assert_eq!(skill.category, DocumentCategory::Skill);
         assert_eq!(skill.content, "Как работать с borrow checker");
 
@@ -1078,18 +1267,18 @@ mod tests {
         };
         let mut used = HashSet::new();
         let ai = new_kb_id(&d, Some("migration_slc_plan".into()), &mut used);
-        assert_eq!(ai, "doc_migration_slc_plan");
+        assert_eq!(ai, "migration_slc_plan", "AI-слаг без категорийного префикса");
         // Без AI: латинское "SLC" в заголовке даёт ascii-slug.
         let fb = new_kb_id(&d, None, &mut used);
-        assert_eq!(fb, "doc_slc");
-        // Киррилический текст без заголовка — тот же fallback.
+        assert_eq!(fb, "slc");
+        // Киррилический текст без заголовка — fallback на осмысленный legacy id.
         let d2 = LegacyDoc {
             document_id: "doc_a1b2c3".into(),
             content: "просто кириллический текст".into(),
             ..Default::default()
         };
         let mut used2 = HashSet::new();
-        assert_eq!(new_kb_id(&d2, None, &mut used2), "doc_legacy_doc_a1b2c3");
+        assert_eq!(new_kb_id(&d2, None, &mut used2), "doc_a1b2c3");
     }
 
     #[tokio::test]
@@ -1116,6 +1305,89 @@ mod tests {
         map.insert("old_b".to_string(), "doc_new_b".to_string());
         let out = fix_links(&["old_a".into(), "ghost".into(), "old_b".into()], &map);
         assert_eq!(out, vec!["doc_new_a", "ghost", "doc_new_b"]);
+    }
+
+    #[test]
+    fn hierarchical_default_folders() {
+        // Knowledge categories live under docs/ (no prefix, folders carry context).
+        assert_eq!(
+            Document::new("manifest", DocumentCategory::Core, "x", Default::default(), vec![], None)
+                .default_folder(),
+            "docs/core"
+        );
+        assert_eq!(
+            Document::new("notes", DocumentCategory::Custom, "x", Default::default(), vec![], None)
+                .default_folder(),
+            "docs/custom"
+        );
+        assert_eq!(
+            Document::new("guide", DocumentCategory::Documentation, "x", Default::default(), vec![], None)
+                .default_folder(),
+            "docs"
+        );
+        assert_eq!(
+            Document::new("audit", DocumentCategory::Task, "x", Default::default(), vec![], None)
+                .default_folder(),
+            "tasks"
+        );
+
+        // Project note: docs/projects/<slug>/ (legacy `project_` stripped).
+        let proj = Document::new("slc", DocumentCategory::Project, "x", Default::default(), vec![], None);
+        assert_eq!(proj.default_folder(), "docs/projects/slc");
+        let mut proj2 = Document::new("project_slc", DocumentCategory::Project, "x", Default::default(), vec![], None);
+        assert_eq!(proj2.default_folder(), "docs/projects/slc");
+        // Explicit metadata.project wins even for a project note.
+        let mut m = DocMeta::default();
+        m.extra.insert("project".into(), json!("cellframe"));
+        proj2.metadata = m;
+        assert_eq!(proj2.default_folder(), "docs/projects/cellframe");
+
+        // Docs bound to a project go inside its folder, per-category subfolder.
+        let mut meta = DocMeta::default();
+        meta.extra.insert("project".into(), json!("slc"));
+        let task = Document::new("migration", DocumentCategory::Task, "x", meta.clone(), vec![], None);
+        assert_eq!(task.default_folder(), "docs/projects/slc/tasks");
+        let note = Document::new("mcp-setup", DocumentCategory::Documentation, "x", meta, vec![], None);
+        assert_eq!(note.default_folder(), "docs/projects/slc/docs");
+
+        // project slug is sanitized — cannot escape the projects tree.
+        let mut evil = DocMeta::default();
+        evil.extra.insert("project".into(), json!("../../etc/passwd"));
+        let d = Document::new("x", DocumentCategory::Custom, "x", evil, vec![], None);
+        assert_eq!(d.default_folder(), "docs/projects/etc_passwd/custom");
+    }
+
+    #[test]
+    fn build_migrated_doc_fixes_links_and_keeps_binding() {
+        let mut id_map = HashMap::new();
+        id_map.insert("documentation_abc".into(), "mcp_setup".into());
+        let doc = LegacyDoc {
+            document_id: "custom_old".into(),
+            category: Some("documentation".into()),
+            content: "текст".into(),
+            doc_type: Some("plan".into()),
+            metadata: {
+                let mut m = Map::new();
+                m.insert("project".into(), json!("slc"));
+                m
+            },
+            tags: vec!["x".into()],
+            auto_load: vec!["documentation_abc".into(), "missing".into()],
+            references: vec![],
+            seat_id: None,
+            created_at: None,
+            updated_at: None,
+            version: 2,
+            deleted_at: None,
+        };
+        let out = build_migrated_doc(doc, "mcp_setup".into(), &id_map, Utc::now());
+        assert_eq!(out.document_id, "mcp_setup");
+        assert_eq!(out.auto_load, vec!["mcp_setup", "missing"]);
+        assert_eq!(out.metadata.doc_type.as_deref(), Some("plan"));
+        assert_eq!(out.metadata.extra["legacy_id"], "custom_old");
+        assert_eq!(out.metadata.extra["project"], "slc", "привязка к проекту сохраняется");
+        assert_eq!(out.version, 2);
+        assert_eq!(out.default_folder(), "docs/projects/slc/docs");
     }
 
     impl Default for LegacyDoc {
