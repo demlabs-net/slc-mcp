@@ -540,6 +540,116 @@ fn fix_links(ids: &[String], id_map: &HashMap<String, String>) -> Vec<String> {
         .collect()
 }
 
+/// Normalize a legacy task status into the canonical set
+/// (`IN_WORK | PENDING | COMPLETED | CANCELLED`); unknown → `None`
+/// (no status is written).
+fn normalize_task_status(raw: &str) -> Option<&'static str> {
+    let norm: String = raw
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    match norm.as_str() {
+        "active" | "inprogress" | "inwork" | "running" | "started" | "wip" | "doing" => {
+            Some("IN_WORK")
+        }
+        "pending" | "planned" | "backlog" | "queued" | "scheduled" | "open" | "new" => {
+            Some("PENDING")
+        }
+        "completed" | "done" | "closed" | "finished" | "resolved" | "merged" | "released" => {
+            Some("COMPLETED")
+        }
+        "cancelled" | "canceled" | "rejected" | "abandoned" | "wontfix" => Some("CANCELLED"),
+        _ => None,
+    }
+}
+
+/// Human-readable id for a legacy task: AI slug (`--rename-with-ai`, based on
+/// name/description/original_data) or a deterministic slug from name →
+/// description → original_data → task_id.
+async fn task_new_id(
+    raw: &BsonDoc,
+    task_id: &str,
+    name: &str,
+    description: &str,
+    llm: Option<&dyn LlmClient>,
+    rename_with_ai: bool,
+    used: &mut HashSet<String>,
+) -> String {
+    let original_data = || {
+        raw.get_document("metadata")
+            .and_then(|m| m.get_document("original_data"))
+            .map(|od| serde_json::to_string_pretty(&bson_doc_to_map(od)).unwrap_or_default())
+            .unwrap_or_default()
+    };
+    let fallback = || {
+        for c in [name.to_string(), description.to_string(), original_data()] {
+            let slug = slugify(&c);
+            if !slug.is_empty() {
+                return slug;
+            }
+        }
+        let slug = slugify(task_id);
+        if !slug.is_empty() {
+            slug
+        } else {
+            task_id
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .take(64)
+                .collect()
+        }
+    };
+    let base = if rename_with_ai {
+        match llm {
+            Some(l) => {
+                let content = format!("{name}\n{description}\n{}", original_data());
+                let doc = LegacyDoc {
+                    document_id: task_id.to_string(),
+                    category: Some("task".into()),
+                    content,
+                    ..Default::default()
+                };
+                match tokio::time::timeout(Duration::from_secs(30), ai_slug(l, &doc)).await {
+                    Ok(Some(slug)) => slug,
+                    _ => fallback(),
+                }
+            }
+            None => fallback(),
+        }
+    } else {
+        fallback()
+    };
+    unique(base, used)
+}
+
+/// Restore the seat's legacy active-task pointer: task ids were renamed, so
+/// the old id is resolved through `id_map` into the new anchor. Returns true
+/// when the anchor was restored (the `legacy_active_task_id` metadata key is
+/// removed in that case).
+fn restore_seat_anchor(seat: &mut Seat, id_map: &HashMap<String, String>) -> bool {
+    let Some(old) = seat
+        .metadata
+        .remove("legacy_active_task_id")
+        .and_then(|v| v.as_str().map(String::from))
+    else {
+        return false;
+    };
+    match id_map.get(&old) {
+        Some(new_id) => {
+            seat.active_task_id = Some(new_id.clone());
+            seat.active_document_id = Some(new_id.clone());
+            true
+        }
+        None => {
+            // The referenced task did not survive the migration — keep the
+            // reference for tracing.
+            seat.metadata.insert("legacy_active_task_id".into(), json!(old));
+            false
+        }
+    }
+}
+
 /// Legacy seat → new `Seat`. All seats are imported ACTIVE and non-expiring
 /// (every legacy seat id keeps working); the original status/expiry/active
 /// task are preserved in `metadata.legacy_*`. Handles both field layouts:
@@ -626,6 +736,26 @@ fn extract_legacy_seat(raw: &BsonDoc) -> Option<Seat> {
     })
 }
 
+impl Default for LegacyDoc {
+    fn default() -> Self {
+        LegacyDoc {
+            document_id: String::new(),
+            category: None,
+            content: String::new(),
+            doc_type: None,
+            metadata: Map::new(),
+            tags: Vec::new(),
+            auto_load: Vec::new(),
+            references: Vec::new(),
+            seat_id: None,
+            created_at: None,
+            updated_at: None,
+            version: 1,
+            deleted_at: None,
+        }
+    }
+}
+
 /// Migrate the legacy Python MongoDB (`knowledge_base`, `projects`, `tasks`
 /// and `seats` collections) into `target` (any new backend; Obsidian vault
 /// by default).
@@ -651,6 +781,9 @@ pub async fn migrate_legacy_mongo(
     let db = client.database(&opts.database);
     let mut report = MongoMigrateReport::default();
     let now = Utc::now();
+    // old id → new id for every renamed document (projects, tasks, KB) —
+    // used to rewrite auto_load/references and restore seat anchors.
+    let mut id_map: HashMap<String, String> = HashMap::new();
 
     // ── projects → Project documents ──
     let mut project_by_id: HashMap<String, String> = HashMap::new(); // legacy project_id → new id
@@ -687,6 +820,7 @@ pub async fn migrate_legacy_mongo(
                 },
                 &mut used,
             );
+            id_map.insert(project_id.clone(), new_id.clone());
             let mut meta = DocMeta::default();
             meta.extra.insert("legacy_id".into(), json!(project_id));
             meta.extra.insert("name".into(), json!(name));
@@ -738,25 +872,24 @@ pub async fn migrate_legacy_mongo(
             let Some(task_id) = raw.get_str("task_id").ok().map(String::from) else {
                 continue;
             };
-            let slug = slugify(&task_id);
-            let new_id = unique(
-                if slug.is_empty() {
-                    task_id
-                        .chars()
-                        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .take(64)
-                        .collect::<String>()
-                } else {
-                    slug
-                },
-                &mut used,
-            );
+            let name = raw.get_str("name").unwrap_or("").to_string();
+            let description = raw.get_str("description").unwrap_or("").to_string();
+            let new_id =
+                task_new_id(&raw, &task_id, &name, &description, llm, rename_with_ai, &mut used)
+                    .await;
+            id_map.insert(task_id.clone(), new_id.clone());
             let mut meta = DocMeta::default();
             meta.extra.insert("legacy_id".into(), json!(task_id));
-            for k in ["name", "status", "priority"] {
-                if let Ok(v) = raw.get_str(k) {
-                    meta.extra.insert(k.into(), json!(v));
+            if !name.is_empty() {
+                meta.extra.insert("name".into(), json!(name));
+            }
+            if let Ok(st) = raw.get_str("status") {
+                if let Some(norm) = normalize_task_status(st) {
+                    meta.extra.insert("status".into(), json!(norm));
                 }
+            }
+            if let Ok(p) = raw.get_str("priority") {
+                meta.extra.insert("priority".into(), json!(p));
             }
             if let Ok(pid) = raw.get_str("project_id") {
                 match project_by_id.get(pid) {
@@ -770,7 +903,7 @@ pub async fn migrate_legacy_mongo(
             }
             // Body: description; if empty — the original task data survives
             // in metadata (original_data), so dump it as the content.
-            let mut content = raw.get_str("description").unwrap_or("").to_string();
+            let mut content = description;
             if content.trim().is_empty() {
                 if let Ok(od) = raw
                     .get_document("metadata")
@@ -833,7 +966,9 @@ pub async fn migrate_legacy_mongo(
     // Deterministic order → stable ids across runs.
     docs.sort_by_key(|d| d.created_at);
 
-    let mut id_map: HashMap<String, String> = HashMap::new();
+    // NOTE: `id_map` is shared — it already carries projects/tasks renames;
+    // KB renames are added below. Never re-declare it here (shadowing would
+    // drop the earlier mappings and break links + seat anchors).
     let mut kb_jobs: Vec<(LegacyDoc, String)> = Vec::with_capacity(docs.len());
     for doc in docs {
         if doc_category(&doc) == DocumentCategory::History {
@@ -916,7 +1051,9 @@ pub async fn migrate_legacy_mongo(
         let raw: BsonDoc = cursor
             .deserialize_current()
             .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
-        let Some(seat) = extract_legacy_seat(&raw) else { continue };
+        let Some(mut seat) = extract_legacy_seat(&raw) else { continue };
+        // Task ids were renamed — restore the legacy active-task anchor.
+        restore_seat_anchor(&mut seat, &id_map);
         if let Err(e) = target.insert_seat(&seat).await {
             report.errors.push(format!("seat {}: {e}", seat.seat_id));
         } else {
@@ -1390,23 +1527,107 @@ mod tests {
         assert_eq!(out.default_folder(), "docs/projects/slc/docs");
     }
 
-    impl Default for LegacyDoc {
-        fn default() -> Self {
-            LegacyDoc {
-                document_id: String::new(),
-                category: None,
-                content: String::new(),
-                doc_type: None,
-                metadata: Map::new(),
-                tags: Vec::new(),
-                auto_load: Vec::new(),
-                references: Vec::new(),
-                seat_id: None,
-                created_at: None,
-                updated_at: None,
-                version: 1,
-                deleted_at: None,
-            }
-        }
+    #[test]
+    fn normalize_task_status_maps_to_canonical_set() {
+        assert_eq!(normalize_task_status("active"), Some("IN_WORK"));
+        assert_eq!(normalize_task_status("ACTIVE"), Some("IN_WORK"));
+        assert_eq!(normalize_task_status("in_progress"), Some("IN_WORK"));
+        assert_eq!(normalize_task_status("pending"), Some("PENDING"));
+        assert_eq!(normalize_task_status("PENDING"), Some("PENDING"));
+        assert_eq!(normalize_task_status("planned"), Some("PENDING"));
+        assert_eq!(normalize_task_status("completed"), Some("COMPLETED"));
+        assert_eq!(normalize_task_status("COMPLETED"), Some("COMPLETED"));
+        assert_eq!(normalize_task_status("cancelled"), Some("CANCELLED"));
+        assert_eq!(normalize_task_status("canceled"), Some("CANCELLED"));
+        assert_eq!(normalize_task_status("какой-то мусор"), None);
+        assert_eq!(normalize_task_status(""), None);
+    }
+
+    #[tokio::test]
+    async fn task_new_id_slugs_the_name_and_falls_back() {
+        let raw = bson::doc! {
+            "task_id": "task_15c3c8ca",
+            "name": "VoIP Bridge: односторонний звук — расследование 2026-08-11",
+            "description": "# Односторонний звук: pacing исправлен",
+        };
+        let mut used = HashSet::new();
+        let id = task_new_id(
+            &raw,
+            "task_15c3c8ca",
+            "VoIP Bridge: односторонний звук — расследование 2026-08-11",
+            "# Односторонний звук: pacing исправлен",
+            None,
+            false,
+            &mut used,
+        )
+        .await;
+        assert_eq!(id, "voip_bridge_2026_08_11");
+        // Уникальность: повтор → суффикс.
+        let id2 = task_new_id(
+            &raw,
+            "task_15c3c8ca",
+            "VoIP Bridge: односторонний звук — расследование 2026-08-11",
+            "# Односторонний звук: pacing исправлен",
+            None,
+            false,
+            &mut used,
+        )
+        .await;
+        assert_eq!(id2, "voip_bridge_2026_08_11_2");
+
+        // Пустые name/description → fallback на task_id.
+        let raw3 = bson::doc! { "task_id": "cellframe_staking_security_audit" };
+        let mut used3 = HashSet::new();
+        let id3 = task_new_id(&raw3, "cellframe_staking_security_audit", "", "", None, false, &mut used3).await;
+        assert_eq!(id3, "cellframe_staking_security_audit");
+    }
+
+    #[test]
+    fn restore_seat_anchor_uses_renamed_task_ids() {
+        let mut map = HashMap::new();
+        map.insert("task_15c3c8ca".to_string(), "voip_bridge_one_way_audio".to_string());
+        let mut seat = Seat {
+            seat_id: "seat_a".into(),
+            name: "dev".into(),
+            status: SeatStatus::Active,
+            created_at: Utc::now(),
+            last_accessed: Utc::now(),
+            expires_at: None,
+            metadata: {
+                let mut m = Map::new();
+                m.insert("legacy_active_task_id".into(), json!("task_15c3c8ca"));
+                m
+            },
+            active_task_id: None,
+            active_document_id: None,
+            context: Map::new(),
+            usage_stats: UsageStats::default(),
+        };
+        assert!(restore_seat_anchor(&mut seat, &map));
+        assert_eq!(seat.active_task_id.as_deref(), Some("voip_bridge_one_way_audio"));
+        assert_eq!(seat.active_document_id.as_deref(), Some("voip_bridge_one_way_audio"));
+        assert!(seat.metadata.get("legacy_active_task_id").is_none());
+
+        // Ссылка на несуществующую задачу → legacy-ключ остаётся.
+        let mut seat2 = Seat {
+            seat_id: "seat_b".into(),
+            name: "dev".into(),
+            status: SeatStatus::Active,
+            created_at: Utc::now(),
+            last_accessed: Utc::now(),
+            expires_at: None,
+            metadata: {
+                let mut m = Map::new();
+                m.insert("legacy_active_task_id".into(), json!("task_ghost"));
+                m
+            },
+            active_task_id: None,
+            active_document_id: None,
+            context: Map::new(),
+            usage_stats: UsageStats::default(),
+        };
+        assert!(!restore_seat_anchor(&mut seat2, &map));
+        assert!(seat2.active_task_id.is_none());
+        assert_eq!(seat2.metadata["legacy_active_task_id"], "task_ghost");
     }
 }
