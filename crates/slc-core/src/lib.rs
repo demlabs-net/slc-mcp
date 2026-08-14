@@ -25,6 +25,7 @@ pub mod pagination;
 pub mod proactivity;
 pub mod profiles;
 pub mod reminders;
+pub mod seed;
 pub mod search;
 pub mod seat;
 pub mod storage;
@@ -108,7 +109,17 @@ pub async fn reembed_documents(
     done
 }
 
-/// Отчёт пересборки эмбеддингов (`reindex-embeddings`).
+
+/// Best-effort seeding of core documents (manifest, standards, …) on open.
+async fn seed_core_if_missing(store: &dyn StorageBackend) {
+    match seed::ensure_core_documents(store).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(inserted = n, "seeded core documents"),
+        Err(e) => tracing::warn!("core seeding skipped: {e}"),
+    }
+}
+
+/// Отчёт пересборки эмбеддингов (`reindex-embeddings`). (`reindex-embeddings`).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReindexReport {
     /// Документов всего (в выборке).
@@ -180,7 +191,7 @@ impl Default for SlcConfig {
             context_limit_chars: std::env::var("SLC_CONTEXT_LIMIT_CHARS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(8000),
+                .unwrap_or(100_000),
             mongodb_uri: std::env::var("SLC_MONGODB_URI").ok(),
             mcp_sampling: std::env::var("SLC_MCP_SAMPLING").is_ok_and(|v| v == "true" || v == "1"),
             ai_organize: std::env::var("SLC_AI_ORGANIZE")
@@ -307,6 +318,7 @@ impl SlcEngine {
     /// Async open — required for the MongoDB backend, fine for the others.
     pub async fn open_async(config: SlcConfig) -> SlcResult<Self> {
         let store = Self::open_store(&config).await?;
+        seed_core_if_missing(store.as_ref()).await;
         Ok(Self::with(store, Self::pick_llm(), config))
     }
 
@@ -316,6 +328,7 @@ impl SlcEngine {
         llm: std::sync::Arc<dyn LlmClient>,
     ) -> SlcResult<Self> {
         let store = Self::open_store(&config).await?;
+        seed_core_if_missing(store.as_ref()).await;
         Ok(Self::with(store, llm, config))
     }
 

@@ -310,7 +310,7 @@ impl StorageBackend for SqliteStore {
         let row = doc_to_row(doc)?;
         self.blocking(move |conn| {
             conn.execute(
-                "INSERT INTO documents (document_id, category, folder, content, content_hash, metadata, tags, auto_load, refs, seat_id, created_at, updated_at, version, deleted_at)
+                "INSERT OR REPLACE INTO documents (document_id, category, folder, content, content_hash, metadata, tags, auto_load, refs, seat_id, created_at, updated_at, version, deleted_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11, row.12, row.13],
             )?;

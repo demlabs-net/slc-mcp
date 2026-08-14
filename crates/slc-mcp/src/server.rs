@@ -910,7 +910,17 @@ async fn build_context(
     }
     let mut base_blocks: Vec<Value> = Vec::new();
     if include_base {
-        for base in ["core_slc_manifest", "core_standards"] {
+        // ВСЕ core-документы (манифест, стандарты, методология…), в порядке
+        // приоритета: важнейшие первыми, дропаются последними.
+        for base in [
+            "core_slc_manifest",
+            "core_standards",
+            "core_development_standards",
+            "core_methodology",
+            "core_ai_behavior_correction",
+            "core_reflection_system",
+            "core_project",
+        ] {
             if let Ok(Some(d)) = engine.get_document(base).await {
                 used += d.content.chars().count();
                 base_blocks.push(json!({"id": base, "type": "base", "content": d.content}));
@@ -918,32 +928,28 @@ async fn build_context(
         }
     }
 
-    // Compression: drop whole blocks by priority until it fits.
-    let mut omitted: Vec<&str> = Vec::new();
-    if used > limit && !base_blocks.is_empty() {
-        for b in &base_blocks {
-            used = used.saturating_sub(
-                b["content"]
-                    .as_str()
-                    .map(|s| s.chars().count())
-                    .unwrap_or(0),
-            );
+    // Compression: drop whole blocks by priority until it fits — по одному,
+    // начиная с наименее важных (последних), чтобы манифест и стандарты
+    // остались в контексте даже при жёстком лимите.
+    let mut omitted: Vec<String> = Vec::new();
+    let mut drop_while_overflow = |blocks: &mut Vec<Value>, omitted: &mut Vec<String>| {
+        while used > limit {
+            match blocks.pop() {
+                Some(b) => {
+                    used = used.saturating_sub(
+                        b["content"]
+                            .as_str()
+                            .map(|s| s.chars().count())
+                            .unwrap_or(0),
+                    );
+                    omitted.push(b["id"].as_str().unwrap_or("block").to_string());
+                }
+                None => break,
+            }
         }
-        omitted.push("base_docs");
-        base_blocks.clear();
-    }
-    if used > limit && !profile_blocks.is_empty() {
-        for b in &profile_blocks {
-            used = used.saturating_sub(
-                b["content"]
-                    .as_str()
-                    .map(|s| s.chars().count())
-                    .unwrap_or(0),
-            );
-        }
-        omitted.push("profiles");
-        profile_blocks.clear();
-    }
+    };
+    drop_while_overflow(&mut base_blocks, &mut omitted);
+    drop_while_overflow(&mut profile_blocks, &mut omitted);
     let compressed = !omitted.is_empty();
 
     if let Some(b) = active_block {
@@ -1014,13 +1020,13 @@ async fn build_context(
             "saved": save_info.as_ref().and_then(|v| v.get("document_id")).cloned(),
         }));
     }
+    // NOTE: контекст — ТОЛЬКО документы (активный + фокусы + профили + base).
+    // Списки всех проектов/задач в контекст не попадают (см. /ctx для
+    // диагностики) — иначе каждая сборка тянула бы всю базу.
     Ok(
         json!({"docs": docs, "seat": seat_id, "save_info": save_info,
                    "limit_chars": limit, "used_chars": used, "compressed": compressed,
-                   "warning": warning,
-                   "active_document": engine.seats.get_active_document(seat_id).await.map_err(json_err)?,
-                   "projects": project_list(engine).await?,
-                   "tasks": task_list(engine, Some(seat_id)).await?}),
+                   "warning": warning}),
     )
 }
 
