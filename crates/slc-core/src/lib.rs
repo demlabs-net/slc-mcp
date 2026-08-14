@@ -191,7 +191,7 @@ impl Default for SlcConfig {
             context_limit_chars: std::env::var("SLC_CONTEXT_LIMIT_CHARS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(100_000),
+                .unwrap_or(300_000),
             mongodb_uri: std::env::var("SLC_MONGODB_URI").ok(),
             mcp_sampling: std::env::var("SLC_MCP_SAMPLING").is_ok_and(|v| v == "true" || v == "1"),
             ai_organize: std::env::var("SLC_AI_ORGANIZE")

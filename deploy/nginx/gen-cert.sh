@@ -13,7 +13,7 @@ cd /tmp
 openssl req -x509 -newkey rsa:2048 -nodes -days "$DAYS" \
   -keyout slc-mcp.key -out slc-mcp.crt \
   -subj "/CN=slc.local/O=SLC-MCP" \
-  -addext "subjectAltName=DNS:slc.local,DNS:localhost,IP:127.0.0.1" \
+  -addext "subjectAltName=DNS:slc.local,DNS:localhost,IP:127.0.0.1,IP:192.168.0.251" \
   -addext "basicConstraints=CA:FALSE" \
   -addext "keyUsage=digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=serverAuth"
@@ -25,5 +25,5 @@ sudo chmod 600 "$DIR/slc-mcp.key"
 sudo cp "$DIR/slc-mcp.crt" /usr/local/share/ca-certificates/slc-mcp.crt
 sudo update-ca-certificates
 
-echo "сертификат: $DIR/slc-mcp.crt (SAN: slc.local, localhost, 127.0.0.1)"
+echo "сертификат: $DIR/slc-mcp.crt (SAN: slc.local, localhost, 127.0.0.1, 192.168.0.251)"
 echo "для ZCode: NODE_EXTRA_CA_CERTS=$DIR/slc-mcp.crt (уже в zcode.desktop)"

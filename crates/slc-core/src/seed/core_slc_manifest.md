@@ -17,18 +17,15 @@ Context is assembled from blocks by priority (highest → lowest):
 1. **Active document** — task/document the agent works on. NEVER dropped.
 2. **Focus items** — user's current priorities. NEVER dropped.
 3. **Profiles** — seat profile + user profile. Dropped when budget exceeded.
-4. **Core documents** — system knowledge. Dropped LAST (least important
-   first; the manifest survives longest) when the budget still overflows.
+4. **Core documents** — system knowledge. NEVER dropped.
 
 Compression on budget overflow:
 - Documents are NEVER truncated — only dropped whole or LLM-summarized.
-- Overflow = the seat's TOKEN budget is exceeded.
-- Profiles drop first, then core docs one by one from the least important.
+- Profiles drop first (least important first).
 - If still over — LLM summarization of remaining docs.
 - Response includes `compressed: true` + `warning`.
 
-Budget: `/limit N` (TOKENS; ~3 chars per token) or
-`SLC_CONTEXT_LIMIT_TOKENS` env var. Default: 100000 tokens.
+Budget: `/limit N` (characters) or `SLC_CONTEXT_LIMIT_CHARS` env var. Default: 300000.
 
 ## Documents
 
@@ -145,7 +142,7 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 
 | Command | Description |
 |---------|-------------|
-| `/limit N` | Context limit in TOKENS (~3 chars per token) |
+| `/limit N` | Context limit in characters |
 | `/ctx` | Show current context |
 | `/search <query>` | Search KB |
 | `/update_context [summary]` | Assemble context |
@@ -157,7 +154,7 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SLC_VAULT_PATH` | `~/.slc/vault` | Vault path |
-| `SLC_CONTEXT_LIMIT_TOKENS` | `100000` | Context limit (tokens; ~3 chars each) |
+| `SLC_CONTEXT_LIMIT_CHARS` | `300000` | Context limit (characters) |
 | `SLC_LLM` | auto | Provider: hash/ollama/lmstudio/candle |
 | `LMSTUDIO_URL` | — | LM Studio URL |
 | `LMSTUDIO_MODEL` | `google/gemma-4-e4b` | Reasoning model |
