@@ -119,6 +119,10 @@ async fn seed_core_if_missing(store: &dyn StorageBackend) {
     }
 }
 
+/// Приблизительное число символов на один токен (смешанный RU/EN текст).
+/// Компрессия работает в символах, лимиты задаются в токенах.
+pub const CHARS_PER_TOKEN: usize = 3;
+
 /// Отчёт пересборки эмбеддингов (`reindex-embeddings`). (`reindex-embeddings`).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReindexReport {
@@ -148,10 +152,11 @@ pub struct SlcConfig {
     pub semantic_weight: f32,
     pub text_weight: f32,
     pub seat_ttl_seconds: i64,
-    /// Total context budget in characters handed to the model per
-    /// `update_context` call. Per-seat override: `/limit N` or the client's
-    /// `capabilities.experimental.context_limit_chars`.
-    pub context_limit_chars: usize,
+    /// Total context budget in TOKENS handed to the model per
+    /// `update_context` call. Per-seat override: `/limit N` (tokens) or the
+    /// client's window from `initialize` (tokens). The compression works in
+    /// characters internally: budget_chars = tokens * CHARS_PER_TOKEN.
+    pub context_limit_tokens: usize,
     /// MongoDB connection URI (used when `storage = MongoDB`).
     pub mongodb_uri: Option<String>,
     /// Use the MCP client's own inference (sampling) as the LLM — the
@@ -188,10 +193,17 @@ impl Default for SlcConfig {
             semantic_weight: 0.7,
             text_weight: 0.3,
             seat_ttl_seconds: 86400,
-            context_limit_chars: std::env::var("SLC_CONTEXT_LIMIT_CHARS")
+            // Токены. Легаси- env в символах конвертируем (≈3 симв/токен).
+            context_limit_tokens: std::env::var("SLC_CONTEXT_LIMIT_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(300_000),
+                .or_else(|| {
+                    std::env::var("SLC_CONTEXT_LIMIT_CHARS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .map(|chars| chars / CHARS_PER_TOKEN)
+                })
+                .unwrap_or(100_000),
             mongodb_uri: std::env::var("SLC_MONGODB_URI").ok(),
             mcp_sampling: std::env::var("SLC_MCP_SAMPLING").is_ok_and(|v| v == "true" || v == "1"),
             ai_organize: std::env::var("SLC_AI_ORGANIZE")
@@ -451,19 +463,27 @@ impl SlcEngine {
         Ok(out)
     }
 
-    /// Effective context budget for a seat (characters): per-seat override
-    /// (`seat.context["context_limit_chars"]`) wins over the config default.
+    /// Effective context budget for a seat (TOKENS): per-seat override
+    /// (`context_limit_tokens` from /limit or initialize) wins over the
+    /// config default. Legacy `context_limit_chars` values are converted.
     pub async fn context_limit_for(&self, seat_id: &str) -> SlcResult<usize> {
         if let Ok(Some(seat)) = self.seats.get_seat(seat_id).await {
+            if let Some(v) = seat
+                .context
+                .get("context_limit_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                return Ok(v as usize);
+            }
             if let Some(v) = seat
                 .context
                 .get("context_limit_chars")
                 .and_then(|v| v.as_u64())
             {
-                return Ok(v as usize);
+                return Ok((v as usize / CHARS_PER_TOKEN).max(1));
             }
         }
-        Ok(self.config.context_limit_chars)
+        Ok(self.config.context_limit_tokens)
     }
 
     /// The active LLM provider (LM Studio or Ollama).
