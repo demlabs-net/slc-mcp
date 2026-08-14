@@ -30,7 +30,7 @@ pub mod timer;
 
 pub use error::{SlcError, SlcResult};
 pub use auth::{authenticate, auth_mode_from_env, Principal, AuthMode};pub use focus::{FocusItem, FocusManager};
-pub use llm::{LlmClient, LmStudioClient, MockLlm, OllamaClient};
+pub use llm::{LlmClient, LmStudioClient, McpSamplingLlm, MockLlm, OllamaClient};
 pub use memory::{ConsolidationReport, CompressionReport, HistoryCompressor, MemoryConsolidator};
 pub use model::*;
 pub use notifications::NotificationQueue;
@@ -79,6 +79,9 @@ pub struct SlcConfig {
     pub context_limit_chars: usize,
     /// MongoDB connection URI (used when `storage = MongoDB`).
     pub mongodb_uri: Option<String>,
+    /// Use the MCP client's own inference (sampling) as the LLM — the
+    /// fallback for weak machines without a local GPU/LLM server.
+    pub mcp_sampling: bool,
 }
 
 impl Default for SlcConfig {
@@ -102,6 +105,7 @@ impl Default for SlcConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8000),
             mongodb_uri: std::env::var("SLC_MONGODB_URI").ok(),
+            mcp_sampling: std::env::var("SLC_MCP_SAMPLING").is_ok_and(|v| v == "true" || v == "1"),
         }
     }
 }
@@ -142,7 +146,22 @@ impl SlcEngine {
 
     /// Async open — required for the MongoDB backend, fine for the others.
     pub async fn open_async(config: SlcConfig) -> SlcResult<Self> {
-        let store: std::sync::Arc<dyn StorageBackend> = match config.storage {
+        let store = Self::open_store(&config).await?;
+        Ok(Self::with(store, Self::pick_llm(&config), config))
+    }
+
+    /// Open with an externally-built LLM (e.g. MCP-sampling fallback).
+    pub async fn open_async_with_llm(
+        config: SlcConfig,
+        llm: std::sync::Arc<dyn LlmClient>,
+    ) -> SlcResult<Self> {
+        let store = Self::open_store(&config).await?;
+        Ok(Self::with(store, llm, config))
+    }
+
+    /// Open just the storage backend for the config.
+    pub async fn open_store(config: &SlcConfig) -> SlcResult<std::sync::Arc<dyn StorageBackend>> {
+        Ok(match config.storage {
             StorageKind::ObsidianVault => {
                 let path = expand_tilde(&config.path);
                 std::sync::Arc::new(storage::obsidian::ObsidianVaultStore::open(path, config.auto_git_commit)?)
@@ -154,13 +173,15 @@ impl SlcEngine {
             StorageKind::MongoDB => {
                 std::sync::Arc::new(storage::mongodb::MongoStore::connect(config.mongodb_uri.as_deref()).await?)
             }
-        };
-        Ok(Self::with(store, Self::pick_llm(&config), config))
+        })
     }
 
     /// Provider auto-select: LM Studio (OpenAI-compatible) when configured,
     /// else Ollama — same rule as the Python legacy.
     fn pick_llm(config: &SlcConfig) -> std::sync::Arc<dyn LlmClient> {
+        if std::env::var("SLC_LLM").as_deref() == Ok("hash") {
+            return std::sync::Arc::new(llm::CpuHashLlm);
+        }
         match &config.lmstudio_url {
             Some(url) => std::sync::Arc::new(LmStudioClient::new(
                 url,

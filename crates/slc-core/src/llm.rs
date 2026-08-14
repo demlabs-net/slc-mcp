@@ -12,7 +12,7 @@
 
 use crate::error::{SlcError, SlcResult};
 use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
@@ -253,6 +253,104 @@ impl LlmClient for MockLlm {
     }
 }
 
+/// LlmClient, который запрашивает инференс у MCP-КЛИЕНТА через sampling —
+/// фоллбэк для машин без локального GPU/LLM-сервера (слабые компы,
+/// виртуалки). Модель-клиента делает вызов за сервер; эмбеддинги через
+/// sampling невозможны — `generate_embedding` возвращает ошибку, и поиск
+/// честно деградирует в text-only (BM25).
+pub struct McpSamplingLlm {
+    /// Sampling-запросы наружу (сервер пересылает их клиенту по SSE).
+    pub outbound: tokio::sync::mpsc::Sender<Value>,
+    /// Ожидающие ответа запросы (id → канал ответа). Общий с сервером.
+    pub pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+    max_tokens: usize,
+}
+
+impl McpSamplingLlm {
+    pub fn new(
+        outbound: tokio::sync::mpsc::Sender<Value>,
+        pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+    ) -> Self {
+        Self { outbound, pending, max_tokens: 2000 }
+    }
+}
+
+#[async_trait]
+impl LlmClient for McpSamplingLlm {
+    async fn reason(&self, prompt: &str) -> SlcResult<String> {
+        let request_id = format!("smp-{}", uuid::Uuid::new_v4());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        self.pending.lock().unwrap().insert(request_id.clone(), tx);
+        let msg = json!({
+            "type": "sampling_request",
+            "request_id": request_id.clone(),
+            "message": {
+                "jsonrpc": "2.0",
+                "id": request_id.clone(),
+                "method": "sampling/createMessage",
+                "params": {
+                    "messages": [ { "role": "user", "content": { "type": "text", "text": prompt } } ],
+                    "maxTokens": self.max_tokens,
+                    "systemPrompt": "Ты — встроенный LLM SLC (память агента). Отвечай кратко и по делу.",
+                },
+            },
+        });
+        self.outbound
+            .send(msg)
+            .await
+            .map_err(|_| SlcError::Storage("sampling channel closed".into()))?;
+        match tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
+            Ok(Some(text)) => Ok(text),
+            Ok(None) => Err(SlcError::Storage("sampling channel closed".into())),
+            Err(_) => Err(SlcError::Storage("sampling timed out — is the MCP client connected?".into())),
+        }
+    }
+
+    async fn generate_embedding(&self, _text: &str) -> SlcResult<Vec<f32>> {
+        Err(SlcError::Storage(
+            "sampling client cannot embed — text-only search fallback".into(),
+        ))
+    }
+}
+
+/// CPU-only fallback LLM for weak machines/virtual machines: embeddings
+/// are deterministic hash features (n-gram → 512-dim) so hybrid search
+/// works without ANY model server; reasoning returns a clear error (the
+/// caller falls back to sampling or skips). Enable with `SLC_LLM=hash`.
+pub struct CpuHashLlm;
+
+#[async_trait]
+impl LlmClient for CpuHashLlm {
+    async fn reason(&self, _prompt: &str) -> SlcResult<String> {
+        Err(SlcError::Storage(
+            "no local LLM: enable SLC_MCP_SAMPLING for client inference or point SLC_LLM at Ollama/LM Studio".into(),
+        ))
+    }
+
+    async fn generate_embedding(&self, text: &str) -> SlcResult<Vec<f32>> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let dim = 512usize;
+        let mut out = vec![0.0f32; dim];
+        // char n-grams (2..=4) hashed into the vector — cheap lexical signal.
+        let chars: Vec<char> = text.chars().collect();
+        for n in 2..=4 {
+            for w in chars.windows(n) {
+                let mut h = DefaultHasher::new();
+                w.hash(&mut h);
+                let idx = (h.finish() % dim as u64) as usize;
+                out[idx] += 1.0;
+            }
+        }
+        // L2-normalize.
+        let norm = out.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+        for v in out.iter_mut() {
+            *v /= norm;
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +362,38 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "summarize");
+    }
+
+    #[tokio::test]
+    async fn sampling_llm_roundtrip() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let llm = McpSamplingLlm::new(tx, pending.clone());
+        // Simulate the MCP client: read the sampling request, answer it.
+        let pending2 = pending.clone();
+        tokio::spawn(async move {
+            let msg = rx.recv().await.unwrap();
+            let rid = msg["request_id"].as_str().unwrap().to_string();
+            let tx = pending2.lock().unwrap().remove(&rid).unwrap();
+            tx.send("сжатый ответ клиента".into()).await.unwrap();
+        });
+        let out = llm.reason("длинный текст для сжатия").await.unwrap();
+        assert_eq!(out, "сжатый ответ клиента");
+    }
+
+    #[tokio::test]
+    async fn cpu_hash_embeddings_are_deterministic_and_normalized() {
+        let a = CpuHashLlm.generate_embedding("кофе чёрный").await.unwrap();
+        let b = CpuHashLlm.generate_embedding("кофе чёрный").await.unwrap();
+        let c = CpuHashLlm.generate_embedding("совсем другой текст").await.unwrap();
+        assert_eq!(a.len(), 512);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        let norm: f32 = a.iter().map(|v| v * v).sum();
+        assert!((norm - 1.0).abs() < 1e-3);
+        // Deterministic lexical similarity: similar texts correlate > 0.
+        let dot: f32 = a.iter().zip(c.iter()).map(|(x, y)| x * y).sum();
+        assert!(dot < 0.5, "dissimilar texts should be weakly correlated: {dot}");
     }
 
     #[test]

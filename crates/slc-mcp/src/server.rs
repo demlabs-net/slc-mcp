@@ -19,14 +19,31 @@ pub struct AppState {
     pub engine: Arc<SlcEngine>,
     /// Server→client notification fan-out keyed by seat id.
     pub events: tokio::sync::broadcast::Sender<Value>,
+    /// Pending MCP sampling requests (id → answer channel); the sampling
+    /// LlmClient registers here and the client's response resolves it.
+    pub sampling: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
 }
 
-pub async fn run(engine: SlcEngine, port: u16) -> anyhow::Result<()> {
+pub async fn run(
+    engine: SlcEngine,
+    port: u16,
+    sampling_out: Option<tokio::sync::mpsc::Receiver<Value>>,
+    sampling: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+) -> anyhow::Result<()> {
     if let Err(e) = engine.start_background().await {
         tracing::warn!("failed to start background timers: {e}");
     }
     let (tx, _) = tokio::sync::broadcast::channel(256);
-    let state = Arc::new(AppState { engine: Arc::new(engine), events: tx });
+    // Sampling requests from the LlmClient → forwarded to the client's SSE.
+    if let Some(mut rx) = sampling_out {
+        let out_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                let _ = out_tx.send(msg);
+            }
+        });
+    }
+    let state = Arc::new(AppState { engine: Arc::new(engine), events: tx, sampling });
     let app = Router::new()
         .route("/mcp", post(mcp))
         .route("/sse", get(sse_endpoint))
@@ -130,6 +147,7 @@ fn bearer_from_request(headers: &axum::http::HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+#[axum::debug_handler]
 async fn mcp(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -138,6 +156,26 @@ async fn mcp(
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
+
+    // A response to one of our sampling requests (client answered via
+    // POST /messages): resolve the pending channel and reply with nothing.
+    if method.is_empty() && id.is_some() {
+        if let Some(rid) = id.as_ref().and_then(|v| v.as_str()) {
+            if let Some(tx) = state.sampling.lock().unwrap().remove(rid) {
+                let text = req
+                    .get("result")
+                    .and_then(|r| r.get("content"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|m| m.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let _ = tx.try_send(text);
+                return (StatusCode::OK, Json(json!({})));
+            }
+        }
+    }
 
     let engine = state.engine.as_ref();
     let seat_hdr = seat_from_request(&headers);

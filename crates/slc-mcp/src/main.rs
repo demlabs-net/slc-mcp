@@ -137,8 +137,21 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Serve { port, auto_commit } => {
             config.auto_git_commit = auto_commit;
-            let engine = SlcEngine::open_async(config).await?;
-            server::run(engine, port).await
+            if config.mcp_sampling {
+                // Inference through the MCP client (sampling) — no local
+                // GPU/LLM needed; embeddings degrade to text-only search.
+                let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
+                let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+                let llm: std::sync::Arc<dyn slc_core::LlmClient> = std::sync::Arc::new(
+                    slc_core::McpSamplingLlm::new(out_tx, pending.clone()),
+                );
+                let engine = SlcEngine::open_async_with_llm(config, llm).await?;
+                server::run(engine, port, Some(out_rx), pending).await
+            } else {
+                let engine = SlcEngine::open_async(config).await?;
+                let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+                server::run(engine, port, None, pending).await
+            }
         }
         Cmd::Migrate { from, to_vault } => {
             let engine = SlcEngine::open_async(config).await?;
