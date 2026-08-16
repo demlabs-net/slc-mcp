@@ -13,12 +13,39 @@ use crate::storage::{DocFilter, DocSort, SortDir, StorageBackend};
 use chrono::Utc;
 use serde_json::{json, Value};
 
-/// Status values shared by tasks and projects.
-pub const STATUS_PENDING: &str = "pending";
-pub const STATUS_ACTIVE: &str = "active";
-pub const STATUS_COMPLETED: &str = "completed";
-pub const STATUS_CANCELLED: &str = "cancelled";
-pub const STATUS_ARCHIVED: &str = "archived";
+/// Canonical status values shared by tasks and projects (SCREAMING_SNAKE,
+/// same set the Mongo migration normalizes legacy statuses into).
+pub const STATUS_PENDING: &str = "PENDING";
+pub const STATUS_ACTIVE: &str = "IN_WORK";
+pub const STATUS_COMPLETED: &str = "COMPLETED";
+pub const STATUS_CANCELLED: &str = "CANCELLED";
+pub const STATUS_ARCHIVED: &str = "ARCHIVED";
+
+/// Project lifecycle statuses (separate from task statuses).
+pub const STATUS_PROJECT_ACTIVE: &str = "active";
+pub const STATUS_PROJECT_ARCHIVED: &str = "archived";
+
+/// Normalize a raw task status into the canonical set; unknown → `None`.
+pub fn normalize_task_status(raw: &str) -> Option<&'static str> {
+    let norm: String = raw
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    match norm.as_str() {
+        "active" | "inprogress" | "inwork" | "running" | "started" | "wip" | "doing" => {
+            Some(STATUS_ACTIVE)
+        }
+        "pending" | "planned" | "backlog" | "queued" | "scheduled" | "open" | "new" => {
+            Some(STATUS_PENDING)
+        }
+        "completed" | "done" | "closed" | "finished" | "resolved" | "merged" | "released" => {
+            Some(STATUS_COMPLETED)
+        }
+        "cancelled" | "canceled" | "rejected" | "abandoned" | "wontfix" => Some(STATUS_CANCELLED),
+        _ => None,
+    }
+}
 
 /// Task/Project shape returned by the CRUD tools.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -54,7 +81,8 @@ fn doc_to_task(doc: &Document) -> TaskInfo {
         name: extra_field(doc, "name").unwrap_or_else(|| doc.document_id.clone()),
         description: doc.content.clone(),
         status: extra_field(doc, "status").unwrap_or_else(|| STATUS_PENDING.into()),
-        project_id: extra_field(doc, "project_id"),
+        // Канонический ключ — "project"; "project_id" остаётся для старых доков.
+        project_id: extra_field(doc, "project").or_else(|| extra_field(doc, "project_id")),
         auto_load: doc.auto_load.clone(),
         created_at: doc.created_at.to_rfc3339(),
         updated_at: doc.updated_at.to_rfc3339(),
@@ -66,7 +94,7 @@ fn doc_to_project(doc: &Document) -> ProjectInfo {
         project_id: doc.document_id.clone(),
         name: extra_field(doc, "name").unwrap_or_else(|| doc.document_id.clone()),
         description: doc.content.clone(),
-        status: extra_field(doc, "status").unwrap_or_else(|| STATUS_ACTIVE.into()),
+        status: extra_field(doc, "status").unwrap_or_else(|| STATUS_PROJECT_ACTIVE.into()),
         auto_load: doc.auto_load.clone(),
         created_at: doc.created_at.to_rfc3339(),
         updated_at: doc.updated_at.to_rfc3339(),
@@ -90,7 +118,9 @@ fn build_doc(
     meta.extra.insert("name".into(), json!(name));
     meta.extra.insert("status".into(), json!(status));
     if let Some(pid) = project_id {
-        meta.extra.insert("project_id".into(), json!(pid));
+        // "project" — канонический ключ: из него вычисляется папка
+        // (docs/projects/<p>/tasks/) и он же отдаётся в TaskInfo.
+        meta.extra.insert("project".into(), json!(pid));
     }
     if let Some(obj) = metadata.as_object() {
         for (k, v) in obj {
@@ -132,7 +162,7 @@ impl<S: StorageBackend> WorkItemManager<S> {
         auto_load: &[String],
         metadata: &Value,
     ) -> SlcResult<TaskInfo> {
-        let task_id = self.speaking_id("task", name).await;
+        let task_id = self.speaking_id(name).await;
         let doc = build_doc(
             task_id.clone(),
             DocumentCategory::Task,
@@ -148,20 +178,21 @@ impl<S: StorageBackend> WorkItemManager<S> {
         Ok(doc_to_task(&doc))
     }
 
-    /// Говорящий id вида `{prefix}_{slug}` (транслит названия); при коллизии
-    /// — `_2`, `_3`…; пустой слаг — unique_id fallback.
-    async fn speaking_id(&self, prefix: &str, name: &str) -> String {
+    /// Говорящий id — транслит названия БЕЗ категорийного префикса
+    /// (папка уже несёт категорию: `tasks/`, `docs/projects/<p>/tasks/`),
+    /// при коллизии — `_2`, `_3`…; пустой слаг — unique_id fallback.
+    async fn speaking_id(&self, name: &str) -> String {
         let slug = crate::model::slug_name(name);
         if slug.is_empty() {
-            return crate::model::unique_id(prefix);
+            return crate::model::unique_id("task");
         }
-        let mut id = format!("{prefix}_{slug}");
+        let mut id = slug.clone();
         let mut n = 1usize;
         while self.store.kb_get(&id).await.map(|d| d.is_some()).unwrap_or(true) {
             n += 1;
-            id = format!("{prefix}_{slug}_{n}");
+            id = format!("{slug}_{n}");
             if n > 100 {
-                return crate::model::unique_id(prefix);
+                return crate::model::unique_id("task");
             }
         }
         id
@@ -205,10 +236,11 @@ impl<S: StorageBackend> WorkItemManager<S> {
             doc.content_hash = content_hash(&doc.content);
         }
         if let Some(Some(pid)) = project_id {
-            doc.metadata.extra.insert("project_id".into(), json!(pid));
+            doc.metadata.extra.insert("project".into(), json!(pid));
         }
         if let Some(pid) = project_id {
             if pid.is_none() {
+                doc.metadata.extra.remove("project");
                 doc.metadata.extra.remove("project_id");
             }
         }
@@ -216,7 +248,10 @@ impl<S: StorageBackend> WorkItemManager<S> {
             doc.auto_load = al.to_vec();
         }
         if let Some(st) = status {
-            doc.metadata.extra.insert("status".into(), json!(st));
+            // Статус нормализуется в канонический набор; неизвестный — не трогаем.
+            if let Some(norm) = normalize_task_status(st) {
+                doc.metadata.extra.insert("status".into(), json!(norm));
+            }
         }
         if let Some(obj) = metadata.and_then(|m| m.as_object()) {
             for (k, v) in obj {
@@ -278,13 +313,13 @@ impl<S: StorageBackend> WorkItemManager<S> {
         auto_load: &[String],
         metadata: &Value,
     ) -> SlcResult<ProjectInfo> {
-        let project_id = self.speaking_id("project", name).await;
+        let project_id = self.speaking_id(name).await;
         let doc = build_doc(
             project_id.clone(),
             DocumentCategory::Project,
             name,
             description,
-            STATUS_ACTIVE,
+            STATUS_PROJECT_ACTIVE,
             None,
             auto_load,
             metadata,
@@ -593,14 +628,14 @@ mod tests {
             .create_task("seat_a", "Миграция БД", "", None, &[], &json!({}))
             .await
             .unwrap();
-        assert_eq!(t1.task_id, "task_migratsiya_bd");
+        assert_eq!(t1.task_id, "migratsiya_bd");
         let t2 = m
             .create_task("seat_a", "Миграция БД", "", None, &[], &json!({}))
             .await
             .unwrap();
-        assert_eq!(t2.task_id, "task_migratsiya_bd_2");
+        assert_eq!(t2.task_id, "migratsiya_bd_2");
         let t3 = m.create_task("seat_a", "!!!", "", None, &[], &json!({})).await.unwrap();
-        assert!(t3.task_id.starts_with("task_"));
+        assert!(t3.task_id.starts_with("task_")); // fallback: unique_id
         assert_ne!(t3.task_id, "task_");
     }
 
@@ -620,7 +655,7 @@ mod tests {
     async fn task_crud_and_visibility() {
         let (m, _) = mgr();
         let t = m.create_task("seat_t", "Fix audio", "do it", None, &[], &json!({})).await.unwrap();
-        assert!(t.task_id.starts_with("task_"));
+        assert_eq!(t.task_id, "fix_audio"); // без категорийного префикса
         assert_eq!(t.status, STATUS_PENDING);
 
         let got = m.get_task("seat_t", &t.task_id).await.unwrap().unwrap();
@@ -643,7 +678,7 @@ mod tests {
     async fn project_crud_and_task_link() {
         let (m, _) = mgr();
         let p = m.create_project("seat_p", "Vassista", "voice assistant", &["core_manifest".into()], &json!({})).await.unwrap();
-        assert!(p.project_id.starts_with("project_"));
+        assert_eq!(p.project_id, "vassista"); // без категорийного префикса
         assert_eq!(p.auto_load, vec!["core_manifest".to_string()]);
 
         let t = m.create_task("seat_p", "STT", "stt plugin", Some(&p.project_id), &[], &json!({})).await.unwrap();
@@ -652,8 +687,8 @@ mod tests {
         let projects = m.list_projects("seat_p", None, 10).await.unwrap();
         assert_eq!(projects.len(), 1);
 
-        let upd = m.update_project("seat_p", &p.project_id, None, None, None, None, Some(STATUS_ARCHIVED), None).await.unwrap().unwrap();
-        assert_eq!(upd.status, STATUS_ARCHIVED);
+        let upd = m.update_project("seat_p", &p.project_id, None, None, None, None, Some(STATUS_PROJECT_ARCHIVED), None).await.unwrap().unwrap();
+        assert_eq!(upd.status, STATUS_PROJECT_ARCHIVED);
         assert!(m.delete_project("seat_p", &p.project_id).await.unwrap());
     }
 

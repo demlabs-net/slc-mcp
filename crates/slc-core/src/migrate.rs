@@ -27,6 +27,7 @@ use crate::error::{SlcError, SlcResult};
 use crate::llm::LlmClient;
 use crate::model::{content_hash, DocMeta, Document, DocumentCategory, Seat, SeatStatus, UsageStats};
 use crate::storage::StorageBackend;
+use crate::tasks::normalize_task_status;
 use bson::{doc, Bson, Document as BsonDoc};
 use chrono::{DateTime, Utc};
 use mongodb::{Client, Collection};
@@ -538,30 +539,6 @@ fn fix_links(ids: &[String], id_map: &HashMap<String, String>) -> Vec<String> {
     ids.iter()
         .map(|id| id_map.get(id).cloned().unwrap_or_else(|| id.clone()))
         .collect()
-}
-
-/// Normalize a legacy task status into the canonical set
-/// (`IN_WORK | PENDING | COMPLETED | CANCELLED`); unknown → `None`
-/// (no status is written).
-fn normalize_task_status(raw: &str) -> Option<&'static str> {
-    let norm: String = raw
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
-    match norm.as_str() {
-        "active" | "inprogress" | "inwork" | "running" | "started" | "wip" | "doing" => {
-            Some("IN_WORK")
-        }
-        "pending" | "planned" | "backlog" | "queued" | "scheduled" | "open" | "new" => {
-            Some("PENDING")
-        }
-        "completed" | "done" | "closed" | "finished" | "resolved" | "merged" | "released" => {
-            Some("COMPLETED")
-        }
-        "cancelled" | "canceled" | "rejected" | "abandoned" | "wontfix" => Some("CANCELLED"),
-        _ => None,
-    }
 }
 
 /// Human-readable id for a legacy task: AI slug (`--rename-with-ai`, based on

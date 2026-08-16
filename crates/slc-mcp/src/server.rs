@@ -520,7 +520,7 @@ fn tools() -> Vec<Value> {
                 },"required":["op"]},"description":"дифф-операции, применяются по порядку"},
                 "project_id": {"type":"string"},
                 "auto_load": {"type":"array","items":{"type":"string"}},
-                "status": {"type":"string","enum":["pending","active","completed","cancelled"]},
+                "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","CANCELLED"]},
                 "metadata": {"type":"object"}
             },"required":["task_id"]}
         }),
@@ -570,7 +570,7 @@ fn tools() -> Vec<Value> {
             "description": "List your tasks with optional filters",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
-                "status": {"type":"string","enum":["pending","active","completed","cancelled"]},
+                "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","CANCELLED"]},
                 "limit": {"type":"number","default":50}
             },"required":[]}
         }),
@@ -740,8 +740,19 @@ pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инс�
    включён в `update_context`. Активируй один главный документ, не
    несколько.
 3. **Веди работу документами.** Новая деятельность → `create_task` (или
-   `add_document` с category=task) и/или проект. Скилы — это тоже
-   документы (category=skill): инструкции «как делать X».
+   `add_document` с category=task) и/или проект (`create_project`). Скилы —
+   это тоже документы (category=skill): инструкции «как делать X».
+
+   **Создание задач/проектов (как это устроено):**
+   - id генерируется сам: транслит названия, БЕЗ категорийных префиксов
+     (`task_…`/`project_…` не добавляются) — папка уже несёт категорию;
+   - статусы — канонический набор: `PENDING` (новая), `IN_WORK`,
+     `COMPLETED`, `CANCELLED` (не lowercase);
+   - `project_id` при создании задачи привязывает её к проекту — документ
+     ложится в `docs/projects/<проект>/tasks/` (папка вычисляется из
+     `metadata.project`);
+   - `name` — короткое имя, `description` — markdown-тело задачи;
+   - `auto_load` — рабочие связи (см. п. 5), не дублируй в references.
 4. **Обогащай по ходу.** После значимых шагов обновляй документы
    (`add_document` с тем же document_id — upsert): статусы, решения,
    новые факты. История (remember) — это сырьё, а документы — рабочий
