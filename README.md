@@ -1,93 +1,94 @@
 # SLC MCP
 
+SLC (Smart Layered Context) — движок памяти для кодинг-агентов: единая база
+документов (проекты, задачи, скилы, знания), эпизодическая история с
+прогрессивной суммаризацией, гибридный поиск (семантика + BM25), фокусы,
+напоминания. Работает как MCP-сервер (`tools` + `prompts`) и CLI.
 
+## Развертывание: `slc-mcp init`
 
-## Getting started
+Модель эмбеддингов **никогда не скачивается автоматически** на первый
+запрос — её готовит консольный визард:
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://gitlab.demlabs.net/internal/ai/slc-mcp.git
-git branch -M main
-git push -uf origin main
+```bash
+slc-mcp init
 ```
 
-## Integrate with your tools
+Визард спрашивает:
 
-- [ ] [Set up project integrations](https://gitlab.demlabs.net/internal/ai/slc-mcp/-/settings/integrations)
+1. **Провайдер эмбеддингов**:
+   - `candle` — встроенный инференс (модель качается на эту машину);
+   - `ollama` / `lmstudio` — внешний GPU-сервер;
+   - `hash` — CPU-эмбеддинги без моделей (слабые машины, виртуалки).
+2. **Устройство** для candle (`auto` | `cuda` | `metal` | `cpu`; визард
+   показывает, что обнаружено).
+3. **Модель**: по умолчанию `BAAI/bge-m3` (1024-мер, мультиязычная, RU) на
+   GPU и `intfloat/multilingual-e5-small` (384-мер) на CPU; можно указать
+   любой HF repo id.
 
-## Collaborate with your team
+Затем визард **сразу скачивает модель** в кэш Hugging Face
+(`~/.cache/huggingface`), записывает `.env` (`SLC_LLM`, `SLC_EMBED_DEVICE`,
+`SLC_EMBED_MODEL`) и делает контрольный эмбеддинг. Неинтерактивно:
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+```bash
+slc-mcp init --llm candle --device cpu --model intfloat/multilingual-e5-small
+```
 
-## Test and Deploy
+### Выбор провайдера по умолчанию
 
-Use the built-in continuous integration in GitLab.
+- Явный `SLC_LLM` (`hash` | `ollama` | `lmstudio` | `candle`) — всегда его;
+  если он отвалился, поиск честно деградирует в text-only (без тихого
+  переключения).
+- Ничего не задано: GPU есть и модель скачана → candle; иначе → hash.
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+## Запуск
 
-***
+```bash
+slc-mcp serve --port 3000          # MCP: POST /mcp, SSE /sse, /health
+# хранилище: Obsidian vault (default), --sqlite, --mongodb
+```
 
-# Editing this README
+## Управление CLI
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+| Команда | Что делает |
+|---|---|
+| `slc-mcp init` | Визард развертывания: провайдер, модель, скачивание, `.env` |
+| `slc-mcp reindex-embeddings [--seat X]` | Пересобрать эмбеддинги после смены модели/настроек |
+| `slc-mcp search "<query>" [--seat X]` | Гибридный поиск |
+| `slc-mcp status` | Бэкенд и путь хранилища |
+| `slc-mcp remember/compress/consolidate` | Эпизодика и суммаризация |
+| `slc-mcp migrate --from <legacy>` | Миграция легаси-ваулта (id → слаги, папки) |
+| `slc-mcp migrate --from-mongo [URI] --db slc_mcp [--rename-with-ai]` | Миграция легаси-Mongo: БЗ + history → episodic + проекты/задачи (`docs/projects/<p>/`) + сиды; `--rename-with-ai` переименовывает id через LLM из `.env` и правит `auto_load`/`references` |
 
-## Suggestions for a good README
+Сменил модель в `init`? Пересобери эмбеддинги:
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+```bash
+slc-mcp reindex-embeddings
+```
 
-## Name
-Choose a self-explaining name for your project.
+Поиск сам отфильтровывает записи от другой модели (по размерности) и при
+первом поиске лениво пересобирает устаревшие, так что даже без `reindex`
+ничего не сломается.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+## Инференс
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+Каскад (в порядке приоритета): **внешний GPU-сервер → встроенный candle →
+CPU-hash**. Подробности в `crates/slc-core/src/candle_emb.rs`:
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+- `SLC_LLM=hash` — детерминированные hash-эмбеддинги, без моделей;
+- `SLC_LLM=candle` — встроенный инференс (candle): GPU → `bge-m3`, CPU →
+  `e5-small`; модель грузится из кэша (автоскачивания нет);
+- `SLC_LLM=ollama` / `lmstudio` — внешние серверы (reasoning + embeddings);
+- `SLC_MCP_SAMPLING=true` — инференс через MCP-клиента (sampling), эмбеддинги
+  недоступны → text-only поиск.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+GPU-бэкенды: **CUDA** (Linux/Windows, собери с `--features slc-core/cuda`,
+нужен CUDA toolkit) → `bge-m3` на GPU; на **macOS** candle работает на
+Accelerate-ускоренном CPU (Metal-бэкенд candle не поддерживает layer-norm —
+проверено e2e), поэтому `init` предложит `e5-small`; CPU-машины без моделей
+→ hash.
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+## Хуки для харнеса
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Готовый hook-скрипт, который обвязка дёргает в конце каждого агент-лупа и
+который автоматически сохраняет контекст в SLC — см. [`hooks/README.md`](hooks/README.md).
