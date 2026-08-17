@@ -1031,6 +1031,11 @@ impl SlcEngine {
         self.store.health_check().await
     }
 
+    /// Re-read the backing store from disk (multi-process sync).
+    pub async fn refresh(&self) -> SlcResult<()> {
+        self.store.refresh().await
+    }
+
     /// Start the background timer scheduler: default per-seat timers +
     /// compression/consolidation handlers. Idempotent. The MCP server calls
     /// this on startup.
@@ -1113,6 +1118,28 @@ impl SlcEngine {
         }
         registry.start().await?;
         *guard = Some(registry);
+
+        // Multi-process sync: periodically re-read the store from disk so
+        // changes made by another service sharing the same vault (e.g. the
+        // web UI) become visible. SLC_VAULT_REFRESH_SECS: interval (default
+        // 30s, 0 = off).
+        let refresh_secs = std::env::var("SLC_VAULT_REFRESH_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        if refresh_secs > 0 {
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
+                loop {
+                    ticker.tick().await;
+                    if let Err(e) = store.refresh().await {
+                        tracing::debug!("store refresh failed: {e}");
+                    }
+                }
+            });
+        }
         Ok(())
     }
 

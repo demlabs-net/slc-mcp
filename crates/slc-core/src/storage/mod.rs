@@ -174,6 +174,13 @@ pub trait StorageBackend: Send + Sync {
     /// Enumerate all records in a collection as `(key, value)` pairs.
     async fn list_records(&self, collection: &str) -> SlcResult<Vec<(String, Value)>>;
 
+    /// Re-read the backing store from disk (multi-process setups: several
+    /// services may share one vault/db — refresh picks up foreign changes).
+    /// Default: no-op.
+    async fn refresh(&self) -> SlcResult<()> {
+        Ok(())
+    }
+
     async fn health_check(&self) -> bool;
     async fn close(&self) -> SlcResult<()>;
 }

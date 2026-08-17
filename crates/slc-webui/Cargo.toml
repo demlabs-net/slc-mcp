@@ -1,6 +1,6 @@
 [package]
 name = "slc-webui"
-description = "SLC web UI — REST proxy over the MCP server + static SPA hosting"
+description = "SLC web UI — REST service over the embedded slc-core engine + static SPA hosting"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,8 +14,9 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 axum = { version = "0.8", features = ["json", "macros"] }
-reqwest = { workspace = true }
+chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
-futures = { workspace = true }
+async-stream = { workspace = true }
+slc-core = { workspace = true }

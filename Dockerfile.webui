@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
-# SLC Web UI — Svelte SPA + Rust REST-прокси (slc-webui), Debian 13 (trixie).
+# SLC Web UI — REST-сервис над встроенным slc-core движком + Svelte SPA.
+# Открывает тот же Obsidian vault, что и MCP-сервер (multi-process синк
+# через refresh), авто-коммит/push vault — OBSIDIAN_AUTO_GIT_COMMIT.
 
 # ── фронтенд: Svelte SPA ──────────────────────────────────────────────────
 FROM node:22-alpine AS frontend
@@ -25,17 +27,18 @@ RUN cargo build --release -p slc-webui
 # ── runtime ────────────────────────────────────────────────────────────────
 FROM debian:trixie-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
+ && apt-get install -y --no-install-recommends ca-certificates git openssh-client curl \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 1000 --create-home slc \
- && mkdir -p /app/dist \
- && chown -R slc:slc /app
+ && mkdir -p /app/dist /data/vault \
+ && chown -R slc:slc /app /data/vault
 
 COPY --from=builder /build/target/release/slc-webui /usr/local/bin/slc-webui
 COPY --from=frontend /app/web-ui/dist /app/dist
 
 USER slc
-ENV SLC_WEBUI_DIST=/app/dist
+ENV SLC_WEBUI_DIST=/app/dist \
+    SLC_VAULT_PATH=/data/vault
 EXPOSE 3002
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

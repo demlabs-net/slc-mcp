@@ -22,7 +22,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  # Веб-морда: REST-прокси поверх MCP + статика SPA (порт 3002).
+  # Веб-морда: REST поверх встроенного движка + статика SPA (порт 3002).
+  # Открывает тот же vault (multi-process синк через refresh).
   slc-webui:
     build:
       context: .
@@ -32,8 +33,12 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:3002:3002"
+    env_file:
+      - .env
     environment:
-      SLC_MCP_URL: http://slc-mcp:3000
+      SLC_VAULT_PATH: /data/vault
       SLC_WEBUI_DIST: /app/dist
+    volumes:
+      - "${SLC_VAULT_HOST_PATH:?run deploy.sh (sets SLC_VAULT_HOST_PATH)}:/data/vault"
     depends_on:
       - slc-mcp
