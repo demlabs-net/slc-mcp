@@ -13,8 +13,9 @@ WORKDIR /build
 COPY Cargo.toml ./
 COPY crates/slc-core/Cargo.toml crates/slc-core/
 COPY crates/slc-mcp/Cargo.toml crates/slc-mcp/
-RUN mkdir -p crates/slc-core/src crates/slc-mcp/src \
- && touch crates/slc-core/src/lib.rs crates/slc-mcp/src/main.rs \
+COPY crates/slc-webui/Cargo.toml crates/slc-webui/
+RUN mkdir -p crates/slc-core/src crates/slc-mcp/src crates/slc-webui/src \
+ && touch crates/slc-core/src/lib.rs crates/slc-mcp/src/main.rs crates/slc-webui/src/main.rs \
  && cargo fetch
 
 # Sources. The `librust-inference` submodule is NOT used by this build.
