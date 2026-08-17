@@ -147,11 +147,21 @@ impl LmStudioClient {
 
 /// Request body builders (pure, unit-tested).
 pub fn lmstudio_chat_body(model: &str, prompt: &str) -> serde_json::Value {
-    json!({
+    let mut body = json!({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": false,
-    })
+    });
+    // Reasoning-модели (nemotron и др.) по умолчанию генерируют длинную
+    // цепочку рассуждений, оставляя `content` пустым до её завершения.
+    // Для коротких задач (нейминг id при миграции) можно отключить:
+    // LMSTUDIO_REASONING_EFFORT=none.
+    if let Ok(effort) = std::env::var("LMSTUDIO_REASONING_EFFORT") {
+        if !effort.is_empty() {
+            body["reasoning_effort"] = json!(effort);
+        }
+    }
+    body
 }
 
 pub fn lmstudio_embed_body(model: &str, text: &str) -> serde_json::Value {
