@@ -1,4 +1,4 @@
-# SLC MCP server — single service, no web UI yet.
+# SLC MCP — сервер памяти (Obsidian vault) + веб-морда (slc-webui).
 #
 # Vault location on the host comes from $SLC_VAULT (set by deploy.sh,
 # default ~/Obsidian/slc-vault). LM Studio / Ollama on the host are
@@ -21,3 +21,19 @@ services:
       - "${SLC_VAULT_HOST_PATH:?run deploy.sh (sets SLC_VAULT_HOST_PATH)}:/data/vault"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  # Веб-морда: REST-прокси поверх MCP + статика SPA (порт 3002).
+  slc-webui:
+    build:
+      context: .
+      dockerfile: Dockerfile.webui
+    image: slc-webui:local
+    container_name: slc-webui
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3002:3002"
+    environment:
+      SLC_MCP_URL: http://slc-mcp:3000
+      SLC_WEBUI_DIST: /app/dist
+    depends_on:
+      - slc-mcp

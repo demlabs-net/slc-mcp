@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# SLC MCP — deploy helper (Docker, Obsidian vault, LM Studio provider).
+# SLC MCP — deploy helper (Docker, Obsidian vault, LM Studio provider, web UI).
 #
 # Usage:
-#   ./deploy.sh build     — собрать образ (cargo build --release, candle CPU)
-#   ./deploy.sh up        — создать vault (+git init), поднять контейнер, ждать /health
-#   ./deploy.sh down      — остановить контейнер
-#   ./deploy.sh status    — статус контейнера + /health
-#   ./deploy.sh logs      — логи контейнера (follow)
+#   ./deploy.sh build     — собрать образы (slc-mcp + slc-webui)
+#   ./deploy.sh up        — создать vault (+git init), поднять сервисы, ждать /health
+#   ./deploy.sh down      — остановить сервисы
+#   ./deploy.sh status    — статус + /health (MCP) и /api/health (webui)
+#   ./deploy.sh logs      — логи (follow)
 #   ./deploy.sh migrate   — импорт БЗ+сидов из легаси-Mongo (CLI --from-mongo,
 #                           с AI-переименованием id через LLM из .env)
 #   ./deploy.sh reindex   — пересобрать эмбеддинги текущим провайдером
@@ -64,8 +64,9 @@ cmd_up() {
     "${COMPOSE[@]}" up -d
     wait_health
     echo
-    echo "SLC MCP: http://127.0.0.1:3000/mcp  (health: $HEALTH_URL)"
-    echo "vault:   $VAULT_PATH"
+    echo "SLC MCP:   http://127.0.0.1:3000/mcp  (health: $HEALTH_URL)"
+    echo "Web UI:    http://127.0.0.1:3002/      (health: /api/health)"
+    echo "vault:     $VAULT_PATH"
 }
 
 cmd_down() {
@@ -76,6 +77,8 @@ cmd_status() {
     "${COMPOSE[@]}" ps
     echo
     curl -sS -m 3 "$HEALTH_URL" || echo "(health недоступен)"
+    echo
+    curl -sS -m 3 "http://127.0.0.1:3002/api/health" || echo "(webui health недоступен)"
 }
 
 cmd_logs() {
