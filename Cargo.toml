@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/slc-core", "crates/slc-mcp"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "test-util"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rusqlite = { version = "0.34", features = ["bundled"] }
+rand = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+axum = { version = "0.8", features = ["json"] }
+futures = "0.3"
+async-stream = "0.3"
+slc-core = { path = "crates/slc-core" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

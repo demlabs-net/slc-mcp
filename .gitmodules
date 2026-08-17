@@ -1,0 +1,3 @@
+[submodule "librust-inference"]
+	path = librust-inference
+	url = ../librust-inference
