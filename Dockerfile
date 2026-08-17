@@ -24,10 +24,10 @@ RUN cargo build --release -p slc-mcp
 # ── runtime: Debian 13 (trixie), no toolchain ─────────────────────────────
 FROM debian:trixie-slim
 
-# git — optional vault auto-commit (OBSIDIAN_AUTO_GIT_COMMIT=true);
-# curl — healthcheck; ca-certificates — TLS for LLM/embedding endpoints.
+# git — optional vault auto-commit (OBSIDIAN_AUTO_GIT_COMMIT=true) + push
+# по ssh (openssh-client); curl — healthcheck; ca-certificates — TLS.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git curl \
+ && apt-get install -y --no-install-recommends ca-certificates git curl openssh-client \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 1000 --create-home slc \
  && mkdir -p /data/vault \
