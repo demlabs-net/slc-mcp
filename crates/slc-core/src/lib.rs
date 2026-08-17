@@ -762,6 +762,16 @@ impl SlcEngine {
         queue.count_pending(seat_id).await
     }
 
+    /// List notifications for the seat (any status; without popping).
+    pub async fn list_notifications(
+        &self,
+        seat_id: &str,
+        status: Option<&str>,
+    ) -> SlcResult<Vec<model::Notification>> {
+        let queue = NotificationQueue::new(self.store.clone());
+        queue.list(seat_id, status).await
+    }
+
     // ── pagination ───────────────────────────────────────────────
 
     pub async fn paginate(

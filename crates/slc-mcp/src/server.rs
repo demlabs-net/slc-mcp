@@ -650,6 +650,57 @@ fn tools() -> Vec<Value> {
                 "timezone": {"type":"string","description":"IANA timezone, e.g. Europe/Moscow"}
             },"required":["content"]}
         }),
+        // UI-ориентированные read/write-тулы
+        json!({
+            "name": "list_documents",
+            "description": "List knowledge documents (id/category/folder/tags, no content) with optional filters",
+            "inputSchema": {"type":"object","properties":{
+                "category": {"type":"string","description":"core|module|task|project|code_snippet|documentation|skill|custom|system"},
+                "folder": {"type":"string","description":"relative vault folder, e.g. docs/projects/slc"},
+                "query": {"type":"string","description":"substring filter on id/content"},
+                "limit": {"type":"number","default":100}
+            },"required":[]}
+        }),
+        json!({
+            "name": "update_document",
+            "description": "Update an existing document (patch: content, tags, metadata, auto_load, references, seat_id)",
+            "inputSchema": {"type":"object","properties":{
+                "document_id": {"type":"string"},
+                "content": {"type":"string"},
+                "tags": {"type":"array","items":{"type":"string"}},
+                "auto_load": {"type":"array","items":{"type":"string"}},
+                "references": {"type":"array","items":{"type":"string"}},
+                "metadata": {"type":"object"},
+                "seat_id": {"type":"string","description":"owner seat; empty string = public"}
+            },"required":["document_id"]}
+        }),
+        json!({
+            "name": "delete_document",
+            "description": "Soft-delete a document (or purge it with purge=true)",
+            "inputSchema": {"type":"object","properties":{
+                "document_id": {"type":"string"},
+                "purge": {"type":"boolean","default":false}
+            },"required":["document_id"]}
+        }),
+        json!({
+            "name": "document_stats",
+            "description": "Knowledge base counts: total, by category, episodic, seats, tasks, projects",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        json!({
+            "name": "list_seats",
+            "description": "List active seats with usage stats",
+            "inputSchema": {"type":"object","properties":{
+                "limit": {"type":"number","default":100}
+            },"required":[]}
+        }),
+        json!({
+            "name": "notification_list",
+            "description": "List notifications for the seat (without popping; optional status filter)",
+            "inputSchema": {"type":"object","properties":{
+                "status": {"type":"string","description":"pending|delivered|dismissed"}
+            },"required":[]}
+        }),
         // pagination
         json!({
             "name": "get_page",
@@ -1784,6 +1835,171 @@ async fn call_tool(
             } else {
                 json!({"success": true, "module": module, "loaded_count": 0, "skipped_count": 0, "loaded_documents": []})
             }
+        }
+        "list_documents" => {
+            let category = args
+                .get("category")
+                .and_then(|v| v.as_str())
+                .and_then(DocumentCategory::parse);
+            let folder = args.get("folder").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            let query = args.get("query").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).min(500) as usize;
+            let filter = DocFilter {
+                category,
+                visible_to: Some(seat_id.into()),
+                ..Default::default()
+            };
+            let docs = engine
+                .store()
+                .kb_find(&filter, &DocSort::by_updated(SortDir::Desc), limit)
+                .await
+                .map_err(json_err)?;
+            let out: Vec<Value> = docs
+                .iter()
+                .filter(|d| folder.map_or(true, |f| d.folder.as_deref() == Some(f)))
+                .filter(|d| {
+                    query.map_or(true, |q| {
+                        let q = q.to_lowercase();
+                        d.document_id.to_lowercase().contains(&q)
+                            || d.content.to_lowercase().contains(&q)
+                    })
+                })
+                .map(|d| {
+                    json!({
+                        "document_id": d.document_id,
+                        "category": d.category.as_str(),
+                        "folder": d.folder,
+                        "tags": d.tags,
+                        "seat_id": d.seat_id,
+                        "created_at": d.created_at.to_rfc3339(),
+                        "updated_at": d.updated_at.to_rfc3339(),
+                        "content_preview": d.content.chars().take(200).collect::<String>(),
+                    })
+                })
+                .collect();
+            json!({"success": true, "documents": out, "count": out.len()})
+        }
+        "update_document" => {
+            let id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(mut doc) = engine.get_document(id).await.map_err(json_err)? else {
+                return Err(json!({"code": -32602, "message": format!("document not found: {id}")}));
+            };
+            if let Some(c) = args.get("content").and_then(|v| v.as_str()) {
+                doc.content = c.to_string();
+                doc.content_hash = slc_core::content_hash(c);
+            }
+            if let Some(t) = args.get("tags").and_then(|v| v.as_array()) {
+                doc.tags = t.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+            }
+            if let Some(al) = args.get("auto_load").and_then(|v| v.as_array()) {
+                doc.auto_load = al.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+            }
+            if let Some(r) = args.get("references").and_then(|v| v.as_array()) {
+                doc.references = r.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+            }
+            if let Some(m) = args.get("metadata").and_then(|v| v.as_object()) {
+                for (k, v) in m {
+                    doc.metadata.extra.insert(k.clone(), v.clone());
+                }
+            }
+            if let Some(s) = args.get("seat_id").and_then(|v| v.as_str()) {
+                doc.seat_id = if s.is_empty() { None } else { Some(s.into()) };
+            }
+            doc.updated_at = chrono::Utc::now();
+            doc.version += 1;
+            engine.store().kb_replace(&doc).await.map_err(json_err)?;
+            let _ = engine.reembed_document(id).await;
+            json!({"success": true, "document_id": id})
+        }
+        "delete_document" => {
+            let id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let purge = args.get("purge").and_then(|v| v.as_bool()).unwrap_or(false);
+            let ok = if purge {
+                engine.store().kb_purge(id).await.map_err(json_err)?
+            } else {
+                engine.store().kb_soft_delete(id).await.map_err(json_err)?
+            };
+            json!({"success": ok, "document_id": id, "purged": purge})
+        }
+        "document_stats" => {
+            let mut by_cat = serde_json::Map::new();
+            for cat in [
+                DocumentCategory::Core,
+                DocumentCategory::Module,
+                DocumentCategory::Task,
+                DocumentCategory::Project,
+                DocumentCategory::CodeSnippet,
+                DocumentCategory::Documentation,
+                DocumentCategory::Skill,
+                DocumentCategory::Custom,
+                DocumentCategory::System,
+            ] {
+                let n = engine
+                    .store()
+                    .kb_count(&DocFilter {
+                        category: Some(cat),
+                        visible_to: Some(seat_id.into()),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(json_err)?;
+                by_cat.insert(cat.as_str().into(), json!(n));
+            }
+            let total = engine
+                .store()
+                .kb_count(&DocFilter {
+                    visible_to: Some(seat_id.into()),
+                    ..Default::default()
+                })
+                .await
+                .map_err(json_err)?;
+            let episodic = engine
+                .store()
+                .episodic_count(&DocFilter::default())
+                .await
+                .map_err(json_err)?;
+            let seats = engine.seats.list_active(1000).await.map_err(json_err)?.len();
+            json!({
+                "total": total,
+                "by_category": by_cat,
+                "episodic": episodic,
+                "seats": seats,
+                "tasks": by_cat.get("task").cloned().unwrap_or(json!(0)),
+                "projects": by_cat.get("project").cloned().unwrap_or(json!(0)),
+            })
+        }
+        "list_seats" => {
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+            let seats = engine.seats.list_active(limit).await.map_err(json_err)?;
+            json!({
+                "seats": seats.iter().map(|s| json!({
+                    "seat_id": s.seat_id,
+                    "name": s.name,
+                    "status": s.status.as_str(),
+                    "created_at": s.created_at.to_rfc3339(),
+                    "last_accessed": s.last_accessed.to_rfc3339(),
+                    "usage_stats": s.usage_stats,
+                    "active_document_id": s.active_document_id,
+                })).collect::<Vec<_>>(),
+                "count": seats.len(),
+            })
+        }
+        "notification_list" => {
+            let status = args.get("status").and_then(|v| v.as_str());
+            let notes = engine
+                .list_notifications(seat_id, status)
+                .await
+                .map_err(json_err)?;
+            json!({
+                "notifications": notes.iter().map(|n| json!({
+                    "notification_id": n.notification_id,
+                    "source": n.source,
+                    "title": n.title,
+                    "body": n.body,
+                    "status": n.status,
+                    "created_at": n.created_at.to_rfc3339(),
+                })).collect::<Vec<_>>(),
+            })
         }
         _ => return Err(json!({"code": -32601, "message": format!("unknown tool: {name}")})),
     };
