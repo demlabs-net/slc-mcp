@@ -173,7 +173,10 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Serve { port, auto_commit } => {
-            config.auto_git_commit = auto_commit;
+            // Флаг --auto-commit дополняет env OBSIDIAN_AUTO_GIT_COMMIT,
+            // а не перезаписывает его (иначе авто-коммит vault выключен
+            // всегда, когда флаг не передан).
+            config.auto_git_commit = auto_commit || config.auto_git_commit;
             if config.mcp_sampling {
                 // Inference through the MCP client (sampling) — no local
                 // GPU/LLM needed; embeddings degrade to text-only search.
