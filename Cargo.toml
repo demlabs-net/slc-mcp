@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/slc-core", "crates/slc-mcp"]
+members = ["crates/slc-core", "crates/slc-mcp", "crates/slc-webui"]
 
 [workspace.package]
 edition = "2024"
@@ -20,7 +20,7 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
 rand = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
