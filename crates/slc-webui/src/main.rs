@@ -1,22 +1,25 @@
-//! slc-webui — веб-морда SLC: REST-прокси поверх MCP-сервера + раздача
-//! статики SPA. Vault остаётся за одним процессом (MCP-сервер) — webui
-//! общается с ним как обычный MCP-клиент (JSON-RPC по HTTP, X-Seat-ID).
+//! slc-webui — веб-морда SLC: REST-сервис поверх встроенного slc-core
+//! движка (не прокси над MCP) + раздача статики SPA.
+//!
+//! Vault открывается этим же процессом (Obsidian, тот же путь, что у
+//! MCP-сервера). Multi-process синхронизация: периодический `refresh`
+//! (SLC_VAULT_REFRESH_SECS, default 30с) — файлы vault являются источником
+//! истины. Авто-коммит/push vault — через OBSIDIAN_AUTO_GIT_COMMIT.
 
-mod proxy;
+mod api;
 mod static_files;
 
 use axum::{
     extract::DefaultBodyLimit,
-    routing::{delete, get, put},
+    routing::{delete, get, post, put},
     Router,
 };
+use slc_core::{SlcConfig, SlcEngine, StorageKind};
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {
-    /// MCP-сервер (http://127.0.0.1:3000 по умолчанию).
-    pub mcp_url: String,
-    pub http: reqwest::Client,
+    pub engine: Arc<SlcEngine>,
     /// Каталог со статикой SPA (web-ui/dist).
     pub dist: std::path::PathBuf,
 }
@@ -34,83 +37,80 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3002);
-    let mcp_url = std::env::var("SLC_MCP_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:3000".into());
     let dist = std::env::var("SLC_WEBUI_DIST")
         .unwrap_or_else(|_| "./web-ui/dist".into());
 
+    // Конфиг полностью из env (SLC_VAULT_PATH, LMSTUDIO_URL/OLLAMA,
+    // SLC_CONTEXT_LIMIT_TOKENS, OBSIDIAN_AUTO_GIT_COMMIT, SLC_AI_ORGANIZE…).
+    let config = SlcConfig::default();
+    if config.storage != StorageKind::ObsidianVault {
+        anyhow::bail!("webui supports only the Obsidian vault backend");
+    }
+    let engine = Arc::new(SlcEngine::open_async(config).await?);
+    // Таймеры (напоминания/компрессия) + refresh-луп multi-process синка.
+    engine.start_background().await?;
+
     let state = Arc::new(AppState {
-        mcp_url,
-        http: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()?,
+        engine,
         dist: std::path::PathBuf::from(dist),
     });
 
     let app = Router::new()
-        // health + stats
-        .route("/api/health", get(proxy::health))
-        .route("/api/stats", get(proxy::stats))
-        .route("/api/context", get(proxy::context))
-        // documents
+        .route("/api/health", get(api::health))
+        .route("/api/stats", get(api::stats))
+        .route("/api/context", get(api::context))
         .route(
             "/api/documents",
-            get(proxy::list_documents).post(proxy::add_document),
+            get(api::list_documents).post(api::add_document),
         )
         .route(
             "/api/documents/{id}",
-            get(proxy::get_document)
-                .put(proxy::update_document)
-                .delete(proxy::delete_document),
+            get(api::get_document)
+                .put(api::update_document)
+                .delete(api::delete_document),
         )
-        .route("/api/search", get(proxy::search))
-        // tasks / projects
+        .route("/api/search", get(api::search))
         .route(
             "/api/tasks",
-            get(proxy::list_tasks).post(proxy::create_task),
+            get(api::list_tasks).post(api::create_task),
         )
         .route(
             "/api/tasks/{id}",
-            put(proxy::update_task).delete(proxy::delete_task),
+            put(api::update_task).delete(api::delete_task),
         )
         .route(
             "/api/projects",
-            get(proxy::list_projects).post(proxy::create_project),
+            get(api::list_projects).post(api::create_project),
         )
         .route(
             "/api/projects/{id}",
-            put(proxy::update_project).delete(proxy::delete_project),
+            put(api::update_project).delete(api::delete_project),
         )
-        // seats, notifications, reminders, focuses
-        .route("/api/seats", get(proxy::list_seats))
+        .route("/api/seats", get(api::list_seats))
         .route(
             "/api/notifications",
-            get(proxy::notification_list).post(proxy::pop_notifications),
+            get(api::notification_list).post(api::pop_notifications),
         )
         .route(
             "/api/reminders",
-            get(proxy::reminder_list).post(proxy::reminder_create),
+            get(api::reminder_list).post(api::reminder_create),
         )
-        .route("/api/reminders/{id}", delete(proxy::reminder_cancel))
+        .route("/api/reminders/{id}", delete(api::reminder_cancel))
         .route(
             "/api/focuses",
-            get(proxy::focus_list).post(proxy::focus_add),
+            get(api::focus_list).post(api::focus_add),
         )
         .route(
             "/api/focuses/{id}",
-            put(proxy::focus_update).delete(proxy::focus_remove),
+            put(api::focus_update).delete(api::focus_remove),
         )
-        .route("/api/page", get(proxy::get_page))
-        .route("/api/events", get(proxy::sse_events))
+        .route("/api/events", get(api::sse_events))
         .fallback(static_files::handler)
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("SLC webui listening on http://{addr} (MCP: {})", {
-        let s = std::env::var("SLC_MCP_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".into());
-        s
-    });
+    tracing::info!("SLC webui listening on http://{addr} (embedded slc-core)");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

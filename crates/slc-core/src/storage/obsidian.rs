@@ -1045,6 +1045,15 @@ impl StorageBackend for ObsidianVaultStore {
         self.root.exists()
     }
 
+    /// Multi-process sync: re-scan the vault from disk (documents, seats,
+    /// sidecars). Files are the source of truth — picks up changes made by
+    /// another service (e.g. the web UI) sharing the same vault.
+    async fn refresh(&self) -> SlcResult<()> {
+        self.rebuild_index()?;
+        self.load_sidecars()?;
+        Ok(())
+    }
+
     async fn close(&self) -> SlcResult<()> {
         Ok(())
     }
