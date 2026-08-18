@@ -486,6 +486,37 @@ impl StorageBackend for SqliteStore {
         .await
     }
 
+    async fn kb_rename(&self, old_id: &str, new_id: &str) -> SlcResult<bool> {
+        let old = old_id.to_string();
+        let new = new_id.to_string();
+        self.blocking(move |conn| {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM documents WHERE document_id = ?1 AND deleted_at IS NULL",
+                    params![new],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                return Err(SlcError::Storage(format!("document already exists: {new}")));
+            }
+            let n = conn.execute(
+                "UPDATE documents SET document_id = ?1 WHERE document_id = ?2",
+                params![new, old],
+            )?;
+            if n == 0 {
+                return Ok(false);
+            }
+            conn.execute(
+                "UPDATE embeddings SET document_id = ?1 WHERE document_id = ?2",
+                params![new, old],
+            )?;
+            Ok(true)
+        })
+        .await
+    }
+
     async fn kb_purge(&self, document_id: &str) -> SlcResult<bool> {
         let id = document_id.to_string();
         self.blocking(move |conn| {

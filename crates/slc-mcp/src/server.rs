@@ -764,6 +764,30 @@ fn tools() -> Vec<Value> {
             },"required":[]}
         }),
         json!({
+            "name": "rename_document",
+            "description": "Переименовать документ (сменить document_id/имя файла) — работает для документов, задач и проектов. Каскадно чинит: auto_load/references всех документов, проектные связи задач, вики-ссылки [[old]] в контенте, активные указатели сидов. Только свои (видимые) документы.",
+            "inputSchema": {"type":"object","properties":{
+                "document_id": {"type":"string"},
+                "new_document_id": {"type":"string","description":"новый уникальный id (slug)"}
+            },"required":["document_id","new_document_id"]}
+        }),
+        json!({
+            "name": "rename_task",
+            "description": "Переименовать задачу: новый id = slug от new_name, name обновляется; auto_load/references/проектные связи/указатели сидов чинятся каскадно.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"},
+                "new_name": {"type":"string"}
+            },"required":["task_id","new_name"]}
+        }),
+        json!({
+            "name": "rename_project",
+            "description": "Переименовать проект: новый id = slug от new_name, name обновляется; задачи проекта и ссылки чинятся каскадно.",
+            "inputSchema": {"type":"object","properties":{
+                "project_id": {"type":"string"},
+                "new_name": {"type":"string"}
+            },"required":["project_id","new_name"]}
+        }),
+        json!({
             "name": "list_documents",
             "description": "List knowledge documents (id/category/folder/tags, no content) with optional filters",
             "inputSchema": {"type":"object","properties":{
@@ -985,6 +1009,14 @@ pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инс�
 
 `check_notifications` в начале каждого хода — там могут быть фокус- или
 таймер-напоминания, требующие действий.
+
+## Переименование
+
+`rename_document` меняет document_id (имя файла) любого документа, задачи
+или проекта с каскадным исправлением ссылок (auto_load/references,
+проектные связи, вики-ссылки [[old]], активные указатели сидов).
+`rename_task`/`rename_project` принимают новое человекочитаемое имя и сами
+строят новый id (slug) — предпочитай их для задач и проектов.
 
 ## Роли сидов
 
@@ -1993,6 +2025,42 @@ async fn call_tool(
                 .map(|r| r.as_str())
                 .collect();
             json!({"success": true, "seat_id": q, "roles": roles, "can_manage_seats": engine.can_manage_seats(q)})
+        }
+        "rename_document" => {
+            let document_id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let new_id = args.get("new_document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let report = engine
+                .rename_document(seat_id, document_id, new_id, None)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "old_id": report.old_id, "new_id": report.new_id,
+                   "links_fixed": report.links_fixed, "content_links_fixed": report.content_links_fixed,
+                   "seats_updated": report.seats_updated,
+                   "message": format!("Renamed {} → {}", report.old_id, report.new_id)})
+        }
+        "rename_task" => {
+            let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let new_name = args.get("new_name").and_then(|v| v.as_str()).unwrap_or("");
+            let report = engine
+                .rename_task(seat_id, task_id, new_name)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "old_id": report.old_id, "new_id": report.new_id,
+                   "name": new_name, "links_fixed": report.links_fixed,
+                   "seats_updated": report.seats_updated,
+                   "message": format!("Task renamed: {} → {}", report.old_id, report.new_id)})
+        }
+        "rename_project" => {
+            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let new_name = args.get("new_name").and_then(|v| v.as_str()).unwrap_or("");
+            let report = engine
+                .rename_project(seat_id, project_id, new_name)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "old_id": report.old_id, "new_id": report.new_id,
+                   "name": new_name, "links_fixed": report.links_fixed,
+                   "seats_updated": report.seats_updated,
+                   "message": format!("Project renamed: {} → {}", report.old_id, report.new_id)})
         }
         "list_documents" => {
             let category = args
