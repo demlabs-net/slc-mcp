@@ -80,17 +80,19 @@
       остаётся только **агентский поиск** (agentic search на gemma-4-e4b:
       multi-hop retrieve → answer, в рамках `search`/RAG).
 
-## P6 — Web UI (Rust, standalone)
-- [ ] **Web UI портируем на Rust** как отдельный standalone-сервер
-      (crate `slc-webui`, консолидированная точка доступа к движку через
-      `slc-core`/REST).
-- [ ] REST API слой (роуты: docs/history/search/seats/tasks/projects/
-      profiles/focus/ideas/reminders/notifications; auth как в MCP).
-- [ ] фронтенд (статика + интерактив) обслуживается тем же сервером.
-- [ ] деплой: **отдельный Docker** для `slc-webui` (не с MCP-сервером).
+## P6 — Web UI (встроен в slc-mcp)
+- [x] REST API + статика SPA встроены в **slc-mcp** (один процесс владеет
+      vault'ом — конфликтов одновременного доступа нет).
+- [x] REST-слой: documents/tasks/projects/seats/search/context/
+      notifications/reminders/focuses/stats (/api/*).
+- [x] Auth: полный порт легаси-стека — users/пароли (bcrypt-совместимо),
+      JWT access+refresh с ротацией, RBAC (группы), audit-log, rate-limit,
+      Yandex OAuth2 + allowlist (env + правила oauth_access_rules), admin-
+      эндпоинты пользователей.
+- [x] Фронтенд (Svelte 5) обслуживается тем же сервером (fallback index.html).
 
 ## Вне скоупа (другие агенты)
-REST/Web UI для Vassista-клиентов (помимо нашего standalone `slc-webui`),
+REST/Web UI для Vassista-клиентов (помимо встроенной в `slc-mcp` веб-морды),
 wake/VAD/STT/TTS/LLM, s2s, Metal TTS, e2e talk. Агентская система
 (LangGraph-эквивалент, субагенты, runs) — **не портируем**; только агентский
 поиск.

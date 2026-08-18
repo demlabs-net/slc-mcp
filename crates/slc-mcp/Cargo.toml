@@ -23,6 +23,11 @@ uuid = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
 chrono = { workspace = true }
+reqwest = { workspace = true }
+jsonwebtoken = { workspace = true }
+bcrypt = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
 slc-core = { workspace = true }
 
 [dev-dependencies]

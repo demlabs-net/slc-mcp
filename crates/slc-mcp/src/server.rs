@@ -11,11 +11,13 @@ use axum::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
 use serde_json::{Value, json};
 use slc_core::{DocFilter, DocMeta, DocSort, Document, DocumentCategory, SlcEngine, SortDir};
 use std::sync::Arc;
+
+use crate::{auth, webui};
 
 pub struct AppState {
     pub engine: Arc<SlcEngine>,
@@ -26,11 +28,17 @@ pub struct AppState {
     pub sampling: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
     >,
+    /// Каталог со статикой SPA (web-ui/dist) для встроенной веб-морды.
+    pub dist: std::path::PathBuf,
+    /// Авторизация веб-морды (users/JWT/RBAC/Yandex OAuth, SLC_AUTH).
+    pub auth: std::sync::Arc<auth::AuthState>,
 }
 
 pub async fn run(
     engine: SlcEngine,
     port: u16,
+    dist: std::path::PathBuf,
+    auth_state: auth::AuthState,
     sampling_out: Option<tokio::sync::mpsc::Receiver<Value>>,
     sampling: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
@@ -53,16 +61,89 @@ pub async fn run(
         engine: Arc::new(engine),
         events: tx,
         sampling,
+        dist,
+        auth: std::sync::Arc::new(auth_state),
     });
     let app = Router::new()
         .route("/mcp", post(mcp))
         .route("/sse", get(sse_endpoint))
         .route("/messages", post(messages))
         .route("/health", get(health))
+        // ── Веб-морда (REST + SPA, тот же процесс) ──
+        .route("/api/health", get(webui::api::health))
+        .route("/api/stats", get(webui::api::stats))
+        .route("/api/context", get(webui::api::context))
+        .route(
+            "/api/documents",
+            get(webui::api::list_documents).post(webui::api::add_document),
+        )
+        .route(
+            "/api/documents/{id}",
+            get(webui::api::get_document)
+                .put(webui::api::update_document)
+                .delete(webui::api::delete_document),
+        )
+        .route("/api/search", get(webui::api::search))
+        .route("/api/tasks", get(webui::api::list_tasks).post(webui::api::create_task))
+        .route(
+            "/api/tasks/{id}",
+            put(webui::api::update_task).delete(webui::api::delete_task),
+        )
+        .route(
+            "/api/projects",
+            get(webui::api::list_projects).post(webui::api::create_project),
+        )
+        .route(
+            "/api/projects/{id}",
+            put(webui::api::update_project).delete(webui::api::delete_project),
+        )
+        .route("/api/seats", get(webui::api::list_seats))
+        .route(
+            "/api/notifications",
+            get(webui::api::notification_list).post(webui::api::pop_notifications),
+        )
+        .route(
+            "/api/reminders",
+            get(webui::api::reminder_list).post(webui::api::reminder_create),
+        )
+        .route("/api/reminders/{id}", delete(webui::api::reminder_cancel))
+        .route("/api/focuses", get(webui::api::focus_list).post(webui::api::focus_add))
+        .route(
+            "/api/focuses/{id}",
+            put(webui::api::focus_update).delete(webui::api::focus_remove),
+        )
+        .route("/api/events", get(webui::api::sse_events))
+        // ── Авторизация веб-морды (полный порт легаси) ──
+        .route("/api/auth/register", post(auth::routes::register))
+        .route("/api/auth/login", post(auth::routes::login))
+        .route("/api/auth/refresh", post(auth::routes::refresh))
+        .route("/api/auth/logout", post(auth::routes::logout))
+        .route("/api/auth/me", get(auth::routes::me))
+        .route(
+            "/api/auth/oauth/yandex",
+            get(auth::routes::oauth_yandex_redirect).post(auth::routes::oauth_yandex_code),
+        )
+        .route("/api/auth/oauth/yandex/callback", get(auth::routes::oauth_yandex_callback))
+        .route("/api/auth/oauth/yandex/callback_uri", get(auth::routes::oauth_callback_uri))
+        .route("/api/auth/exchange", post(auth::routes::exchange))
+        .route("/api/auth/users", get(auth::routes::list_users))
+        .route("/api/auth/users/{user_id}/groups", put(auth::routes::update_user_groups))
+        .route("/api/auth/users/{user_id}/active", put(auth::routes::toggle_user_active))
+        .route("/api/auth/groups", get(auth::routes::list_groups))
+        .route("/api/admin/oauth/rules", get(auth::routes::oauth_rules_list).post(auth::routes::oauth_rule_create))
+        .route(
+            "/api/admin/oauth/rules/{rule_id}",
+            put(auth::routes::oauth_rule_update).delete(auth::routes::oauth_rule_delete),
+        )
+        .route("/api/admin/oauth/ya360/status", get(auth::routes::ya360_status))
+        .fallback(webui::static_files::handler)
+        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("SLC MCP listening on http://{addr}/mcp (SSE: /sse → /messages)");
+    tracing::info!(
+        "SLC MCP listening on http://{addr}/mcp (SSE: /sse → /messages; web UI: /api, /)"
+    );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

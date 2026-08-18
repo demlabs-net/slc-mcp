@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { api, getSeat } from '../lib/api';
+  import { tokenForStream } from '../lib/auth';
   import Alert from '../components/ui/Alert.svelte';
   import Spinner from '../components/ui/Spinner.svelte';
   import Badge from '../components/ui/Badge.svelte';
@@ -44,7 +45,10 @@
     const interval = setInterval(load, 30000);
     // SSE-уведомления
     try {
-      es = new EventSource(`/api/events?seat=${encodeURIComponent(getSeat())}`);
+      const token = tokenForStream();
+      es = new EventSource(
+        `/api/events?seat=${encodeURIComponent(getSeat())}${token ? `&token=${encodeURIComponent(token)}` : ''}`
+      );
       es.onmessage = (ev) => {
         sseLog = [...sseLog.slice(-19), ev.data.slice(0, 200)];
       };

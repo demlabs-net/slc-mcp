@@ -1,8 +1,7 @@
-//! REST-хендлеры веб-морды: напрямую через встроенный slc-core движок
-//! (не прокси над MCP). Vault открывается этим же процессом; multi-process
-//! синхронизация — через периодический `refresh` (SLC_VAULT_REFRESH_SECS).
+//! REST-хендлеры веб-морды: напрямую через движок того же процесса, что и
+//! MCP-сервер (один владелец vault — ноль конфликтов одновременного доступа).
 
-use crate::AppState;
+use crate::server::AppState;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -14,7 +13,7 @@ use slc_core::{DocFilter, DocSort, DocumentCategory, SlcEngine, SortDir};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -36,30 +35,79 @@ fn bad(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
 }
 
-/// Seat-id: заголовок X-Seat-ID → кука slc_seat → сгенерированный
-/// (при генерации ставим Set-Cookie, чтобы UI держал тот же сид).
-fn resolve_seat(headers: &HeaderMap) -> (String, Option<String>) {
-    if let Some(v) = headers.get("x-seat-id").and_then(|v| v.to_str().ok()) {
-        if !v.trim().is_empty() {
-            return (v.trim().to_string(), None);
-        }
+/// Seat-id запроса.
+/// - full-режим (SLC_AUTH=full): Bearer-JWT → пользователь → сид
+///   `user_<user_id>` (persistent); без валидного токена — 401.
+/// - seat-режим: заголовок X-Seat-ID → кука slc_seat → сгенерированный
+///   (при генерации ставим Set-Cookie, чтобы UI держал тот же сид).
+pub async fn resolve_seat(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, Option<String>), ApiError> {
+    if state.auth.mode == crate::auth::AuthMode::Full {
+        let user = state
+            .auth
+            .user_from_bearer(bearer_from(headers).as_deref())
+            .ok_or_else(|| {
+                ApiError(StatusCode::UNAUTHORIZED, "Invalid authentication credentials".into())
+            })?;
+        let seat_id = user.user_id.clone();
+        state
+            .engine
+            .seats
+            .ensure_seat(&seat_id)
+            .await
+            .map_err(|e| internal(e.to_string()))?;
+        return Ok((seat_id, None));
     }
-    if let Some(cookie) = headers
+    let seat_id = if let Some(v) = headers.get("x-seat-id").and_then(|v| v.to_str().ok()) {
+        if !v.trim().is_empty() {
+            v.trim().to_string()
+        } else {
+            seat_from_cookie(headers).unwrap_or_else(|| format!("slc_web_{}", uuid_like()))
+        }
+    } else {
+        seat_from_cookie(headers).unwrap_or_else(|| format!("slc_web_{}", uuid_like()))
+    };
+    state
+        .engine
+        .seats
+        .ensure_seat(&seat_id)
+        .await
+        .map_err(|e| internal(e.to_string()))?;
+    let cookie = if has_cookie(&seat_id, headers) {
+        None
+    } else {
+        Some(format!("slc_seat={seat_id}; Path=/; Max-Age=31536000; SameSite=Lax"))
+    };
+    return Ok((seat_id, cookie));
+}
+
+fn seat_from_cookie(headers: &HeaderMap) -> Option<String> {
+    let cookie = headers
         .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-    {
-        for part in cookie.split(';') {
-            let part = part.trim();
-            if let Some(v) = part.strip_prefix("slc_seat=") {
-                if !v.is_empty() {
-                    return (v.to_string(), None);
-                }
+        .and_then(|v| v.to_str().ok())?;
+    for part in cookie.split(';') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("slc_seat=") {
+            if !v.is_empty() {
+                return Some(v.to_string());
             }
         }
     }
-    let id = format!("slc_web_{}", uuid_like());
-    let cookie = format!("slc_seat={id}; Path=/; Max-Age=31536000; SameSite=Lax");
-    (id, Some(cookie))
+    None
+}
+
+fn has_cookie(seat_id: &str, headers: &HeaderMap) -> bool {
+    seat_from_cookie(headers).as_deref() == Some(seat_id)
+}
+
+
+fn bearer_from(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 fn uuid_like() -> String {
@@ -95,7 +143,11 @@ macro_rules! seat_handler {
             State($state): State<Arc<AppState>>,
             headers: HeaderMap,
         ) -> Response {
-            let (seat, cookie) = resolve_seat(&headers);
+            let (seat, cookie) = match resolve_seat(&$state, &headers).await {
+                Ok(x) => x,
+                Err(e) => return e.into_response(),
+            };
+            #[allow(unused_variables)]
             let $seat = seat.as_str();
             match (async { Ok::<Value, ApiError>($body) }).await {
                 Ok(v) => with_seat_cookie(Json(v), cookie),
@@ -110,7 +162,7 @@ macro_rules! seat_handler {
 pub async fn health(State(state): State<Arc<AppState>>) -> ApiResult {
     Ok(Json(json!({
         "status": if state.engine.health().await { "ok" } else { "degraded" },
-        "server": "slc-webui",
+        "server": concat!("slc-mcp ", env!("CARGO_PKG_VERSION")),
         "services": { "storage": state.engine.health().await },
     })))
 }
@@ -201,7 +253,10 @@ pub async fn list_documents(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let engine = &state.engine;
     let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200).min(500);
     let filter = DocFilter {
@@ -250,7 +305,10 @@ pub async fn get_document(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (_seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     match state.engine.get_document(&id).await {
         Ok(Some(d)) => with_seat_cookie(
             Json(json!({
@@ -278,7 +336,10 @@ pub async fn add_document(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let engine = &state.engine;
     let id = body.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
     if id.is_empty() {
@@ -319,7 +380,10 @@ pub async fn update_document(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (_seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let engine = &state.engine;
     let doc = match engine.get_document(&id).await {
         Ok(Some(d)) => d,
@@ -367,7 +431,10 @@ pub async fn delete_document(
     Path(id): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (_seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let engine = &state.engine;
     let purge = q.get("purge").map(|v| v == "true").unwrap_or(false);
     let res = if purge {
@@ -387,7 +454,10 @@ pub async fn search(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let query = q.get("q").cloned().unwrap_or_default();
     if query.is_empty() {
         return bad("q required").into_response();
@@ -417,7 +487,10 @@ pub async fn list_tasks(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let project_id = q.get("project_id").filter(|s| !s.is_empty()).map(String::as_str);
     let status = q.get("status").filter(|s| !s.is_empty()).map(String::as_str);
     let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200);
@@ -442,7 +515,10 @@ pub async fn create_task(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
     if name.is_empty() {
         return bad("name required").into_response();
@@ -477,7 +553,10 @@ pub async fn update_task(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let name = body.get("name").and_then(|v| v.as_str());
     let description = body.get("description").and_then(|v| v.as_str());
     let description_patch = body.get("description_patch").cloned();
@@ -523,7 +602,10 @@ pub async fn delete_task(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     match state.engine.task_delete(&seat, &id).await {
         Ok(ok) => with_seat_cookie(
             Json(json!({"success": ok, "task_id": id, "message": if ok { "Task deleted" } else { "Task not found" }})),
@@ -538,7 +620,10 @@ pub async fn list_projects(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200);
     match state.engine.project_list(&seat, None, limit).await {
         Ok(projects) => with_seat_cookie(
@@ -561,7 +646,10 @@ pub async fn create_project(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
     if name.is_empty() {
         return bad("name required").into_response();
@@ -595,7 +683,10 @@ pub async fn update_project(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let name = body.get("name").and_then(|v| v.as_str());
     let description = body.get("description").and_then(|v| v.as_str());
     let description_patch = body.get("description_patch").cloned();
@@ -636,7 +727,10 @@ pub async fn delete_project(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     match state.engine.project_delete(&seat, &id).await {
         Ok(ok) => with_seat_cookie(
             Json(json!({"success": ok, "project_id": id, "message": if ok { "Project deleted" } else { "Project not found" }})),
@@ -700,7 +794,10 @@ pub async fn reminder_create(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
     let remind_at_raw = body.get("remind_at").and_then(|v| v.as_str()).unwrap_or("");
     let remind_at = match chrono::DateTime::parse_from_rfc3339(remind_at_raw) {
@@ -728,7 +825,10 @@ pub async fn reminder_cancel(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     match state.engine.reminder_cancel(&seat, &id).await {
         Ok(ok) => with_seat_cookie(Json(json!({"success": ok, "reminder_id": id})), cookie),
         Err(e) => internal(e.to_string()).into_response(),
@@ -753,7 +853,10 @@ pub async fn focus_add(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("");
     if title.is_empty() {
         return bad("title required").into_response();
@@ -785,7 +888,10 @@ pub async fn focus_update(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let title = body.get("title").and_then(|v| v.as_str());
     let description = body.get("description").and_then(|v| v.as_str());
     let priority = body.get("priority").and_then(|v| v.as_i64());
@@ -811,7 +917,10 @@ pub async fn focus_remove(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let (seat, cookie) = resolve_seat(&headers);
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     match state.engine.focus_remove(&seat, &id).await {
         Ok(ok) => with_seat_cookie(Json(json!({"success": ok, "focus_id": id})), cookie),
         Err(e) => internal(e.to_string()).into_response(),
@@ -823,8 +932,20 @@ pub async fn focus_remove(
 pub async fn sse_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let (seat, _cookie) = resolve_seat(&headers);
+    // EventSource не умеет заголовки — в full-режиме токен можно передать
+    // query-параметром (?token=). Подменяем заголовок до резолва сида.
+    let mut headers = headers;
+    if let Some(token) = q.get("token").filter(|t| !t.is_empty()) {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {token}")) {
+            headers.insert(axum::http::header::AUTHORIZATION, v);
+        }
+    }
+    let (seat, _cookie) = match resolve_seat(&state, &headers).await {
+        Ok(x) => x,
+        Err(e) => return e.into_response(),
+    };
     let engine = state.engine.clone();
     let stream = async_stream::stream! {
         let mut last_count = 0usize;
