@@ -13,6 +13,8 @@
 #[cfg(feature = "candle-emb")]
 pub mod candle_emb;
 
+use serde_json::json;
+
 pub mod auth;
 pub mod error;
 pub mod focus;
@@ -132,6 +134,20 @@ pub struct ReindexReport {
     pub reindexed: usize,
     /// Пропущено (другой сид при --seat).
     pub skipped: usize,
+}
+
+/// Отчёт переименования документа (`rename_document`/`rename_task`/
+/// `rename_project`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RenameReport {
+    pub old_id: String,
+    pub new_id: String,
+    /// Всего затронутых документов (ссылочные поля и/или контент).
+    pub links_fixed: usize,
+    /// Документы, в контенте которых заменены вики-ссылки [[old]].
+    pub content_links_fixed: usize,
+    /// Сиды с обновлёнными активными указателями.
+    pub seats_updated: Vec<String>,
 }
 
 /// Engine configuration.
@@ -1013,6 +1029,181 @@ impl SlcEngine {
         f.set_archived(focus_id, target_seat, archived).await
     }
 
+    // ── переименование документов (каскад ссылок) ──────────────────────
+
+    /// Переименовать документ (любой категории, включая задачи и проекты):
+    /// смена document_id/имени файла + каскадное исправление ссылок —
+    /// auto_load/references всех документов, проектные связи задач
+    /// (metadata.project/project_id), вики-ссылки `[[old]]` в контенте и
+    /// активные указатели сидов. `new_name` (для задач/проектов) обновляет
+    /// человекочитаемое имя. Только видимые сиду документы.
+    pub async fn rename_document(
+        &self,
+        seat_id: &str,
+        document_id: &str,
+        new_id: &str,
+        new_name: Option<&str>,
+    ) -> SlcResult<RenameReport> {
+        if new_id.trim().is_empty() {
+            return Err(SlcError::InvalidInput("new_document_id required".into()));
+        }
+        if new_id == document_id {
+            return Err(SlcError::InvalidInput("new id must differ".into()));
+        }
+        let Some(mut doc) = self.get_document(document_id).await? else {
+            return Err(SlcError::NotFound(format!("document not found: {document_id}")));
+        };
+        if !doc.is_kb_visible(seat_id) {
+            return Err(SlcError::NotFound(format!("document not found: {document_id}")));
+        }
+        if self.store.kb_get(new_id).await?.is_some() {
+            return Err(SlcError::InvalidInput(format!(
+                "document already exists: {new_id}"
+            )));
+        }
+
+        let mut links_fixed = 0usize;
+        let mut content_links_fixed = 0usize;
+        let all = self
+            .store
+            .kb_find(&DocFilter::default(), &DocSort::default(), 100_000)
+            .await?;
+        let mut reembed: Vec<String> = Vec::new();
+        for mut d in all {
+            let mut changed = false;
+            // Ссылочные поля.
+            let fix = |ids: &mut Vec<String>| -> bool {
+                let mut c = false;
+                for id in ids.iter_mut() {
+                    if id == document_id {
+                        *id = new_id.to_string();
+                        c = true;
+                    }
+                }
+                c
+            };
+            let mut c1 = fix(&mut d.auto_load);
+            let mut c2 = fix(&mut d.references);
+            // Проектные связи задач (metadata.project / project_id).
+            let mut c3 = false;
+            for key in ["project", "project_id"] {
+                if d.metadata.extra.get(key).and_then(|v| v.as_str()) == Some(document_id) {
+                    d.metadata
+                        .extra
+                        .insert(key.into(), json!(new_id));
+                    c3 = true;
+                }
+            }
+            // Вики-ссылки [[old]] / [[old|alias]] в контенте.
+            let old_bracket = format!("[[{document_id}]]");
+            let old_pipe = format!("[[{document_id}|");
+            let mut c4 = false;
+            if d.content.contains(&old_bracket) || d.content.contains(&old_pipe) {
+                d.content = d
+                    .content
+                    .replace(&old_bracket, &format!("[[{new_id}]]"))
+                    .replace(&old_pipe, &format!("[[{new_id}|"));
+                d.content_hash = content_hash(&d.content);
+                c4 = true;
+            }
+            if c1 || c2 || c3 || c4 {
+                d.updated_at = chrono::Utc::now();
+                d.version += 1;
+                self.store.kb_replace(&d).await?;
+                changed = true;
+            }
+            if changed && c4 {
+                links_fixed += 1;
+                content_links_fixed += 1;
+            } else if changed {
+                links_fixed += 1;
+            }
+            if c4 {
+                reembed.push(d.document_id);
+            }
+        }
+
+        // Само переименование (файл/ключ).
+        let ok = self.store.kb_rename(document_id, new_id).await?;
+        if !ok {
+            return Err(SlcError::NotFound(format!(
+                "document not found: {document_id}"
+            )));
+        }
+
+        // Человекочитаемое имя для задач/проектов.
+        if let Some(name) = new_name.filter(|n| !n.trim().is_empty()) {
+            if matches!(
+                doc.category,
+                DocumentCategory::Task | DocumentCategory::Project
+            ) {
+                if let Some(mut d) = self.store.kb_get(new_id).await? {
+                    d.metadata.extra.insert("name".into(), json!(name));
+                    d.updated_at = chrono::Utc::now();
+                    d.version += 1;
+                    self.store.kb_replace(&d).await?;
+                }
+            }
+        }
+
+        // Активные указатели сидов (унифицированный и task-указатель).
+        let mut seats_updated = Vec::new();
+        for seat in self.seats.list_active(1000).await? {
+            let mut changed = false;
+            let mut s = seat;
+            if s.active_task_id.as_deref() == Some(document_id) {
+                s.active_task_id = Some(new_id.to_string());
+                changed = true;
+            }
+            if s.active_document_id.as_deref() == Some(document_id) {
+                s.active_document_id = Some(new_id.to_string());
+                changed = true;
+            }
+            if changed {
+                self.store.insert_seat(&s).await?;
+                seats_updated.push(s.seat_id);
+            }
+        }
+
+        let _ = self.reembed_document(new_id).await;
+        for id in reembed {
+            let _ = self.reembed_document(&id).await;
+        }
+
+        Ok(RenameReport {
+            old_id: document_id.to_string(),
+            new_id: new_id.to_string(),
+            links_fixed,
+            content_links_fixed,
+            seats_updated,
+        })
+    }
+
+    /// Переименовать задачу: новый id — slug от `new_name` (как при
+    /// создании), name обновляется, ссылки чинятся каскадно.
+    pub async fn rename_task(
+        &self,
+        seat_id: &str,
+        task_id: &str,
+        new_name: &str,
+    ) -> SlcResult<RenameReport> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        let new_id = m.speaking_id(new_name).await;
+        self.rename_document(seat_id, task_id, &new_id, Some(new_name)).await
+    }
+
+    /// Переименовать проект: новый id — slug от `new_name`, name обновляется.
+    pub async fn rename_project(
+        &self,
+        seat_id: &str,
+        project_id: &str,
+        new_name: &str,
+    ) -> SlcResult<RenameReport> {
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        let new_id = m.speaking_id(new_name).await;
+        self.rename_document(seat_id, project_id, &new_id, Some(new_name)).await
+    }
+
     /// The seat's active document, if any (task fallback included).
     pub async fn document_get_active(&self, seat_id: &str) -> SlcResult<Option<Document>> {
         let Some(id) = self.store.get_seat_active_document(seat_id).await? else {
@@ -1504,6 +1695,83 @@ mod engine_tests {
         assert_eq!(engine.seat_roles("boss"), vec![SeatRole::Operator]);
         assert!(engine.can_manage_seats("boss"));
         assert!(!engine.can_manage_seats("worker"));
+    }
+
+    /// Переименование документа: каскад auto_load/references/вики-ссылок/
+    /// активных указателей сидов; rename_task строит slug от нового имени.
+    #[tokio::test]
+    async fn rename_document_cascades_links() {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
+        let engine = SlcEngine::with(store.clone(), llm, SlcConfig::default());
+        engine.ensure_seat("seat_a").await.unwrap();
+
+        let mut doc = Document::new(
+            "old_name",
+            DocumentCategory::Custom,
+            "текст со ссылкой [[old_name]] и [[old_name|alias]]",
+            DocMeta::default(),
+            vec![],
+            Some("seat_a".to_string()),
+        );
+        engine.add_document(&mut doc).await.unwrap();
+        // Ссылающийся документ.
+        let mut ref_doc = Document::new(
+            "ref_doc",
+            DocumentCategory::Custom,
+            "ссылки",
+            DocMeta::default(),
+            vec![],
+            Some("seat_a".to_string()),
+        );
+        ref_doc.auto_load = vec!["old_name".into()];
+        ref_doc.references = vec!["old_name".into()];
+        engine.add_document(&mut ref_doc).await.unwrap();
+        // Активный указатель сида на старый id.
+        engine.document_activate("seat_a", "old_name").await.unwrap();
+
+        let report = engine.rename_document("seat_a", "old_name", "new_name", None).await.unwrap();
+        assert_eq!(report.new_id, "new_name");
+        assert_eq!(report.links_fixed, 2); // сам документ (контент) + ref_doc
+        assert_eq!(report.content_links_fixed, 1); // только сам документ
+        assert!(report.seats_updated.contains(&"seat_a".to_string()));
+
+        // Старый id исчез, новый на месте, контент с заменёнными ссылками.
+        assert!(engine.get_document("old_name").await.unwrap().is_none());
+        let renamed = engine.get_document("new_name").await.unwrap().unwrap();
+        assert_eq!(renamed.content, "текст со ссылкой [[new_name]] и [[new_name|alias]]");
+        // Указатель сида обновлён.
+        assert_eq!(
+            engine.document_get_active("seat_a").await.unwrap().unwrap().document_id,
+            "new_name"
+        );
+        // Ссылки обновлены.
+        let refd = engine.get_document("ref_doc").await.unwrap().unwrap();
+        assert_eq!(refd.auto_load, vec!["new_name".to_string()]);
+        assert_eq!(refd.references, vec!["new_name".to_string()]);
+        // Ссылка на несуществующий id — ошибка.
+        let err = engine.rename_document("seat_a", "new_name", "new_name", None).await.unwrap_err();
+        assert!(matches!(err, SlcError::InvalidInput(_)));
+    }
+
+    /// rename_task: новый id = slug от имени, name обновляется.
+    #[tokio::test]
+    async fn rename_task_builds_slug() {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
+        let engine = SlcEngine::with(store.clone(), llm, SlcConfig::default());
+        engine.ensure_seat("seat_a").await.unwrap();
+        let task = engine.task_create("seat_a", "Старая задача", "", None, &[], &json!({})).await.unwrap();
+
+        let report = engine.rename_task("seat_a", &task.task_id, "Новая задача").await.unwrap();
+        assert_eq!(report.new_id, "novaya_zadacha");
+        assert!(engine.get_document(&task.task_id).await.unwrap().is_none());
+        let t = engine.task_list("seat_a", None, None, 10).await.unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].task_id, "novaya_zadacha");
+        assert_eq!(t[0].name, "Новая задача");
     }
 }
 

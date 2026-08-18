@@ -735,6 +735,36 @@ impl StorageBackend for ObsidianVaultStore {
         Ok(true)
     }
 
+    async fn kb_rename(&self, old_id: &str, new_id: &str) -> SlcResult<bool> {
+        // Вся работа с guard — в блоке без await (future должен быть Send).
+        let renamed = {
+            let mut index = self.index.lock().unwrap();
+            let Some(entry) = index.get(old_id).cloned() else {
+                return Ok(false);
+            };
+            if index.contains_key(new_id) {
+                return Err(SlcError::Storage(format!(
+                    "document already exists: {new_id}"
+                )));
+            }
+            let dir = self.root.join(sanitize_folder(&entry.folder)?);
+            let old_path = dir.join(format!("{}.md", safe_file_name(old_id)));
+            let new_path = dir.join(format!("{}.md", safe_file_name(new_id)));
+            if !old_path.is_file() {
+                return Ok(false);
+            }
+            std::fs::rename(&old_path, &new_path)?;
+            index.remove(old_id);
+            let mut e = entry;
+            e.id = new_id.to_string();
+            index.insert(new_id.to_string(), e);
+            true
+        };
+        self.persist_index()?;
+        self.git_commit().await;
+        Ok(renamed)
+    }
+
     async fn kb_purge(&self, document_id: &str) -> SlcResult<bool> {
         let entry = self.index.lock().unwrap().remove(document_id);
         let Some(e) = entry else { return Ok(false) };

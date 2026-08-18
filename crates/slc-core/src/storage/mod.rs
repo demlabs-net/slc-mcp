@@ -17,7 +17,7 @@ pub mod mongodb;
 pub mod obsidian;
 pub mod sqlite;
 
-use crate::error::SlcResult;
+use crate::error::{SlcError, SlcResult};
 use crate::model::{
     Document, DocumentCategory, DocLevel, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat,
     SeatStatus,
@@ -114,6 +114,24 @@ pub trait StorageBackend: Send + Sync {
     /// Full replace: insert or overwrite the whole document (metadata, tags,
     /// auto_load, content — everything). Returns true if it replaced existing.
     async fn kb_replace(&self, doc: &Document) -> SlcResult<bool>;
+    /// Переименовать документ (сменить document_id/имя файла). Каскадные
+    /// ссылки (auto_load/references/указатели сидов) чинит движок.
+    /// Default: insert под новым id + purge старого; obsidian/sqlite
+    /// переопределяют атомарно.
+    async fn kb_rename(&self, old_id: &str, new_id: &str) -> SlcResult<bool> {
+        let Some(mut doc) = self.kb_get(old_id).await? else {
+            return Ok(false);
+        };
+        if self.kb_get(new_id).await?.is_some() {
+            return Err(SlcError::Storage(format!("document already exists: {new_id}")));
+        }
+        doc.document_id = new_id.to_string();
+        doc.updated_at = chrono::Utc::now();
+        doc.version += 1;
+        self.kb_insert(&doc).await?;
+        self.kb_purge(old_id).await?;
+        Ok(true)
+    }
     async fn kb_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>>;
     async fn kb_count(&self, filter: &DocFilter) -> SlcResult<u64>;
     /// Apply a metadata patch to all matching KB docs.
