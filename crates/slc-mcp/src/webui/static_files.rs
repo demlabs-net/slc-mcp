@@ -1,6 +1,6 @@
 //! Раздача статики SPA (web-ui/dist) с fallback на index.html.
 
-use crate::AppState;
+use crate::server::AppState;
 use axum::{
     body::Body,
     extract::State,

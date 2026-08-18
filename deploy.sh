@@ -2,8 +2,8 @@
 # SLC MCP — deploy helper (Docker, Obsidian vault, LM Studio provider, web UI).
 #
 # Usage:
-#   ./deploy.sh build     — собрать образы (slc-mcp + slc-webui)
-#   ./deploy.sh up        — создать vault (+git init), поднять сервисы, ждать /health
+#   ./deploy.sh build     — собрать образ slc-mcp (MCP + REST + SPA одним процессом)
+#   ./deploy.sh up        — создать vault (+git init), поднять сервис, ждать /health
 #   ./deploy.sh down      — остановить сервисы
 #   ./deploy.sh status    — статус + /health (MCP) и /api/health (webui)
 #   ./deploy.sh logs      — логи (follow)
@@ -65,7 +65,7 @@ cmd_up() {
     wait_health
     echo
     echo "SLC MCP:   http://127.0.0.1:3000/mcp  (health: $HEALTH_URL)"
-    echo "Web UI:    http://127.0.0.1:3002/      (health: /api/health)"
+    echo "Web UI:    http://127.0.0.1:3000/      (REST /api/*, health: /api/health)"
     echo "vault:     $VAULT_PATH"
 }
 
@@ -78,7 +78,7 @@ cmd_status() {
     echo
     curl -sS -m 3 "$HEALTH_URL" || echo "(health недоступен)"
     echo
-    curl -sS -m 3 "http://127.0.0.1:3002/api/health" || echo "(webui health недоступен)"
+    curl -sS -m 3 "http://127.0.0.1:3000/api/health" || echo "(webui health недоступен)"
 }
 
 cmd_logs() {

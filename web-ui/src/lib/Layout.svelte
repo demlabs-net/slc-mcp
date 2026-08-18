@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import type { Snippet } from 'svelte';
   import { getSeat, resetSeat } from './api';
+  import { auth, authMode, isAdmin, logout } from './auth';
 
   let {
     currentRoute,
@@ -12,6 +13,9 @@
     navigate: (route: string) => void;
     children: Snippet;
   } = $props();
+
+  const fullMode = $derived($authMode === 'full');
+  const adminVisible = $derived($isAdmin);
 
   const navigation = [
     { name: 'Dashboard', route: 'dashboard', icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6' },
@@ -95,6 +99,35 @@
           {/if}
         </div>
       {/each}
+
+      {#if adminVisible}
+        {@const isActive = currentRoute === 'admin'}
+        <div class="tooltip-wrapper">
+          <button
+            onclick={() => navigate('admin')}
+            class="w-full flex items-center gap-3 px-3 py-2.5 text-sm font-medium transition-all relative cursor-pointer" style="border-radius: 10px;
+              {isActive
+                ? 'background: linear-gradient(135deg, rgba(139,92,246,0.15), rgba(139,92,246,0.05)); color: var(--accent-ai); border-left: 3px solid var(--accent-ai);'
+                : 'color: var(--text-secondary); border-left: 3px solid transparent;'}"
+            onmouseenter={(e) => {
+              if (!isActive) e.currentTarget.style.background = 'var(--bg-tertiary)';
+            }}
+            onmouseleave={(e) => {
+              if (!isActive) e.currentTarget.style.background = 'transparent';
+            }}
+          >
+            <svg class="w-5 h-5 shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+            </svg>
+            {#if !sidebarCollapsed}
+              <span class="whitespace-nowrap">Admin</span>
+            {/if}
+          </button>
+          {#if sidebarCollapsed}
+            <span class="tooltip">Admin</span>
+          {/if}
+        </div>
+      {/if}
     </nav>
 
     <!-- Bottom: Seat + Theme -->
@@ -119,6 +152,22 @@
         {/if}
       </button>
 
+      {#if fullMode}
+        <button
+          onclick={logout}
+          class="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors cursor-pointer" style="color: var(--text-secondary)"
+          onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--bg-tertiary)'}
+          onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+          title="Выйти"
+        >
+          <svg class="w-5 h-5 shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+          </svg>
+          {#if !sidebarCollapsed}
+            <span>Выйти ({$auth.user?.username})</span>
+          {/if}
+        </button>
+      {:else}
       <!-- Seat -->
       <button
         onclick={handleNewSeat}
@@ -134,6 +183,7 @@
           <span class="truncate">seat: {seat ? seat.slice(0, 14) + '…' : '…'}</span>
         {/if}
       </button>
+      {/if}
 
       <!-- Collapse toggle -->
       <button

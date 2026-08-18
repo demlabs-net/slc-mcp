@@ -1,6 +1,8 @@
-// SLC web UI — REST-клиент к slc-webui (прокси над MCP-сервером).
-// Сессия = seat id: генерируется в браузере, хранится в localStorage,
-// передаётся заголовком X-Seat-ID (сервер авто-создаёт сид).
+// SLC web UI — REST-клиент к slc-mcp (/api/*, тот же процесс, что и MCP).
+// Два режима сервера (SLC_AUTH):
+// - seat (default): X-Seat-ID, сид генерируется в браузере;
+// - full: Bearer-JWT (users/пароли + Yandex OAuth), сид выводится из юзера.
+// При 401 (full-режим) — однофлайтовый refresh + повтор запроса.
 
 const SEAT_KEY = 'slc_seat_id';
 
@@ -17,18 +19,37 @@ export function resetSeat(): void {
   localStorage.removeItem(SEAT_KEY);
 }
 
-async function req<T = any>(method: string, path: string, body?: any): Promise<T> {
+// Токен выставляется модулем auth.ts (login/refresh/logout).
+let accessToken: string | null = null;
+export function setAccessToken(t: string | null): void {
+  accessToken = t;
+}
+export function getAccessToken(): string | null {
+  return accessToken;
+}
+
+async function req<T = any>(method: string, path: string, body?: any, retried = false): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Seat-ID': getSeat(),
+  };
+  if (accessToken) headers['Authorization'] = `Bearer ${accessToken}`;
   const resp = await fetch(path, {
     method,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Seat-ID': getSeat(),
-    },
+    headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  if (resp.status === 401 && accessToken && !path.startsWith('/api/auth/') && !retried) {
+    // 401 → одна попытка refresh (single-flight), потом повтор запроса.
+    if (!refreshPromise) {
+      refreshPromise = import('./auth').then(m => m.refreshTokens()).finally(() => { refreshPromise = null; });
+    }
+    const ok = await refreshPromise;
+    if (ok) return req(method, path, body, true);
+  }
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
-    throw new Error(data?.error || `HTTP ${resp.status}`);
+    throw new Error(data?.error || data?.detail || `HTTP ${resp.status}`);
   }
   return data as T;
 }
@@ -106,5 +127,39 @@ export const api = {
     update: (id: string, data: any) =>
       req(`/api/focuses/${encodeURIComponent(id)}`, 'PUT', data),
     remove: (id: string) => req(`/api/focuses/${encodeURIComponent(id)}`, 'DELETE'),
+  },
+
+  // ── auth (полный порт легаси: users/JWT/Yandex OAuth) ──
+  auth: {
+    me: () => req('/api/auth/me'),
+    login: (username: string, password: string) =>
+      req('/api/auth/login', 'POST', { username, password }),
+    register: (data: { username: string; email: string; password: string; groups?: string[] }) =>
+      req('/api/auth/register', 'POST', data),
+    refresh: (refresh_token: string) =>
+      req('/api/auth/refresh', 'POST', { refresh_token }),
+    logout: () => req('/api/auth/logout', 'POST'),
+    exchange: (code: string) => req('/api/auth/exchange', 'POST', { code }),
+    users: {
+      list: () => req('/api/auth/users'),
+      setGroups: (user_id: string, groups: string[]) =>
+        req(`/api/auth/users/${encodeURIComponent(user_id)}/groups`, 'PUT', groups),
+      setActive: (user_id: string, is_active: boolean) =>
+        req(`/api/auth/users/${encodeURIComponent(user_id)}/active${qs({ is_active })}`, 'PUT', {}),
+    },
+    groups: () => req('/api/auth/groups'),
+  },
+
+  admin: {
+    oauthRules: {
+      list: () => req('/api/admin/oauth/rules'),
+      create: (data: { type: string; value: string; default_groups?: string[]; description?: string }) =>
+        req('/api/admin/oauth/rules', 'POST', data),
+      update: (rule_id: string, data: any) =>
+        req(`/api/admin/oauth/rules/${encodeURIComponent(rule_id)}`, 'PUT', data),
+      remove: (rule_id: string) =>
+        req(`/api/admin/oauth/rules/${encodeURIComponent(rule_id)}`, 'DELETE'),
+    },
+    ya360Status: () => req('/api/admin/oauth/ya360/status'),
   },
 };
