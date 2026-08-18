@@ -614,15 +614,18 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "activate_task",
-            "description": "Activate a task (included in update_context)",
+            "description": "Activate a task (included in update_context). target_seat (только для сидов с ролью operator): поставить активную задачу другому сиду.",
             "inputSchema": {"type":"object","properties":{
-                "task_id": {"type":"string"}
+                "task_id": {"type":"string"},
+                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
             },"required":["task_id"]}
         }),
         json!({
             "name": "deactivate_task",
-            "description": "Deactivate the current active task",
-            "inputSchema": {"type":"object","properties":{},"required":[]}
+            "description": "Deactivate the current active task. target_seat (только для сидов с ролью operator): снять активную задачу другого сида.",
+            "inputSchema": {"type":"object","properties":{
+                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+            },"required":[]}
         }),
         json!({
             "name": "get_active_task",
@@ -631,15 +634,18 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "activate_document",
-            "description": "Activate ANY document (task, project, skill, knowledge doc…) as the seat's context anchor — it is included in update_context and its auto_load links are followed on updates. The effect is identical to activate_task, but for every category.",
+            "description": "Activate ANY document (task, project, skill, knowledge doc…) as the seat's context anchor — it is included in update_context and its auto_load links are followed on updates. The effect is identical to activate_task, but for every category. target_seat (только для сидов с ролью operator): активировать документ другому сиду.",
             "inputSchema": {"type":"object","properties":{
-                "document_id": {"type":"string"}
+                "document_id": {"type":"string"},
+                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
             },"required":["document_id"]}
         }),
         json!({
             "name": "deactivate_document",
-            "description": "Clear the seat's active document (any category)",
-            "inputSchema": {"type":"object","properties":{},"required":[]}
+            "description": "Clear the seat's active document (any category). target_seat (только для сидов с ролью operator): снять активный документ другого сида.",
+            "inputSchema": {"type":"object","properties":{
+                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+            },"required":[]}
         }),
         json!({
             "name": "get_active_document",
@@ -732,6 +738,31 @@ fn tools() -> Vec<Value> {
             },"required":["content"]}
         }),
         // UI-ориентированные read/write-тулы
+        json!({
+            "name": "project_set_status",
+            "description": "Archive/unarchive a project (active|archived). target_seat (только для сидов с ролью operator): сменить статус проекта другого сида.",
+            "inputSchema": {"type":"object","properties":{
+                "project_id": {"type":"string"},
+                "status": {"type":"string","enum":["active","archived"]},
+                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+            },"required":["project_id","status"]}
+        }),
+        json!({
+            "name": "focus_set_archived",
+            "description": "Archive/unarchive a focus item. target_seat (только для сидов с ролью operator): архивировать фокус другого сида.",
+            "inputSchema": {"type":"object","properties":{
+                "focus_id": {"type":"string"},
+                "archived": {"type":"boolean"},
+                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+            },"required":["focus_id","archived"]}
+        }),
+        json!({
+            "name": "seat_roles",
+            "description": "Роли сида (operator = управление контекстом других сидов). Без seat_id — роли текущего сида.",
+            "inputSchema": {"type":"object","properties":{
+                "seat_id": {"type":"string"}
+            },"required":[]}
+        }),
         json!({
             "name": "list_documents",
             "description": "List knowledge documents (id/category/folder/tags, no content) with optional filters",
@@ -954,6 +985,15 @@ pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инс�
 
 `check_notifications` в начале каждого хода — там могут быть фокус- или
 таймер-напоминания, требующие действий.
+
+## Роли сидов
+
+Сид с ролью `operator` (настраивается сервером, `SLC_SEAT_ROLES`) может
+управлять рабочим контекстом других сидов: `activate_task` /
+`activate_document` / `deactivate_document` / `deactivate_task` с параметром
+`target_seat`, а также `project_set_status` и `focus_set_archived` для чужого
+сида. Свои сущности активируются как обычно (target_seat не нужен).
+`seat_roles` показывает роли сида.
 "#;
 
 async fn build_context(
@@ -1653,20 +1693,23 @@ async fn call_tool(
         }
         "activate_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
             let ok = engine
-                .task_activate(seat_id, task_id)
+                .task_activate_for(seat_id, target, task_id)
                 .await
                 .map_err(json_err)?;
-            json!({"success": ok, "task_id": task_id, "message": "Task activated"})
+            json!({"success": ok, "task_id": task_id, "target_seat": target, "message": "Task activated"})
         }
         "deactivate_task" => {
             // clear the active task pointer
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
             engine
                 .seats
-                .set_active_task(seat_id, None, None)
+                .set_active_task(target, None, None)
                 .await
                 .map_err(json_err)?;
-            json!({"success": true, "seat_id": seat_id, "message": "Task deactivated"})
+            json!({"success": true, "seat_id": target, "message": "Task deactivated"})
         }
         "get_active_task" => match engine.task_get_active(seat_id).await.map_err(json_err)? {
             Some(t) => {
@@ -1679,26 +1722,28 @@ async fn call_tool(
                 .get("document_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
             let ok = engine
-                .document_activate(seat_id, document_id)
+                .document_activate_for(seat_id, target, document_id)
                 .await
                 .map_err(json_err)?;
             if ok {
                 // Hook: notify subscribers (SSE) so automation can react.
                 let _ = events.send(json!({
-                    "type": "document_activated", "seat_id": seat_id, "document_id": document_id,
+                    "type": "document_activated", "seat_id": target, "document_id": document_id,
                 }));
-                json!({"success": true, "document_id": document_id, "message": "Document activated (context anchor)"})
+                json!({"success": true, "document_id": document_id, "target_seat": target, "message": "Document activated (context anchor)"})
             } else {
                 json!({"success": false, "error": format!("document not found: {document_id}")})
             }
         }
         "deactivate_document" => {
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
             engine
-                .document_deactivate(seat_id)
+                .document_deactivate_for(seat_id, target)
                 .await
                 .map_err(json_err)?;
-            json!({"success": true, "message": "Active document cleared"})
+            json!({"success": true, "target_seat": target, "message": "Active document cleared"})
         }
         "get_active_document" => {
             match engine
@@ -1916,6 +1961,38 @@ async fn call_tool(
             } else {
                 json!({"success": true, "module": module, "loaded_count": 0, "skipped_count": 0, "loaded_documents": []})
             }
+        }
+        "project_set_status" => {
+            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            match engine
+                .project_set_status_for(seat_id, target, project_id, status)
+                .await
+                .map_err(json_err)?
+            {
+                Some(p) => json!({"success": true, "project_id": p.project_id, "status": p.status, "target_seat": target, "message": format!("Project status set to {}", p.status)}),
+                None => json!({"success": false, "error": format!("project not found: {project_id}")}),
+            }
+        }
+        "focus_set_archived" => {
+            let focus_id = args.get("focus_id").and_then(|v| v.as_str()).unwrap_or("");
+            let archived = args.get("archived").and_then(|v| v.as_bool()).unwrap_or(false);
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let ok = engine
+                .focus_set_archived_for(seat_id, target, focus_id, archived)
+                .await
+                .map_err(json_err)?;
+            json!({"success": ok, "focus_id": focus_id, "archived": archived, "target_seat": target, "message": if ok { "Focus updated" } else { "Focus not found" }})
+        }
+        "seat_roles" => {
+            let q = args.get("seat_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let roles: Vec<&str> = engine
+                .seat_roles(q)
+                .iter()
+                .map(|r| r.as_str())
+                .collect();
+            json!({"success": true, "seat_id": q, "roles": roles, "can_manage_seats": engine.can_manage_seats(q)})
         }
         "list_documents" => {
             let category = args
