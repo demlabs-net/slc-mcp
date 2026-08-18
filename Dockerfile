@@ -12,6 +12,7 @@ WORKDIR /app
 COPY web-ui/package.json web-ui/package-lock.json ./
 RUN npm ci
 COPY web-ui/ web-ui/
+WORKDIR /app/web-ui
 RUN npm run build
 
 # ── builder: Rust toolchain ────────────────────────────────────────────────
