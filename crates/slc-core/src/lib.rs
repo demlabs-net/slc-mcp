@@ -1165,6 +1165,10 @@ impl SlcEngine {
             }
         }
 
+        // Эмбеддинги: старый ключ удаляем (obsidian sidecar хранит их по
+        // document_id; sqlite-перенос сделан в kb_rename), новый id и
+        // документы с изменённым контентом пере-эмбедим.
+        let _ = self.store.delete_embeddings(document_id).await;
         let _ = self.reembed_document(new_id).await;
         for id in reembed {
             let _ = self.reembed_document(&id).await;
@@ -1753,6 +1757,9 @@ mod engine_tests {
         // Ссылка на несуществующий id — ошибка.
         let err = engine.rename_document("seat_a", "new_name", "new_name", None).await.unwrap_err();
         assert!(matches!(err, SlcError::InvalidInput(_)));
+        // Эмбеддинги: старый ключ удалён, новый пере-эмбежен.
+        assert!(engine.store().get_embedding("new_name").await.unwrap().is_some());
+        assert!(engine.store().get_embedding("old_name").await.unwrap().is_none());
     }
 
     /// rename_task: новый id = slug от имени, name обновляется.
