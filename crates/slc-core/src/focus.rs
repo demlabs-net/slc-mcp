@@ -154,6 +154,24 @@ impl<S: StorageBackend> FocusManager<S> {
         Ok(true)
     }
 
+    /// Вручную архивировать/разархивировать фокус (владелец — seat_id).
+    pub async fn set_archived(
+        &self,
+        focus_id: &str,
+        seat_id: &str,
+        archived: bool,
+    ) -> SlcResult<bool> {
+        let Some(mut item) = self.get(focus_id, Some(seat_id)).await? else {
+            return Ok(false);
+        };
+        if item.archived == archived {
+            return Ok(true);
+        }
+        item.archived = archived;
+        self.put(&item).await?;
+        Ok(true)
+    }
+
     pub async fn get(&self, focus_id: &str, seat_id: Option<&str>) -> SlcResult<Option<FocusItem>> {
         let Some(val) = self.store.get_record(COLLECTION, focus_id).await? else { return Ok(None) };
         let item: FocusItem = serde_json::from_value(val)?;

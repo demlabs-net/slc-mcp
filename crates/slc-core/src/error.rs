@@ -20,6 +20,8 @@ pub enum SlcError {
     Limit(String),
     #[error("config error: {0}")]
     Config(String),
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]

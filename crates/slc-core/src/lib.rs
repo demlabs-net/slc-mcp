@@ -23,6 +23,7 @@ pub mod model;
 pub mod notifications;
 pub mod pagination;
 pub mod proactivity;
+pub mod roles;
 pub mod profiles;
 pub mod reminders;
 pub mod search;
@@ -167,6 +168,22 @@ pub struct SlcConfig {
     /// without reasoning simply keep the default folder. Disable with
     /// `SLC_AI_ORGANIZE=false`.
     pub ai_organize: bool,
+    /// Роли сидов: seat_id → роли. Из env `SLC_SEAT_ROLES`
+    /// ("seat_a=operator,seat_b=operator") или программно через
+    /// [`SlcConfig::with_seat_role`] (staticlib: параметр инициализации).
+    pub seat_roles: std::collections::HashMap<String, Vec<roles::SeatRole>>,
+}
+
+impl SlcConfig {
+    /// Добавить роль сиду (builder-стиль; для встроенных клиентов staticlib).
+    pub fn with_seat_role(
+        mut self,
+        seat_id: impl Into<String>,
+        role: roles::SeatRole,
+    ) -> Self {
+        self.seat_roles.entry(seat_id.into()).or_default().push(role);
+        self
+    }
 }
 
 impl Default for SlcConfig {
@@ -202,6 +219,7 @@ impl Default for SlcConfig {
             ai_organize: std::env::var("SLC_AI_ORGANIZE")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
+            seat_roles: roles::parse_roles_env(),
         }
     }
 }
@@ -909,6 +927,92 @@ impl SlcEngine {
         Ok(())
     }
 
+    // ── роли сидов: управление контекстом других сидов ────────────────
+
+    /// Роли сида (пусто — нет особых прав).
+    pub fn seat_roles(&self, seat_id: &str) -> Vec<roles::SeatRole> {
+        self.config.seat_roles.get(seat_id).cloned().unwrap_or_default()
+    }
+
+    /// Имеет ли сид право управлять контекстом других сидов (operator).
+    pub fn can_manage_seats(&self, seat_id: &str) -> bool {
+        self.seat_roles(seat_id)
+            .iter()
+            .any(|r| *r == roles::SeatRole::Operator)
+    }
+
+    /// Проверка права: actor может управлять target_seat (свой сид — всегда).
+    pub async fn require_seat_manage(&self, actor: &str, target_seat: &str) -> SlcResult<()> {
+        if actor == target_seat || self.can_manage_seats(actor) {
+            return Ok(());
+        }
+        Err(SlcError::PermissionDenied(format!(
+            "seat {actor} has no right to manage seat {target_seat} (role operator required)"
+        )))
+    }
+
+    /// Активировать документ у целевого сида (свой сид — без роли).
+    pub async fn document_activate_for(
+        &self,
+        actor: &str,
+        target_seat: &str,
+        document_id: &str,
+    ) -> SlcResult<bool> {
+        self.require_seat_manage(actor, target_seat).await?;
+        self.document_activate(target_seat, document_id).await
+    }
+
+    /// Снять активный документ/задачу у целевого сида.
+    pub async fn document_deactivate_for(&self, actor: &str, target_seat: &str) -> SlcResult<()> {
+        self.require_seat_manage(actor, target_seat).await?;
+        self.document_deactivate(target_seat).await
+    }
+
+    /// Поставить активную задачу целевому сиду.
+    pub async fn task_activate_for(
+        &self,
+        actor: &str,
+        target_seat: &str,
+        task_id: &str,
+    ) -> SlcResult<bool> {
+        self.require_seat_manage(actor, target_seat).await?;
+        self.task_activate(target_seat, task_id).await
+    }
+
+    /// Сменить статус проекта (active|archived) у целевого сида.
+    pub async fn project_set_status_for(
+        &self,
+        actor: &str,
+        target_seat: &str,
+        project_id: &str,
+        status: &str,
+    ) -> SlcResult<Option<tasks::ProjectInfo>> {
+        if status != tasks::STATUS_PROJECT_ACTIVE && status != tasks::STATUS_PROJECT_ARCHIVED {
+            return Err(SlcError::InvalidInput(format!(
+                "status must be {} or {}",
+                tasks::STATUS_PROJECT_ACTIVE,
+                tasks::STATUS_PROJECT_ARCHIVED
+            )));
+        }
+        self.require_seat_manage(actor, target_seat).await?;
+        let m = tasks::WorkItemManager::new(self.store.clone());
+        m.update_project(target_seat, project_id, None, None, None, None, Some(status), None)
+            .await
+    }
+
+    /// Архивация/разархивация фокуса у целевого сида.
+    pub async fn focus_set_archived_for(
+        &self,
+        actor: &str,
+        target_seat: &str,
+        focus_id: &str,
+        archived: bool,
+    ) -> SlcResult<bool> {
+        self.require_seat_manage(actor, target_seat).await?;
+        let f = focus::FocusManager::new(self.store.clone());
+        f.set_archived(focus_id, target_seat, archived).await
+    }
+
     /// The seat's active document, if any (task fallback included).
     pub async fn document_get_active(&self, seat_id: &str) -> SlcResult<Option<Document>> {
         let Some(id) = self.store.get_seat_active_document(seat_id).await? else {
@@ -1283,6 +1387,7 @@ pub unsafe extern "C" fn slc_free_string(ptr: *mut std::os::raw::c_char) {
 #[cfg(test)]
 mod engine_tests {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn summarize_text_uses_llm_and_falls_back() {
@@ -1307,6 +1412,98 @@ mod engine_tests {
             .await
             .unwrap();
         assert!(out2.len() > 5, "no manual truncation: {out2}");
+    }
+
+    /// Роли сидов: operator управляет контекстом другого сида, обычный
+    /// сид — нет (SlcError::PermissionDenied).
+    #[tokio::test]
+    async fn seat_roles_manage_other_seats() {
+        use crate::error::SlcError;
+        use crate::roles::SeatRole;
+
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
+        // Оператор — seat "boss"; рядовой — "worker".
+        let config = SlcConfig::default().with_seat_role("boss", SeatRole::Operator);
+        let engine = SlcEngine::with(store.clone(), llm, config);
+
+        engine.ensure_seat("boss").await.unwrap();
+        engine.ensure_seat("worker").await.unwrap();
+
+        // Документ и задача сида worker.
+        let mut doc = Document::new(
+            "doc_worker",
+            DocumentCategory::Custom,
+            "worker doc",
+            DocMeta::default(),
+            vec![],
+            Some("worker".to_string()),
+        );
+        engine.add_document(&mut doc).await.unwrap();
+        let task = engine.task_create("worker", "worker task", "", None, &[], &json!({})).await.unwrap();
+
+        // Обычный сид не может управлять чужим сидом.
+        let err = engine
+            .document_activate_for("worker", "boss", "doc_worker")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SlcError::PermissionDenied(_)), "{err:?}");
+
+        // Свой сид — всегда можно (target = actor).
+        assert!(engine.document_activate_for("worker", "worker", "doc_worker").await.unwrap());
+
+        // Оператор активирует/деактивирует чужой сид.
+        assert!(engine.document_activate_for("boss", "worker", "doc_worker").await.unwrap());
+        assert_eq!(
+            engine.document_get_active("worker").await.unwrap().unwrap().document_id,
+            "doc_worker"
+        );
+        engine.document_deactivate_for("boss", "worker").await.unwrap();
+        assert!(engine.document_get_active("worker").await.unwrap().is_none());
+
+        // Задачи: оператор ставит активную задачу чужому сиду.
+        assert!(engine.task_activate_for("boss", "worker", &task.task_id).await.unwrap());
+        assert_eq!(
+            engine.task_get_active("worker").await.unwrap().unwrap().task_id,
+            task.task_id
+        );
+
+        // Фокусы: оператор архивирует фокус чужого сида.
+        let f = engine.focus_add("worker", "focus task", "", 5, &[], None).await.unwrap();
+        assert!(engine.focus_set_archived_for("boss", "worker", &f.focus_id, true).await.unwrap());
+        assert!(engine
+            .focus_list("worker", None)
+            .await
+            .unwrap()
+            .iter()
+            .all(|x| x.focus_id != f.focus_id || x.archived));
+        // Без роли — отказ.
+        let err = engine
+            .focus_set_archived_for("worker", "boss", &f.focus_id, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SlcError::PermissionDenied(_)));
+
+        // Проекты: оператор архивирует чужой проект.
+        let proj = engine.project_create("worker", "worker proj", "", &[], &json!({})).await.unwrap();
+        let updated = engine
+            .project_set_status_for("boss", "worker", &proj.project_id, "archived")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "archived");
+        // Невалидный статус — InvalidInput.
+        let err = engine
+            .project_set_status_for("boss", "worker", &proj.project_id, "bogus")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SlcError::InvalidInput(_)));
+
+        // seat_roles отдаёт конфигурацию.
+        assert_eq!(engine.seat_roles("boss"), vec![SeatRole::Operator]);
+        assert!(engine.can_manage_seats("boss"));
+        assert!(!engine.can_manage_seats("worker"));
     }
 }
 
