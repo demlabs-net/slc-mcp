@@ -946,12 +946,15 @@ impl StorageBackend for ObsidianVaultStore {
     // ── embeddings ──────────────────────────────────────────────
 
     async fn insert_embeddings(&self, records: &[EmbeddingRecord]) -> SlcResult<()> {
-        let mut map = self.embeddings.lock().unwrap();
-        for r in records {
-            map.entry(r.document_id.clone()).or_default().push(r.clone());
+        {
+            let mut map = self.embeddings.lock().unwrap();
+            for r in records {
+                map.entry(r.document_id.clone()).or_default().push(r.clone());
+            }
         }
-        drop(map);
-        self.persist_embeddings()
+        self.persist_embeddings()?;
+        self.git_commit().await;
+        Ok(())
     }
 
     async fn get_embedding(&self, document_id: &str) -> SlcResult<Option<Vec<f32>>> {
@@ -985,14 +988,18 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn delete_embeddings(&self, document_id: &str) -> SlcResult<()> {
         self.embeddings.lock().unwrap().remove(document_id);
-        self.persist_embeddings()
+        self.persist_embeddings()?;
+        self.git_commit().await;
+        Ok(())
     }
 
     // ── seats ───────────────────────────────────────────────────
 
     async fn insert_seat(&self, seat: &Seat) -> SlcResult<()> {
         self.seats.lock().unwrap().insert(seat.seat_id.clone(), seat.clone());
-        self.persist_seat(seat)
+        self.persist_seat(seat)?;
+        self.git_commit().await;
+        Ok(())
     }
 
     async fn get_seat(&self, seat_id: &str) -> SlcResult<Option<Seat>> {
@@ -1014,44 +1021,59 @@ impl StorageBackend for ObsidianVaultStore {
     }
 
     async fn touch_seat(&self, seat_id: &str) -> SlcResult<bool> {
-        let mut seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
-        seat.last_accessed = Utc::now();
-        let seat = seat.clone();
-        drop(seats);
+        let seat = {
+            let mut seats = self.seats.lock().unwrap();
+            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            let now = Utc::now();
+            // Authentication touches every tool call. Persisting and pushing
+            // each one makes a read-only request unexpectedly expensive, so
+            // retain a useful heartbeat while coalescing that volatile field.
+            if now.signed_duration_since(seat.last_accessed) < chrono::Duration::minutes(1) {
+                return Ok(true);
+            }
+            seat.last_accessed = now;
+            seat.clone()
+        };
         self.persist_seat(&seat)?;
+        self.git_commit().await;
         Ok(true)
     }
 
     async fn set_seat_status(&self, seat_id: &str, status: SeatStatus) -> SlcResult<bool> {
-        let mut seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
-        seat.status = status;
-        let seat = seat.clone();
-        drop(seats);
+        let seat = {
+            let mut seats = self.seats.lock().unwrap();
+            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            seat.status = status;
+            seat.clone()
+        };
         self.persist_seat(&seat)?;
+        self.git_commit().await;
         Ok(true)
     }
 
     async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
-        let mut seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
-        seat.active_task_id = Some(task_id.into());
-        // Task activation is document activation too (unified anchor).
-        seat.active_document_id = Some(task_id.into());
-        let seat = seat.clone();
-        drop(seats);
+        let seat = {
+            let mut seats = self.seats.lock().unwrap();
+            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            seat.active_task_id = Some(task_id.into());
+            // Task activation is document activation too (unified anchor).
+            seat.active_document_id = Some(task_id.into());
+            seat.clone()
+        };
         self.persist_seat(&seat)?;
+        self.git_commit().await;
         Ok(true)
     }
 
     async fn set_seat_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool> {
-        let mut seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
-        seat.active_document_id = document_id.map(String::from);
-        let seat = seat.clone();
-        drop(seats);
+        let seat = {
+            let mut seats = self.seats.lock().unwrap();
+            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            seat.active_document_id = document_id.map(String::from);
+            seat.clone()
+        };
         self.persist_seat(&seat)?;
+        self.git_commit().await;
         Ok(true)
     }
 
@@ -1063,16 +1085,18 @@ impl StorageBackend for ObsidianVaultStore {
     }
 
     async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool> {
-        let mut seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
-        seat.usage_stats.total_requests += 1;
-        seat.usage_stats.total_tokens += tokens_used;
-        let count = seat.usage_stats.tools_used.get(tool_name).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
-        seat.usage_stats.tools_used.insert(tool_name.into(), json!(count));
-        seat.last_accessed = Utc::now();
-        let seat = seat.clone();
-        drop(seats);
+        let seat = {
+            let mut seats = self.seats.lock().unwrap();
+            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            seat.usage_stats.total_requests += 1;
+            seat.usage_stats.total_tokens += tokens_used;
+            let count = seat.usage_stats.tools_used.get(tool_name).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+            seat.usage_stats.tools_used.insert(tool_name.into(), json!(count));
+            seat.last_accessed = Utc::now();
+            seat.clone()
+        };
         self.persist_seat(&seat)?;
+        self.git_commit().await;
         Ok(true)
     }
 
@@ -1080,7 +1104,9 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn insert_timer(&self, timer: &PersistedTimer) -> SlcResult<()> {
         self.timers.lock().unwrap().insert(timer.timer_id.clone(), timer.clone());
-        self.persist_timers()
+        self.persist_timers()?;
+        self.git_commit().await;
+        Ok(())
     }
 
     async fn get_timer(&self, timer_id: &str) -> SlcResult<Option<PersistedTimer>> {
@@ -1099,19 +1125,24 @@ impl StorageBackend for ObsidianVaultStore {
     }
 
     async fn set_timer_fired(&self, timer_id: &str, now: DateTime<Utc>) -> SlcResult<()> {
-        let mut timers = self.timers.lock().unwrap();
-        if let Some(t) = timers.get_mut(timer_id) {
-            t.last_fired_at = Some(now);
+        {
+            let mut timers = self.timers.lock().unwrap();
+            if let Some(t) = timers.get_mut(timer_id) {
+                t.last_fired_at = Some(now);
+            }
         }
-        drop(timers);
-        self.persist_timers()
+        self.persist_timers()?;
+        self.git_commit().await;
+        Ok(())
     }
 
     // ── records ─────────────────────────────────────────────────
 
     async fn put_record(&self, collection: &str, key: &str, value: &Value) -> SlcResult<()> {
         self.records.lock().unwrap().insert((collection.to_string(), key.to_string()), value.clone());
-        self.persist_records()
+        self.persist_records()?;
+        self.git_commit().await;
+        Ok(())
     }
 
     async fn get_record(&self, collection: &str, key: &str) -> SlcResult<Option<Value>> {
@@ -1122,6 +1153,7 @@ impl StorageBackend for ObsidianVaultStore {
         let existed = self.records.lock().unwrap().remove(&(collection.to_string(), key.to_string())).is_some();
         if existed {
             self.persist_records()?;
+            self.git_commit().await;
         }
         Ok(existed)
     }
