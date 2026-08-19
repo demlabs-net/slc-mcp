@@ -41,8 +41,9 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git curl openssh-client \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 1000 --create-home slc \
- && mkdir -p /data/vault /app/dist \
- && chown -R slc:slc /data/vault /app/dist
+ && mkdir -p /data/vault /app/dist /home/slc/.ssh \
+ && chmod 0700 /home/slc/.ssh \
+ && chown -R slc:slc /data/vault /app/dist /home/slc/.ssh
 
 COPY --from=builder /build/target/release/slc-mcp /usr/local/bin/slc-mcp
 COPY --from=frontend /app/web-ui/dist /app/dist

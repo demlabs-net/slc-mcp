@@ -333,7 +333,12 @@ impl ObsidianVaultStore {
                                     .and_then(|v| v.as_str())
                                     .map(String::from),
                             };
-                            index.insert(id.to_string(), entry);
+                            if let Some(previous) = index.insert(id.to_string(), entry.clone()) {
+                                return Err(SlcError::Storage(format!(
+                                    "duplicate document id {id} in vault folders {:?} and {:?}",
+                                    previous.folder, entry.folder
+                                )));
+                            }
                         }
                     }
                 }
@@ -429,8 +434,24 @@ impl ObsidianVaultStore {
         let dir = self.root.join(&folder);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.md", safe_file_name(&doc.document_id)));
+        let previous = self.index.lock().unwrap().get(&doc.document_id).cloned();
         let text = render_doc(doc)?;
         std::fs::write(path, text)?;
+
+        // A full replacement may change category or project binding, which
+        // changes the canonical folder. Leaving the old note behind creates
+        // duplicate IDs and makes the next index rebuild nondeterministic.
+        if let Some(previous) = previous {
+            if previous.folder != folder {
+                let old_path = self
+                    .root
+                    .join(sanitize_folder(&previous.folder)?)
+                    .join(format!("{}.md", safe_file_name(&doc.document_id)));
+                if old_path.exists() {
+                    std::fs::remove_file(old_path)?;
+                }
+            }
+        }
         self.index.lock().unwrap().insert(doc.document_id.clone(), IndexEntry::from_doc(doc));
         self.persist_index()?;
         Ok(())
@@ -522,13 +543,25 @@ impl ObsidianVaultStore {
         let git_lock = self.git_lock.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let Ok(_guard) = git_lock.lock() else { return }; // serialize git index.lock
-            let author_name = author.split('<').next().unwrap_or("slc-mcp").trim().to_string();
+            let author_name = author
+                .split('<')
+                .next()
+                .unwrap_or("slc-mcp")
+                .trim()
+                .to_string();
+            let author_email = author
+                .split_once('<')
+                .and_then(|(_, email)| email.strip_suffix('>'))
+                .map(str::trim)
+                .filter(|email| !email.is_empty())
+                .unwrap_or("slc-mcp@local")
+                .to_string();
             let run = |args: Vec<&str>| {
                 std::process::Command::new("git")
                     .args(&args)
                     .current_dir(&root)
                     .env("GIT_AUTHOR_NAME", &author_name)
-                    .env("GIT_AUTHOR_EMAIL", &author)
+                    .env("GIT_AUTHOR_EMAIL", &author_email)
                     .output()
             };
             let failed = |out: &std::process::Output| {
@@ -539,7 +572,22 @@ impl ObsidianVaultStore {
             };
             match run(vec!["add", "-A"]) {
                 Ok(out) if out.status.success() => {
-                    let commit = run(vec!["commit", "-m", "slc: vault update", "--allow-empty"]);
+                    // A read-only lifecycle call may still persist operational
+                    // metadata. Avoid manufacturing empty commits when the
+                    // vault representation did not actually change.
+                    match run(vec!["diff", "--cached", "--quiet"]) {
+                        Ok(diff) if diff.status.success() => return,
+                        Ok(diff) if diff.status.code() == Some(1) => {}
+                        Ok(diff) => {
+                            failed(&diff);
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!("vault git diff error: {e}");
+                            return;
+                        }
+                    }
+                    let commit = run(vec!["commit", "-m", "slc: vault update"]);
                     match &commit {
                         Ok(c) if c.status.success() => {
                             // Push the vault to its upstream (best-effort) —
@@ -650,7 +698,7 @@ impl StorageBackend for ObsidianVaultStore {
     async fn kb_upsert(&self, doc: &Document) -> SlcResult<bool> {
         let exists = self.index.lock().unwrap().contains_key(&doc.document_id);
         if exists {
-            self.kb_update_content(&doc.document_id, &doc.content).await?;
+            self.kb_replace(doc).await?;
             return Ok(true);
         }
         self.kb_insert(doc).await?;
@@ -835,8 +883,12 @@ impl StorageBackend for ObsidianVaultStore {
     }
 
     async fn episodic_upsert(&self, doc: &Document) -> SlcResult<bool> {
+        if doc.category != DocumentCategory::History {
+            return Err(SlcError::Storage("only history docs go to the episodic store".into()));
+        }
         if self.index.lock().unwrap().contains_key(&doc.document_id) {
-            self.kb_update_content(&doc.document_id, &doc.content).await?;
+            self.write_note(doc)?;
+            self.git_commit().await;
             return Ok(true);
         }
         self.episodic_insert(doc).await?;
@@ -1165,6 +1217,45 @@ mod tests {
         let ep_count = store2.episodic_count(&DocFilter::default()).await.unwrap();
         assert_eq!(ep_count, 1);
         assert!(store2.kb_insert(&evt).await.is_err(), "history rejected by kb_insert");
+    }
+
+    #[tokio::test]
+    async fn upsert_replaces_metadata_and_removes_the_old_note_path() {
+        let root = tmp_vault("upsert-move");
+        let store = ObsidianVaultStore::open(&root, false).unwrap();
+        let original = Document::with_folder(
+            "same-id",
+            DocumentCategory::Documentation,
+            Some("docs/legacy".into()),
+            "old content",
+            DocMeta::default(),
+            vec!["old".into()],
+            None,
+        );
+        store.kb_insert(&original).await.unwrap();
+
+        let mut metadata = DocMeta::default();
+        metadata.extra.insert("status".into(), json!("IN_WORK"));
+        let replacement = Document::with_folder(
+            "same-id",
+            DocumentCategory::Task,
+            Some("docs/projects/demo/tasks".into()),
+            "new content",
+            metadata,
+            vec!["new".into()],
+            Some("seat-a".into()),
+        );
+        assert!(store.kb_upsert(&replacement).await.unwrap());
+        assert!(!root.join("docs/legacy/same-id.md").exists());
+        assert!(root.join("docs/projects/demo/tasks/same-id.md").exists());
+
+        let reopened = ObsidianVaultStore::open(&root, false).unwrap();
+        let loaded = reopened.kb_get("same-id").await.unwrap().unwrap();
+        assert_eq!(loaded.category, DocumentCategory::Task);
+        assert_eq!(loaded.content, "new content");
+        assert_eq!(loaded.tags, vec!["new"]);
+        assert_eq!(loaded.seat_id.as_deref(), Some("seat-a"));
+        assert_eq!(loaded.metadata.extra["status"], "IN_WORK");
     }
 
     #[tokio::test]

@@ -490,28 +490,20 @@ fn unique(base: String, used: &mut HashSet<String>) -> String {
     }
 }
 
-/// KB id: AI slug (if provided) or deterministic fallback (heading slug →
-/// sanitized legacy id), deduped against `used`. No category prefixes —
-/// the folder tree carries the category context.
+/// KB id: keep the legacy id by default so hard-coded references in agent
+/// profiles and external systems remain valid.  Only an explicit
+/// `--rename-with-ai` result changes it; an empty legacy id falls back to a
+/// heading slug.  All ids are deduped across projects, tasks and KB docs.
 fn new_kb_id(doc: &LegacyDoc, ai: Option<String>, used: &mut HashSet<String>) -> String {
     let base = match ai {
         Some(slug) if !slug.is_empty() => {
             format!("{}{}", category_prefix(doc_category(doc)), slug)
         }
-        _ => {
+        _ if doc.document_id.trim().is_empty() => {
             let slug = doc_slug(doc);
-            if slug.is_empty() {
-                // Deterministic fallback on the legacy id itself (readable
-                // and stable: `core_slc_manifest`, `documentation_abc…`).
-                doc.document_id
-                    .chars()
-                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .take(64)
-                    .collect::<String>()
-            } else {
-                format!("{}{}", category_prefix(doc_category(doc)), slug)
-            }
+            format!("{}{}", category_prefix(doc_category(doc)), slug)
         }
+        _ => doc.document_id.clone(),
     };
     unique(base, used)
 }
@@ -541,9 +533,8 @@ fn fix_links(ids: &[String], id_map: &HashMap<String, String>) -> Vec<String> {
         .collect()
 }
 
-/// Human-readable id for a legacy task: AI slug (`--rename-with-ai`, based on
-/// name/description/original_data) or a deterministic slug from name →
-/// description → original_data → task_id.
+/// Legacy task id is stable by default.  `--rename-with-ai` may replace it;
+/// if inference fails, migration still falls back to the original id.
 async fn task_new_id(
     raw: &BsonDoc,
     task_id: &str,
@@ -560,21 +551,14 @@ async fn task_new_id(
             .unwrap_or_default()
     };
     let fallback = || {
-        for c in [name.to_string(), description.to_string(), original_data()] {
-            let slug = slugify(&c);
-            if !slug.is_empty() {
-                return slug;
-            }
-        }
-        let slug = slugify(task_id);
-        if !slug.is_empty() {
-            slug
+        if !task_id.trim().is_empty() {
+            task_id.to_string()
         } else {
-            task_id
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .take(64)
-                .collect()
+            [name.to_string(), description.to_string(), original_data()]
+                .into_iter()
+                .map(|value| slugify(&value))
+                .find(|value| !value.is_empty())
+                .unwrap_or_else(|| "task".to_string())
         }
     };
     let base = if rename_with_ai {
@@ -600,31 +584,41 @@ async fn task_new_id(
     unique(base, used)
 }
 
-/// Restore the seat's legacy active-task pointer: task ids were renamed, so
-/// the old id is resolved through `id_map` into the new anchor. Returns true
-/// when the anchor was restored (the `legacy_active_task_id` metadata key is
-/// removed in that case).
+/// Restore both legacy active pointers through the migration id map.  Older
+/// Python seats often only have `active_task_id`; newer ones may additionally
+/// carry an independently activated document/project.
 fn restore_seat_anchor(seat: &mut Seat, id_map: &HashMap<String, String>) -> bool {
-    let Some(old) = seat
+    let task = seat
         .metadata
         .remove("legacy_active_task_id")
-        .and_then(|v| v.as_str().map(String::from))
-    else {
-        return false;
-    };
-    match id_map.get(&old) {
-        Some(new_id) => {
+        .and_then(|v| v.as_str().map(String::from));
+    let document = seat
+        .metadata
+        .remove("legacy_active_document_id")
+        .and_then(|v| v.as_str().map(String::from));
+    let mut restored = false;
+
+    if let Some(old) = task {
+        if let Some(new_id) = id_map.get(&old) {
             seat.active_task_id = Some(new_id.clone());
-            seat.active_document_id = Some(new_id.clone());
-            true
-        }
-        None => {
-            // The referenced task did not survive the migration — keep the
-            // reference for tracing.
+            if document.is_none() {
+                seat.active_document_id = Some(new_id.clone());
+            }
+            restored = true;
+        } else {
             seat.metadata.insert("legacy_active_task_id".into(), json!(old));
-            false
         }
     }
+    if let Some(old) = document {
+        if let Some(new_id) = id_map.get(&old) {
+            seat.active_document_id = Some(new_id.clone());
+            restored = true;
+        } else {
+            seat.metadata
+                .insert("legacy_active_document_id".into(), json!(old));
+        }
+    }
+    restored
 }
 
 /// Legacy seat → new `Seat`. All seats are imported ACTIVE and non-expiring
@@ -661,6 +655,9 @@ fn extract_legacy_seat(raw: &BsonDoc) -> Option<Seat> {
     }
     if let Ok(task) = raw.get_str("active_task_id") {
         metadata.insert("legacy_active_task_id".into(), json!(task));
+    }
+    if let Ok(document) = raw.get_str("active_document_id") {
+        metadata.insert("legacy_active_document_id".into(), json!(document));
     }
 
     // Usage stats: standard `usage_stats` layout or recovered `statistics`.
@@ -784,16 +781,12 @@ pub async fn migrate_legacy_mongo(
                 continue;
             };
             let name = raw.get_str("name").unwrap_or("").to_string();
-            let slug = slugify(&name);
             let new_id = unique(
-                if slug.is_empty() {
-                    project_id
-                        .chars()
-                        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .take(64)
-                        .collect::<String>()
+                if project_id.trim().is_empty() {
+                    let slug = slugify(&name);
+                    if slug.is_empty() { "project".to_string() } else { slug }
                 } else {
-                    slug
+                    project_id.clone()
                 },
                 &mut used,
             );
@@ -1382,9 +1375,9 @@ mod tests {
         let mut used = HashSet::new();
         let ai = new_kb_id(&d, Some("migration_slc_plan".into()), &mut used);
         assert_eq!(ai, "migration_slc_plan", "AI-слаг без категорийного префикса");
-        // Без AI: латинское "SLC" в заголовке даёт ascii-slug.
+        // Без AI внешний контракт id сохраняется независимо от заголовка.
         let fb = new_kb_id(&d, None, &mut used);
-        assert_eq!(fb, "slc");
+        assert_eq!(fb, "doc_a1b2c3");
         // Киррилический текст без заголовка — fallback на осмысленный legacy id.
         let d2 = LegacyDoc {
             document_id: "doc_a1b2c3".into(),
@@ -1521,7 +1514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_new_id_slugs_the_name_and_falls_back() {
+    async fn task_new_id_is_stable_without_explicit_ai_rename() {
         let raw = bson::doc! {
             "task_id": "task_15c3c8ca",
             "name": "VoIP Bridge: односторонний звук — расследование 2026-08-11",
@@ -1538,7 +1531,7 @@ mod tests {
             &mut used,
         )
         .await;
-        assert_eq!(id, "voip_bridge_2026_08_11");
+        assert_eq!(id, "task_15c3c8ca");
         // Уникальность: повтор → суффикс.
         let id2 = task_new_id(
             &raw,
@@ -1550,7 +1543,7 @@ mod tests {
             &mut used,
         )
         .await;
-        assert_eq!(id2, "voip_bridge_2026_08_11_2");
+        assert_eq!(id2, "task_15c3c8ca_2");
 
         // Пустые name/description → fallback на task_id.
         let raw3 = bson::doc! { "task_id": "cellframe_staking_security_audit" };
@@ -1563,6 +1556,7 @@ mod tests {
     fn restore_seat_anchor_uses_renamed_task_ids() {
         let mut map = HashMap::new();
         map.insert("task_15c3c8ca".to_string(), "voip_bridge_one_way_audio".to_string());
+        map.insert("project_legacy".to_string(), "project_preserved".to_string());
         let mut seat = Seat {
             seat_id: "seat_a".into(),
             name: "dev".into(),
@@ -1573,6 +1567,7 @@ mod tests {
             metadata: {
                 let mut m = Map::new();
                 m.insert("legacy_active_task_id".into(), json!("task_15c3c8ca"));
+                m.insert("legacy_active_document_id".into(), json!("project_legacy"));
                 m
             },
             active_task_id: None,
@@ -1582,8 +1577,9 @@ mod tests {
         };
         assert!(restore_seat_anchor(&mut seat, &map));
         assert_eq!(seat.active_task_id.as_deref(), Some("voip_bridge_one_way_audio"));
-        assert_eq!(seat.active_document_id.as_deref(), Some("voip_bridge_one_way_audio"));
+        assert_eq!(seat.active_document_id.as_deref(), Some("project_preserved"));
         assert!(seat.metadata.get("legacy_active_task_id").is_none());
+        assert!(seat.metadata.get("legacy_active_document_id").is_none());
 
         // Ссылка на несуществующую задачу → legacy-ключ остаётся.
         let mut seat2 = Seat {
