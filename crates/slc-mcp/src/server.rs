@@ -1091,8 +1091,6 @@ project links, wiki links, and active seat pointers. Prefer `rename_task` and
 `rename_project` for those entity types because they accept a human-readable
 name and generate the new slug.
 
-## Seat roles
-
 ## Paginating large responses
 
 When any tool response contains `_pagination` with
@@ -1296,46 +1294,6 @@ async fn build_context(
                 if summary_chars < content.chars().count() {
                     used_tokens = used_tokens.saturating_sub(to_tokens(content.chars().count()))
                         + to_tokens(summary_chars);
-                    b["content"] = json!(summary);
-                    b["llm_compressed"] = json!(true);
-                    llm_compressed.push(b["id"].as_str().unwrap_or("?").to_string());
-                }
-            }
-        }
-    }
-
-    // ── Байтовый кап вывода: харнесы режут вывод тула на ~50K байт
-    // (≈16K символов RU). Документы НИКОГДА не обрезаются руками — если
-    // итоговый ответ не влезает, самые крупные документы (от base/профилей
-    // к активному) сжимаются reasoning-LLM; при недоступности LLM ответ
-    // уходит в пагинацию (docs — список).
-    const OUTPUT_CAP_CHARS: usize = 16_000;
-    let mut total_chars: usize = docs
-        .iter()
-        .map(|b| b["content"].as_str().map(|s| s.chars().count()).unwrap_or(0))
-        .sum::<usize>()
-        + 400; // обвязка ответа (seat/лимиты/warning)
-    if total_chars > OUTPUT_CAP_CHARS {
-        for b in docs.iter_mut().rev() {
-            if total_chars <= OUTPUT_CAP_CHARS {
-                break;
-            }
-            let Some(content) = b["content"].as_str() else { continue };
-            if b.get("llm_compressed").is_some() || content.chars().count() <= 4000 {
-                continue;
-            }
-            let len = content.chars().count();
-            // Целевой размер summary: чтобы суммарно влезть в кап.
-            let target = (OUTPUT_CAP_CHARS - 400)
-                .saturating_sub(total_chars - len)
-                .max(800)
-                .min(len / 2);
-            if let Ok(summary) = engine.summarize_text_for(seat_id, content, target).await {
-                let sc = summary.chars().count();
-                if sc < len {
-                    total_chars = total_chars - len + sc;
-                    used_tokens =
-                        used_tokens.saturating_sub(to_tokens(len)) + to_tokens(sc);
                     b["content"] = json!(summary);
                     b["llm_compressed"] = json!(true);
                     llm_compressed.push(b["id"].as_str().unwrap_or("?").to_string());
@@ -2700,35 +2658,35 @@ async fn call_tool(
         }
     }
     // Pagination envelope: cache oversized list responses and tag them.
-    // Пагинируем ВНУТРЕННИЙ JSON ответа (text), а не MCP-обёртку —
-    // иначе find_list_key находит "content" (массив сообщений) и отдаёт
-    // одну «страницу» со всем текстом. Порог 16000 символов ≈ 48K байт
-    // UTF-8 (RU) — первая страница влезает в resultBudget харнеса (50K).
+    // Paginate the inner JSON value rather than the MCP ContentBlock array;
+    // otherwise `content` itself looks like the list and no useful split is
+    // possible. This is an application-level SLC tool contract layered on
+    // ordinary MCP TextContent, so it remains consumable by any MCP client.
     if text.chars().count() > 16000 {
         if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
             let response_id = uid("resp");
             if let Ok(paginated) = engine.paginate(seat_id, &response_id, &parsed).await {
                 if let Some(page) = paginated.get("_pagination") {
                     result["_pagination"] = page.clone();
-                    // text = первая страница (без обрезки — целиком блоки,
-                    // которые влезли), остальное — через get_page.
+                    // The first page contains only whole items. Remaining
+                    // items are available through the advertised get_page
+                    // tool without relying on a client-side patch.
                     if let Ok(page_text) = serde_json::to_string(&paginated) {
                         text = page_text;
-                        // Клиенту — явная инструкция добирать страницы
-                        // (харнес режет выхлоп; постраничный забор —
-                        // единственный способ получить весь контекст).
+                        // Give every client an explicit, tool-level recovery
+                        // path for the remaining pages.
                         if let (Some(pid), Some(total)) = (
                             page.get("response_id").and_then(|v| v.as_str()),
                             page.get("total_pages").and_then(|v| v.as_u64()),
                         ) {
                             if total > 1 {
                                 text.push_str(&format!(
-                                    "\n\n📄 ОТВЕТ ОБРЕЗАН БЮДЖЕТОМ КЛИЕНТА — страница 1 из {total}.\n"
+                                    "\n\n📄 Paginated response: page 1 of {total}.\n"
                                 ));
                                 text.push_str(&format!(
-                                    "Забери ВСЕ остальные страницы по очереди: get_page(response_id={pid}, page=2..{total}) — по одной за вызов, сложи содержимое вместе.\n"
+                                    "Retrieve every remaining page in order with get_page(response_id={pid}, page=2..{total}), one page per call, and combine the items.\n"
                                 ));
-                                text.push_str("Не завершай работу, пока не получишь все страницы.");
+                                text.push_str("Do not finish processing the response until all pages have been retrieved.");
                             }
                         }
                         result["content"][0]["text"] = json!(text);

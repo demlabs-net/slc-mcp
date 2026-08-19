@@ -28,6 +28,12 @@ patch is required: compatibility is verified with the official MCP SDK as an
 independent client. Newer protocol revisions that omit `ping` continue to use
 the same initialize/tools flow.
 
+`update_context` applies only the seat's configured context-token budget. It
+does not invoke an LLM merely to fit a Hermes- or vendor-specific output cap.
+Large list-shaped tool results can use SLC's advertised `get_page` extension;
+the extension is carried in ordinary MCP `TextContent` and needs no transport
+patch in the client.
+
 The generic seat-scoped `state_get`, `state_put`, `state_list`, and
 `state_delete` tools expose optimistic-concurrency text objects for external
 memory, skills, or other clients. They are ordinary MCP tools, not a
