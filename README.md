@@ -32,7 +32,31 @@ the same initialize/tools flow.
 does not invoke an LLM merely to fit a Hermes- or vendor-specific output cap.
 Large list-shaped tool results can use SLC's advertised `get_page` extension;
 the extension is carried in ordinary MCP `TextContent` and needs no transport
-patch in the client.
+patch in the client. When more than one page exists, page one ends with an
+explicit instruction to retrieve every remaining page in order before acting
+on the result.
+
+Pagination is enabled by default. `SLC_PAGINATION_ENABLED` toggles it for the
+server and `SLC_PAGE_TOKEN_LIMIT` sets both the approximate page size and the
+threshold at which a list response is paginated (default `50000` tokens).
+`set_page_limit` persists the default when no environment override is present.
+An MCP client may override response shaping for only its own HTTP connection:
+
+- `X-SLC-Pagination: enabled|disabled`
+- `X-SLC-Page-Token-Limit: <tokens>`
+- `X-SLC-Context-Token-Limit: <tokens>` sets the `update_context` and
+  `save_context` budget for that connection without changing the seat-wide
+  value.
+
+`SLC_CONTEXT_LIMIT_TOKENS` is a fallback, not a maximum (default `100000`).
+Clients should choose their own budget explicitly through the connection
+header or persist a seat-specific value with `command {"input":"/limit N"}`.
+For example, deployments may choose 50K, 100K, or 300K for different model
+windows; these are configuration examples and are not model tiers built into
+SLC.
+
+These are optional HTTP transport headers; the JSON-RPC/MCP message format is
+unchanged, so clients using the official SDK remain fully compatible.
 
 The generic seat-scoped `state_get`, `state_put`, `state_list`, and
 `state_delete` tools expose optimistic-concurrency text objects for external

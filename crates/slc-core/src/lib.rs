@@ -841,6 +841,18 @@ impl SlcEngine {
         p.paginate(seat_id, response_id, data).await
     }
 
+    pub async fn paginate_with_limit(
+        &self,
+        seat_id: &str,
+        response_id: &str,
+        data: &serde_json::Value,
+        page_token_limit: usize,
+    ) -> SlcResult<serde_json::Value> {
+        let p = Paginator::new(self.store.clone());
+        p.paginate_with_limit(seat_id, response_id, data, page_token_limit)
+            .await
+    }
+
     pub async fn get_page(
         &self,
         seat_id: &str,
@@ -864,6 +876,11 @@ impl SlcEngine {
     pub async fn page_settings(&self) -> SlcResult<serde_json::Value> {
         let p = Paginator::new(self.store.clone());
         p.get_settings().await
+    }
+
+    pub async fn page_token_limit(&self) -> SlcResult<usize> {
+        let p = Paginator::new(self.store.clone());
+        p.page_token_limit().await
     }
 
     // ── tasks + projects (unified Documents) ─────────────────────

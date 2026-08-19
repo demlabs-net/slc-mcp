@@ -124,6 +124,7 @@ impl<S: StorageBackend> SeatManager<S> {
     }
 
     /// Set one key in the seat's context map (per-seat settings, e.g.
+    /// `context_limit_tokens`; legacy seats may still contain
     /// `context_limit_chars`).
     pub async fn set_context_key(&self, seat_id: &str, key: &str, value: Value) -> SlcResult<bool> {
         let Some(mut seat) = self.store.get_seat(seat_id).await? else { return Ok(false) };

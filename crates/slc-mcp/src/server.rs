@@ -321,6 +321,51 @@ fn bearer_from_request(headers: &axum::http::HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaginationPolicy {
+    enabled: bool,
+    page_token_limit: Option<usize>,
+    context_token_limit: Option<usize>,
+}
+
+/// Resolve the response-shaping policy for one MCP connection. Custom HTTP
+/// headers are transport metadata, not protocol changes: clients that do not
+/// send them continue to receive the server defaults.
+fn pagination_policy_from_request(headers: &axum::http::HeaderMap) -> PaginationPolicy {
+    let enabled = headers
+        .get("x-slc-pagination")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_pagination_enabled)
+        .unwrap_or_else(slc_core::pagination::pagination_enabled_from_env);
+    let page_token_limit = headers
+        .get("x-slc-page-token-limit")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(slc_core::pagination::normalize_page_token_limit);
+    let context_token_limit = headers
+        .get("x-slc-context-token-limit")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    PaginationPolicy {
+        enabled,
+        page_token_limit,
+        context_token_limit,
+    }
+}
+
+fn parse_pagination_enabled(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+fn effective_context_token_limit(connection_limit: Option<usize>, seat_limit: usize) -> usize {
+    connection_limit.unwrap_or(seat_limit)
+}
+
 #[axum::debug_handler]
 async fn mcp(
     State(state): State<Arc<AppState>>,
@@ -374,6 +419,7 @@ async fn mcp_request(
     let engine = state.engine.as_ref();
     let seat_hdr = seat_from_request(&headers);
     let bearer = bearer_from_request(&headers);
+    let pagination = pagination_policy_from_request(&headers);
 
     // Tool calls need a seat; initialize/list/ping are unauthenticated.
     if !matches!(
@@ -404,26 +450,6 @@ async fn mcp_request(
 
     let result = match method {
         "initialize" => {
-            // Auto-apply the client's context budget when it advertises one
-            // (capabilities.experimental.context_limit_chars — ТОКЕНЫ) as the
-            // per-seat override used by update_context compression.
-            if let Some(window) = params
-                .pointer("/capabilities/experimental/context_limit_chars")
-                .and_then(|v| v.as_u64())
-            {
-                if let Some(seat) = seat_hdr.as_deref() {
-                    // The seat may not exist yet — create it first.
-                    let _ = engine.seats.ensure_seat(seat).await;
-                    // SLC budget = 80% of the client's model window in TOKENS
-                    // (the rest is left for the conversation itself), capped
-                    // at the configured limit (SLC_CONTEXT_LIMIT_TOKENS).
-                    let limit = (window * 4 / 5).min(engine.config.context_limit_tokens as u64);
-                    let _ = engine
-                        .seats
-                        .set_context_key(seat, "context_limit_tokens", json!(limit))
-                        .await;
-                }
-            }
             Ok(json!({
                 "protocolVersion": "2025-03-26",
                 "capabilities": { "tools": {}, "prompts": {} },
@@ -460,7 +486,15 @@ async fn mcp_request(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let seat = seat_hdr.clone().unwrap_or_default();
-            call_tool(engine, &seat, name, &args, &state.events).await
+            call_tool(
+                engine,
+                &seat,
+                name,
+                &args,
+                &state.events,
+                pagination,
+            )
+            .await
         }
         _ => Err(json!({"code": -32601, "message": format!("method not found: {method}")})),
     };
@@ -940,14 +974,14 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "set_page_limit",
-            "description": "Set the maximum page size (in tokens) for response pagination",
+            "description": "Persist the default response page size in tokens. SLC_PAGE_TOKEN_LIMIT, when set by the operator, has precedence.",
             "inputSchema": {"type":"object","properties":{
                 "page_token_limit": {"type":"number"}
             },"required":["page_token_limit"]}
         }),
         json!({
             "name": "get_page_settings",
-            "description": "Get current pagination settings",
+            "description": "Get server pagination defaults and effective settings for this MCP connection",
             "inputSchema": {"type":"object","properties":{},"required":[]}
         }),
         // context
@@ -1057,8 +1091,9 @@ When enough work has accumulated, or reflection is requested:
 ## Context budget and compression
 
 - `update_context` reports `limit_tokens`, `used_tokens`, `compressed`, and a
-  `warning` when compression occurs. The seat budget is normally 80 percent of
-  the client model window or the explicit `/limit <tokens>` value.
+  `warning` when compression occurs. The effective budget comes from the
+  `X-SLC-Context-Token-Limit` connection header, a seat-specific
+  `/limit <tokens>` value, or the server fallback, in that order.
 - Documents are never cut at an arbitrary character boundary. When necessary,
   whole lower-priority blocks are omitted first, while the active document and
   focus items remain; remaining documents may then be summarized by the LLM
@@ -1116,6 +1151,7 @@ async fn build_context(
     decisions: &[String],
     next_steps: &[String],
     include_base: bool,
+    context_token_limit: Option<usize>,
     events: &tokio::sync::broadcast::Sender<Value>,
 ) -> Result<Value, Value> {
     // persist a context snapshot if summary provided
@@ -1180,7 +1216,8 @@ async fn build_context(
     //    in by dropping whole low-priority blocks (base docs first,
     //    then profiles), keeping the active document and focuses.
     // 3. The model is warned about the compression in the reply.
-    let limit_tokens = engine.context_limit_for(seat_id).await.map_err(json_err)?;
+    let seat_limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
+    let limit_tokens = effective_context_token_limit(context_token_limit, seat_limit);
     let mut docs: Vec<Value> = Vec::new();
     // ЕДИНАЯ единица бюджета — ТОКЕНЫ (~3 симв/токен, RU/EN смесь).
     // Никаких байтовых ограничений вывода: размер окна определяет клиент
@@ -1467,6 +1504,7 @@ async fn call_tool(
     name: &str,
     args: &Value,
     events: &tokio::sync::broadcast::Sender<Value>,
+    pagination: PaginationPolicy,
 ) -> Result<Value, Value> {
     engine
         .seats
@@ -1516,7 +1554,15 @@ async fn call_tool(
                     let summary = parts.collect::<Vec<_>>().join(" ");
                     let empty: Vec<String> = Vec::new();
                     build_context(
-                        engine, seat_id, &summary, &empty, &empty, &empty, true, events,
+                        engine,
+                        seat_id,
+                        &summary,
+                        &empty,
+                        &empty,
+                        &empty,
+                        true,
+                        pagination.context_token_limit,
+                        events,
                     )
                     .await
                 }
@@ -1530,7 +1576,15 @@ async fn call_tool(
                     }
                     let empty: Vec<String> = Vec::new();
                     build_context(
-                        engine, seat_id, &summary, &empty, &empty, &empty, true, events,
+                        engine,
+                        seat_id,
+                        &summary,
+                        &empty,
+                        &empty,
+                        &empty,
+                        true,
+                        pagination.context_token_limit,
+                        events,
                     )
                     .await
                 }
@@ -2119,13 +2173,31 @@ async fn call_tool(
                 .map_err(json_err)?
         }
         "set_page_limit" => {
-            let tokens = args
+            let Some(tokens) = args
                 .get("page_token_limit")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(16000) as usize;
+                .map(|value| value as usize)
+            else {
+                return Err(json!({"code": -32602, "message": "page_token_limit is required"}));
+            };
             engine.set_page_limit(tokens).await.map_err(json_err)?
         }
-        "get_page_settings" => engine.page_settings().await.map_err(json_err)?,
+        "get_page_settings" => {
+            let mut settings = engine.page_settings().await.map_err(json_err)?;
+            let effective_limit = match pagination.page_token_limit {
+                Some(limit) => limit,
+                None => engine.page_token_limit().await.map_err(json_err)?,
+            };
+            settings["effective_enabled"] = json!(pagination.enabled);
+            settings["effective_page_token_limit"] = json!(effective_limit);
+            settings["connection_override"] = json!({
+                "enabled": pagination.enabled
+                    != slc_core::pagination::pagination_enabled_from_env(),
+                "page_token_limit": pagination.page_token_limit.is_some(),
+                "context_token_limit": pagination.context_token_limit,
+            });
+            settings
+        }
         "update_context" => {
             let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
             let include_base = args
@@ -2143,6 +2215,7 @@ async fn call_tool(
                 &decisions,
                 &next_steps,
                 include_base,
+                pagination.context_token_limit,
                 events,
             )
             .await?
@@ -2167,6 +2240,7 @@ async fn call_tool(
                 &decisions,
                 &next_steps,
                 include_base,
+                pagination.context_token_limit,
                 events,
             )
             .await?
@@ -2634,6 +2708,7 @@ async fn call_tool(
     // Human notification prose is useful on interactive knowledge tools, but
     // appending it would corrupt the generic state backend contract for every
     // MCP client, not just Hermes.
+    let tool_text = text.clone();
     if name != "pop_notifications" && !name.starts_with("state_") {
         if let Ok(notes) = engine.pop_notifications(seat_id, 3).await {
             if !notes.is_empty() {
@@ -2650,11 +2725,11 @@ async fn call_tool(
     // outputSchema. Схем у наших тулов нет, поэтому для БОЛЬШИХ ответов
     // дубль не отдаём — он удваивал вывод (text + structuredContent) и
     // выводил за resultBudget харнеса (обрезка strategy=truncate).
-    if text.chars().count() <= 2000 {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+    if tool_text.chars().count() <= 2000 {
+        if let Ok(parsed) = serde_json::from_str::<Value>(&tool_text) {
             result["structuredContent"] = parsed;
         } else {
-            result["structuredContent"] = json!({"text": text});
+            result["structuredContent"] = json!({"text": tool_text});
         }
     }
     // Pagination envelope: cache oversized list responses and tag them.
@@ -2662,16 +2737,39 @@ async fn call_tool(
     // otherwise `content` itself looks like the list and no useful split is
     // possible. This is an application-level SLC tool contract layered on
     // ordinary MCP TextContent, so it remains consumable by any MCP client.
-    if text.chars().count() > 16000 {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
-            let response_id = uid("resp");
-            if let Ok(paginated) = engine.paginate(seat_id, &response_id, &parsed).await {
+    let pagination_candidate = !matches!(
+        name,
+        "get_page" | "delete_response" | "set_page_limit" | "get_page_settings"
+    );
+    if pagination.enabled && pagination_candidate {
+        let effective_page_token_limit = match pagination.page_token_limit {
+            Some(limit) => limit,
+            None => engine.page_token_limit().await.map_err(json_err)?,
+        };
+        let pagination_threshold = effective_page_token_limit
+            .saturating_mul(slc_core::pagination::CHARS_PER_TOKEN);
+        if tool_text.chars().count() > pagination_threshold {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&tool_text) {
+                let response_id = uid("resp");
+                let paginated = engine
+                    .paginate_with_limit(
+                        seat_id,
+                        &response_id,
+                        &parsed,
+                        effective_page_token_limit,
+                    )
+                    .await
+                    .map_err(json_err)?;
                 if let Some(page) = paginated.get("_pagination") {
                     result["_pagination"] = page.clone();
                     // The first page contains only whole items. Remaining
                     // items are available through the advertised get_page
                     // tool without relying on a client-side patch.
                     if let Ok(page_text) = serde_json::to_string(&paginated) {
+                        let notification_suffix = text
+                            .strip_prefix(&tool_text)
+                            .unwrap_or_default()
+                            .to_string();
                         text = page_text;
                         // Give every client an explicit, tool-level recovery
                         // path for the remaining pages.
@@ -2689,6 +2787,7 @@ async fn call_tool(
                                 text.push_str("Do not finish processing the response until all pages have been retrieved.");
                             }
                         }
+                        text.push_str(&notification_suffix);
                         result["content"][0]["text"] = json!(text);
                     }
                 }
@@ -2773,6 +2872,33 @@ mod seat_filter_tests {
     fn ping_result_is_an_mcp_response_object() {
         assert_eq!(ping_result(), json!({}));
         assert!(ping_result().is_object());
+    }
+
+    #[test]
+    fn pagination_transport_overrides_are_connection_scoped() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-slc-pagination", "disabled".parse().unwrap());
+        headers.insert("x-slc-page-token-limit", "25000".parse().unwrap());
+        headers.insert(
+            "x-slc-context-token-limit",
+            "100000".parse().unwrap(),
+        );
+        let policy = pagination_policy_from_request(&headers);
+        assert!(!policy.enabled);
+        assert_eq!(policy.page_token_limit, Some(25_000));
+        assert_eq!(policy.context_token_limit, Some(100_000));
+
+        assert_eq!(effective_context_token_limit(Some(300_000), 100_000), 300_000);
+        assert_eq!(effective_context_token_limit(None, 100_000), 100_000);
+
+        headers.insert("x-slc-pagination", "enabled".parse().unwrap());
+        headers.insert("x-slc-page-token-limit", "1".parse().unwrap());
+        let policy = pagination_policy_from_request(&headers);
+        assert!(policy.enabled);
+        assert_eq!(
+            policy.page_token_limit,
+            Some(slc_core::pagination::MIN_PAGE_TOKEN_LIMIT)
+        );
     }
 
     #[test]
