@@ -20,7 +20,7 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
 rand = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
@@ -28,6 +28,8 @@ dotenvy = "0.15"
 axum = { version = "0.8", features = ["json"] }
 futures = "0.3"
 async-stream = "0.3"
+jsonwebtoken = "9"
+bcrypt = "0.15"
 slc-core = { path = "crates/slc-core" }
 
 [profile.release]

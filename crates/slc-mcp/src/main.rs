@@ -6,7 +6,9 @@
 //! - CLI subcommands for the memory pipeline (remember/compress/consolidate/
 //!   search/seat/import/graveyard).
 
+mod auth;
 mod server;
+mod webui;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -173,7 +175,14 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Serve { port, auto_commit } => {
-            config.auto_git_commit = auto_commit;
+            // Флаг --auto-commit дополняет env OBSIDIAN_AUTO_GIT_COMMIT,
+            // а не перезаписывает его (иначе авто-коммит vault выключен
+            // всегда, когда флаг не передан).
+            config.auto_git_commit = auto_commit || config.auto_git_commit;
+            let dist = std::env::var("SLC_WEBUI_DIST")
+                .unwrap_or_else(|_| "./web-ui/dist".into());
+            let auth_state = auth::AuthState::from_env(&config.path);
+            auth_state.store.load().context("auth store load")?;
             if config.mcp_sampling {
                 // Inference through the MCP client (sampling) — no local
                 // GPU/LLM needed; embeddings degrade to text-only search.
@@ -183,12 +192,12 @@ async fn main() -> anyhow::Result<()> {
                 let llm: std::sync::Arc<dyn slc_core::LlmClient> =
                     std::sync::Arc::new(slc_core::McpSamplingLlm::new(out_tx, pending.clone()));
                 let engine = SlcEngine::open_async_with_llm(config, llm).await?;
-                server::run(engine, port, Some(out_rx), pending).await
+                server::run(engine, port, dist.into(), auth_state, Some(out_rx), pending).await
             } else {
                 let engine = SlcEngine::open_async(config).await?;
                 let pending =
                     std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-                server::run(engine, port, None, pending).await
+                server::run(engine, port, dist.into(), auth_state, None, pending).await
             }
         }
         Cmd::Migrate {

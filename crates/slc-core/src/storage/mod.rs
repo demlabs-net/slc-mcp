@@ -17,7 +17,7 @@ pub mod mongodb;
 pub mod obsidian;
 pub mod sqlite;
 
-use crate::error::SlcResult;
+use crate::error::{SlcError, SlcResult};
 use crate::model::{
     Document, DocumentCategory, DocLevel, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat,
     SeatStatus,
@@ -114,6 +114,33 @@ pub trait StorageBackend: Send + Sync {
     /// Full replace: insert or overwrite the whole document (metadata, tags,
     /// auto_load, content — everything). Returns true if it replaced existing.
     async fn kb_replace(&self, doc: &Document) -> SlcResult<bool>;
+    /// Пакетная замена документов: один git-коммит на весь пакет
+    /// (obsidian); default — цикл [`StorageBackend::kb_replace`].
+    async fn kb_replace_many(&self, docs: &[Document]) -> SlcResult<()> {
+        for d in docs {
+            self.kb_replace(d).await?;
+        }
+        Ok(())
+    }
+
+    /// Переименовать документ (сменить document_id/имя файла). Каскадные
+    /// ссылки (auto_load/references/указатели сидов) чинит движок.
+    /// Default: insert под новым id + purge старого; obsidian/sqlite
+    /// переопределяют атомарно.
+    async fn kb_rename(&self, old_id: &str, new_id: &str) -> SlcResult<bool> {
+        let Some(mut doc) = self.kb_get(old_id).await? else {
+            return Ok(false);
+        };
+        if self.kb_get(new_id).await?.is_some() {
+            return Err(SlcError::Storage(format!("document already exists: {new_id}")));
+        }
+        doc.document_id = new_id.to_string();
+        doc.updated_at = chrono::Utc::now();
+        doc.version += 1;
+        self.kb_insert(&doc).await?;
+        self.kb_purge(old_id).await?;
+        Ok(true)
+    }
     async fn kb_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>>;
     async fn kb_count(&self, filter: &DocFilter) -> SlcResult<u64>;
     /// Apply a metadata patch to all matching KB docs.
@@ -173,6 +200,13 @@ pub trait StorageBackend: Send + Sync {
     async fn delete_record(&self, collection: &str, key: &str) -> SlcResult<bool>;
     /// Enumerate all records in a collection as `(key, value)` pairs.
     async fn list_records(&self, collection: &str) -> SlcResult<Vec<(String, Value)>>;
+
+    /// Re-read the backing store from disk (multi-process setups: several
+    /// services may share one vault/db — refresh picks up foreign changes).
+    /// Default: no-op.
+    async fn refresh(&self) -> SlcResult<()> {
+        Ok(())
+    }
 
     async fn health_check(&self) -> bool;
     async fn close(&self) -> SlcResult<()>;

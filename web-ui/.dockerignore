@@ -1,0 +1,8 @@
+node_modules
+dist
+test-results
+tests
+playwright.config.ts
+.env
+*.log
+.md

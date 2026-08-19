@@ -521,7 +521,7 @@ impl ObsidianVaultStore {
         let author = self.git_author.clone();
         let git_lock = self.git_lock.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let _guard = git_lock.lock().unwrap(); // serialize git index.lock
+            let Ok(_guard) = git_lock.lock() else { return }; // serialize git index.lock
             let author_name = author.split('<').next().unwrap_or("slc-mcp").trim().to_string();
             let run = |args: Vec<&str>| {
                 std::process::Command::new("git")
@@ -531,10 +531,34 @@ impl ObsidianVaultStore {
                     .env("GIT_AUTHOR_EMAIL", &author)
                     .output()
             };
-            if let Ok(out) = run(vec!["add", "-A"]) {
-                if out.status.success() {
-                    let _ = run(vec!["commit", "-m", "slc: vault update", "--allow-empty"]);
+            let failed = |out: &std::process::Output| {
+                tracing::warn!(
+                    "vault git: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            };
+            match run(vec!["add", "-A"]) {
+                Ok(out) if out.status.success() => {
+                    let commit = run(vec!["commit", "-m", "slc: vault update", "--allow-empty"]);
+                    match &commit {
+                        Ok(c) if c.status.success() => {
+                            // Push the vault to its upstream (best-effort) —
+                            // configured remote only, silent otherwise.
+                            if let Ok(p) = run(vec!["push", "-q"]) {
+                                if !p.status.success() {
+                                    tracing::debug!(
+                                        "vault push: {}",
+                                        String::from_utf8_lossy(&p.stderr).trim()
+                                    );
+                                }
+                            }
+                        }
+                        Ok(c) => failed(c),
+                        Err(e) => tracing::warn!("vault git commit error: {e}"),
+                    }
                 }
+                Ok(out) => failed(&out),
+                Err(e) => tracing::warn!("vault git add error: {e}"),
             }
         })
         .await;
@@ -709,6 +733,50 @@ impl StorageBackend for ObsidianVaultStore {
         self.write_note(&doc)?;
         self.git_commit().await;
         Ok(true)
+    }
+
+    async fn kb_replace_many(&self, docs: &[Document]) -> SlcResult<()> {
+        for doc in docs {
+            if !doc.category.is_kb() {
+                return Err(SlcError::Storage(
+                    "history docs go to the episodic store, not the KB".into(),
+                ));
+            }
+            let doc = doc.clone();
+            self.write_note(&doc)?;
+        }
+        self.git_commit().await;
+        Ok(())
+    }
+
+    async fn kb_rename(&self, old_id: &str, new_id: &str) -> SlcResult<bool> {
+        // Вся работа с guard — в блоке без await (future должен быть Send).
+        let renamed = {
+            let mut index = self.index.lock().unwrap();
+            let Some(entry) = index.get(old_id).cloned() else {
+                return Ok(false);
+            };
+            if index.contains_key(new_id) {
+                return Err(SlcError::Storage(format!(
+                    "document already exists: {new_id}"
+                )));
+            }
+            let dir = self.root.join(sanitize_folder(&entry.folder)?);
+            let old_path = dir.join(format!("{}.md", safe_file_name(old_id)));
+            let new_path = dir.join(format!("{}.md", safe_file_name(new_id)));
+            if !old_path.is_file() {
+                return Ok(false);
+            }
+            std::fs::rename(&old_path, &new_path)?;
+            index.remove(old_id);
+            let mut e = entry;
+            e.id = new_id.to_string();
+            index.insert(new_id.to_string(), e);
+            true
+        };
+        self.persist_index()?;
+        self.git_commit().await;
+        Ok(renamed)
     }
 
     async fn kb_purge(&self, document_id: &str) -> SlcResult<bool> {
@@ -1019,6 +1087,15 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn health_check(&self) -> bool {
         self.root.exists()
+    }
+
+    /// Multi-process sync: re-scan the vault from disk (documents, seats,
+    /// sidecars). Files are the source of truth — picks up changes made by
+    /// another service (e.g. the web UI) sharing the same vault.
+    async fn refresh(&self) -> SlcResult<()> {
+        self.rebuild_index()?;
+        self.load_sidecars()?;
+        Ok(())
     }
 
     async fn close(&self) -> SlcResult<()> {
