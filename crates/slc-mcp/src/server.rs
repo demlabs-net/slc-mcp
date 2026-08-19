@@ -1040,6 +1040,13 @@ pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инс�
 `rename_task`/`rename_project` принимают новое человекочитаемое имя и сами
 строят новый id (slug) — предпочитай их для задач и проектов.
 
+## Пагинация больших ответов
+
+Если ответ любого тула содержит `_pagination` (response_id/page/total_pages)
+или текст «ОТВЕТ ОБРЕЗАН БЮДЖЕТОМ КЛИЕНТА» — выхлоп порезан: забери
+остальные страницы по одной через `get_page(response_id=…, page=2..N)`
+и сложи содержимое. Не завершай обработку, пока не получишь все страницы.
+
 ## Роли сидов
 
 Сид с ролью `operator` (настраивается сервером, `SLC_SEAT_ROLES`) может
@@ -1246,6 +1253,46 @@ async fn build_context(
         }
     }
 
+    // ── Байтовый кап вывода: харнесы режут вывод тула на ~50K байт
+    // (≈16K символов RU). Документы НИКОГДА не обрезаются руками — если
+    // итоговый ответ не влезает, самые крупные документы (от base/профилей
+    // к активному) сжимаются reasoning-LLM; при недоступности LLM ответ
+    // уходит в пагинацию (docs — список).
+    const OUTPUT_CAP_CHARS: usize = 16_000;
+    let mut total_chars: usize = docs
+        .iter()
+        .map(|b| b["content"].as_str().map(|s| s.chars().count()).unwrap_or(0))
+        .sum::<usize>()
+        + 400; // обвязка ответа (seat/лимиты/warning)
+    if total_chars > OUTPUT_CAP_CHARS {
+        for b in docs.iter_mut().rev() {
+            if total_chars <= OUTPUT_CAP_CHARS {
+                break;
+            }
+            let Some(content) = b["content"].as_str() else { continue };
+            if b.get("llm_compressed").is_some() || content.chars().count() <= 4000 {
+                continue;
+            }
+            let len = content.chars().count();
+            // Целевой размер summary: чтобы суммарно влезть в кап.
+            let target = (OUTPUT_CAP_CHARS - 400)
+                .saturating_sub(total_chars - len)
+                .max(800)
+                .min(len / 2);
+            if let Ok(summary) = engine.summarize_text_for(seat_id, content, target).await {
+                let sc = summary.chars().count();
+                if sc < len {
+                    total_chars = total_chars - len + sc;
+                    used_tokens =
+                        used_tokens.saturating_sub(to_tokens(len)) + to_tokens(sc);
+                    b["content"] = json!(summary);
+                    b["llm_compressed"] = json!(true);
+                    llm_compressed.push(b["id"].as_str().unwrap_or("?").to_string());
+                }
+            }
+        }
+    }
+
     // Warn the model about the compression (never silent).
     let warning = if compressed || !llm_compressed.is_empty() {
         let mut parts = Vec::new();
@@ -1432,7 +1479,6 @@ async fn call_tool(
                         "category": h.document.category.as_str(),
                         "folder": h.document.folder,
                         "score": h.rank_score,
-                        "snippet": h.document.content.chars().take(200).collect::<String>(),
                     })).collect::<Vec<_>>()}))
                 }
                 "help" => Ok(json!({"commands": [
@@ -1463,7 +1509,7 @@ async fn call_tool(
                 "category": h.document.category.as_str(),
                 "folder": h.document.folder,
                 "score": h.rank_score,
-                "content": truncate(&h.document.content, 2000),
+                "content": h.document.content,
             })).collect::<Vec<_>>()})
         }
         "get_document" => {
@@ -1525,7 +1571,7 @@ async fn call_tool(
             json!({"events": docs.iter().map(|d| json!({
                 "document_id": d.document_id,
                 "level": d.metadata.doc_level.map(|l| l.as_str()),
-                "content": truncate(&d.content, 1000),
+                "content": d.content,
             })).collect::<Vec<_>>()})
         }
         "seat_info" => match engine.seats.get_seat(seat_id).await.map_err(json_err)? {
@@ -1829,7 +1875,7 @@ async fn call_tool(
                 .map_err(json_err)?
             {
                 Some(d) => {
-                    json!({"success": true, "has_active_document": true, "target_seat": target, "document_id": d.document_id, "category": d.category.as_str(), "content": truncate(&d.content, 2000), "tags": d.tags})
+                    json!({"success": true, "has_active_document": true, "target_seat": target, "document_id": d.document_id, "category": d.category.as_str(), "content": d.content, "tags": d.tags})
                 }
                 None => {
                     json!({"success": true, "has_active_document": false, "target_seat": target, "message": "No active document"})
@@ -2352,11 +2398,40 @@ async fn call_tool(
         }
     }
     // Pagination envelope: cache oversized list responses and tag them.
-    if text.chars().count() > 20000 {
-        let response_id = uid("resp");
-        if let Ok(paginated) = engine.paginate(seat_id, &response_id, &result).await {
-            if let Some(page) = paginated.get("_pagination") {
-                result["_pagination"] = page.clone();
+    // Пагинируем ВНУТРЕННИЙ JSON ответа (text), а не MCP-обёртку —
+    // иначе find_list_key находит "content" (массив сообщений) и отдаёт
+    // одну «страницу» со всем текстом. Порог 16000 символов ≈ 48K байт
+    // UTF-8 (RU) — первая страница влезает в resultBudget харнеса (50K).
+    if text.chars().count() > 16000 {
+        if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+            let response_id = uid("resp");
+            if let Ok(paginated) = engine.paginate(seat_id, &response_id, &parsed).await {
+                if let Some(page) = paginated.get("_pagination") {
+                    result["_pagination"] = page.clone();
+                    // text = первая страница (без обрезки — целиком блоки,
+                    // которые влезли), остальное — через get_page.
+                    if let Ok(page_text) = serde_json::to_string(&paginated) {
+                        text = page_text;
+                        // Клиенту — явная инструкция добирать страницы
+                        // (харнес режет выхлоп; постраничный забор —
+                        // единственный способ получить весь контекст).
+                        if let (Some(pid), Some(total)) = (
+                            page.get("response_id").and_then(|v| v.as_str()),
+                            page.get("total_pages").and_then(|v| v.as_u64()),
+                        ) {
+                            if total > 1 {
+                                text.push_str(&format!(
+                                    "\n\n📄 ОТВЕТ ОБРЕЗАН БЮДЖЕТОМ КЛИЕНТА — страница 1 из {total}.\n"
+                                ));
+                                text.push_str(&format!(
+                                    "Забери ВСЕ остальные страницы по очереди: get_page(response_id={pid}, page=2..{total}) — по одной за вызов, сложи содержимое вместе.\n"
+                                ));
+                                text.push_str("Не завершай работу, пока не получишь все страницы.");
+                            }
+                        }
+                        result["content"][0]["text"] = json!(text);
+                    }
+                }
             }
         }
     }
