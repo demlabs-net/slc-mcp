@@ -11,11 +11,13 @@ use axum::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
 use serde_json::{Value, json};
 use slc_core::{DocFilter, DocMeta, DocSort, Document, DocumentCategory, SlcEngine, SortDir};
 use std::sync::Arc;
+
+use crate::{auth, webui};
 
 pub struct AppState {
     pub engine: Arc<SlcEngine>,
@@ -26,11 +28,17 @@ pub struct AppState {
     pub sampling: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
     >,
+    /// Каталог со статикой SPA (web-ui/dist) для встроенной веб-морды.
+    pub dist: std::path::PathBuf,
+    /// Авторизация веб-морды (users/JWT/RBAC/Yandex OAuth, SLC_AUTH).
+    pub auth: std::sync::Arc<auth::AuthState>,
 }
 
 pub async fn run(
     engine: SlcEngine,
     port: u16,
+    dist: std::path::PathBuf,
+    auth_state: auth::AuthState,
     sampling_out: Option<tokio::sync::mpsc::Receiver<Value>>,
     sampling: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
@@ -53,16 +61,89 @@ pub async fn run(
         engine: Arc::new(engine),
         events: tx,
         sampling,
+        dist,
+        auth: std::sync::Arc::new(auth_state),
     });
     let app = Router::new()
         .route("/mcp", post(mcp))
         .route("/sse", get(sse_endpoint))
         .route("/messages", post(messages))
         .route("/health", get(health))
+        // ── Веб-морда (REST + SPA, тот же процесс) ──
+        .route("/api/health", get(webui::api::health))
+        .route("/api/stats", get(webui::api::stats))
+        .route("/api/context", get(webui::api::context))
+        .route(
+            "/api/documents",
+            get(webui::api::list_documents).post(webui::api::add_document),
+        )
+        .route(
+            "/api/documents/{id}",
+            get(webui::api::get_document)
+                .put(webui::api::update_document)
+                .delete(webui::api::delete_document),
+        )
+        .route("/api/search", get(webui::api::search))
+        .route("/api/tasks", get(webui::api::list_tasks).post(webui::api::create_task))
+        .route(
+            "/api/tasks/{id}",
+            put(webui::api::update_task).delete(webui::api::delete_task),
+        )
+        .route(
+            "/api/projects",
+            get(webui::api::list_projects).post(webui::api::create_project),
+        )
+        .route(
+            "/api/projects/{id}",
+            put(webui::api::update_project).delete(webui::api::delete_project),
+        )
+        .route("/api/seats", get(webui::api::list_seats))
+        .route(
+            "/api/notifications",
+            get(webui::api::notification_list).post(webui::api::pop_notifications),
+        )
+        .route(
+            "/api/reminders",
+            get(webui::api::reminder_list).post(webui::api::reminder_create),
+        )
+        .route("/api/reminders/{id}", delete(webui::api::reminder_cancel))
+        .route("/api/focuses", get(webui::api::focus_list).post(webui::api::focus_add))
+        .route(
+            "/api/focuses/{id}",
+            put(webui::api::focus_update).delete(webui::api::focus_remove),
+        )
+        .route("/api/events", get(webui::api::sse_events))
+        // ── Авторизация веб-морды (полный порт легаси) ──
+        .route("/api/auth/register", post(auth::routes::register))
+        .route("/api/auth/login", post(auth::routes::login))
+        .route("/api/auth/refresh", post(auth::routes::refresh))
+        .route("/api/auth/logout", post(auth::routes::logout))
+        .route("/api/auth/me", get(auth::routes::me))
+        .route(
+            "/api/auth/oauth/yandex",
+            get(auth::routes::oauth_yandex_redirect).post(auth::routes::oauth_yandex_code),
+        )
+        .route("/api/auth/oauth/yandex/callback", get(auth::routes::oauth_yandex_callback))
+        .route("/api/auth/oauth/yandex/callback_uri", get(auth::routes::oauth_callback_uri))
+        .route("/api/auth/exchange", post(auth::routes::exchange))
+        .route("/api/auth/users", get(auth::routes::list_users))
+        .route("/api/auth/users/{user_id}/groups", put(auth::routes::update_user_groups))
+        .route("/api/auth/users/{user_id}/active", put(auth::routes::toggle_user_active))
+        .route("/api/auth/groups", get(auth::routes::list_groups))
+        .route("/api/admin/oauth/rules", get(auth::routes::oauth_rules_list).post(auth::routes::oauth_rule_create))
+        .route(
+            "/api/admin/oauth/rules/{rule_id}",
+            put(auth::routes::oauth_rule_update).delete(auth::routes::oauth_rule_delete),
+        )
+        .route("/api/admin/oauth/ya360/status", get(auth::routes::ya360_status))
+        .fallback(webui::static_files::handler)
+        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("SLC MCP listening on http://{addr}/mcp (SSE: /sse → /messages)");
+    tracing::info!(
+        "SLC MCP listening on http://{addr}/mcp (SSE: /sse → /messages; web UI: /api, /)"
+    );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -508,16 +589,15 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_task",
-            "description": "Update an existing task. Для РЕДАКТИРОВАНИЯ большого тела используй description_patch (дифф: append/prepend/replace_section/remove_section) — НЕ пересылай всю description целиком. Полная description — только для полной замены.",
+            "description": "Update an existing task. Тело редактируется ТОЛЬКО через diff (append/prepend/replace_section/remove_section по markdown-заголовкам) — полное переписывание описания запрещено.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "name": {"type":"string"},
-                "description": {"type":"string","description":"полная замена тела (не используй вместе с description_patch)"},
-                "description_patch": {"type":"array","items":{"type":"object","properties":{
+                "diff": {"type":"array","items":{"type":"object","properties":{
                     "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
                     "content": {"type":"string"},
                     "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
-                },"required":["op"]},"description":"дифф-операции, применяются по порядку"},
+                },"required":["op"]},"description":"ЕДИНСТВЕННЫЙ способ редактирования тела — дифф-операции, применяются по порядку; полная пересылка тела запрещена"},
                 "project_id": {"type":"string"},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","CANCELLED"]},
@@ -533,15 +613,18 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "activate_task",
-            "description": "Activate a task (included in update_context)",
+            "description": "Activate a task (included in update_context). target_seat (только для сидов с ролью operator): поставить активную задачу другому сиду.",
             "inputSchema": {"type":"object","properties":{
-                "task_id": {"type":"string"}
+                "task_id": {"type":"string"},
+                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
             },"required":["task_id"]}
         }),
         json!({
             "name": "deactivate_task",
-            "description": "Deactivate the current active task",
-            "inputSchema": {"type":"object","properties":{},"required":[]}
+            "description": "Deactivate the current active task. target_seat (только для сидов с ролью operator): снять активную задачу другого сида.",
+            "inputSchema": {"type":"object","properties":{
+                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+            },"required":[]}
         }),
         json!({
             "name": "get_active_task",
@@ -550,15 +633,18 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "activate_document",
-            "description": "Activate ANY document (task, project, skill, knowledge doc…) as the seat's context anchor — it is included in update_context and its auto_load links are followed on updates. The effect is identical to activate_task, but for every category.",
+            "description": "Activate ANY document (task, project, skill, knowledge doc…) as the seat's context anchor — it is included in update_context and its auto_load links are followed on updates. The effect is identical to activate_task, but for every category. target_seat (только для сидов с ролью operator): активировать документ другому сиду.",
             "inputSchema": {"type":"object","properties":{
-                "document_id": {"type":"string"}
+                "document_id": {"type":"string"},
+                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
             },"required":["document_id"]}
         }),
         json!({
             "name": "deactivate_document",
-            "description": "Clear the seat's active document (any category)",
-            "inputSchema": {"type":"object","properties":{},"required":[]}
+            "description": "Clear the seat's active document (any category). target_seat (только для сидов с ролью operator): снять активный документ другого сида.",
+            "inputSchema": {"type":"object","properties":{
+                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+            },"required":[]}
         }),
         json!({
             "name": "get_active_document",
@@ -587,16 +673,15 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_project",
-            "description": "Update an existing project. Для редактирования большого тела используй description_patch (дифф), полную description — только для полной замены.",
+            "description": "Update an existing project. Тело редактируется ТОЛЬКО через diff (append/prepend/replace_section/remove_section по markdown-заголовкам) — полное переписывание описания запрещено.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
                 "name": {"type":"string"},
-                "description": {"type":"string","description":"полная замена тела"},
-                "description_patch": {"type":"array","items":{"type":"object","properties":{
+                "diff": {"type":"array","items":{"type":"object","properties":{
                     "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
                     "content": {"type":"string"},
                     "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
-                },"required":["op"]}},
+                },"required":["op"]},"description":"ЕДИНСТВЕННЫЙ способ редактирования тела — дифф-операции, применяются по порядку; полная пересылка тела запрещена"},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "status": {"type":"string","enum":["active","archived"]},
                 "metadata": {"type":"object"}
@@ -649,6 +734,110 @@ fn tools() -> Vec<Value> {
                 "content": {"type":"string"},
                 "timezone": {"type":"string","description":"IANA timezone, e.g. Europe/Moscow"}
             },"required":["content"]}
+        }),
+        // UI-ориентированные read/write-тулы
+        json!({
+            "name": "project_set_status",
+            "description": "Archive/unarchive a project (active|archived). target_seat (только для сидов с ролью operator): сменить статус проекта другого сида.",
+            "inputSchema": {"type":"object","properties":{
+                "project_id": {"type":"string"},
+                "status": {"type":"string","enum":["active","archived"]},
+                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+            },"required":["project_id","status"]}
+        }),
+        json!({
+            "name": "focus_set_archived",
+            "description": "Archive/unarchive a focus item. target_seat (только для сидов с ролью operator): архивировать фокус другого сида.",
+            "inputSchema": {"type":"object","properties":{
+                "focus_id": {"type":"string"},
+                "archived": {"type":"boolean"},
+                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+            },"required":["focus_id","archived"]}
+        }),
+        json!({
+            "name": "seat_roles",
+            "description": "Роли сида (operator = управление контекстом других сидов). Без seat_id — роли текущего сида.",
+            "inputSchema": {"type":"object","properties":{
+                "seat_id": {"type":"string"}
+            },"required":[]}
+        }),
+        json!({
+            "name": "rename_document",
+            "description": "Переименовать документ (сменить document_id/имя файла) — работает для документов, задач и проектов. Каскадно чинит: auto_load/references всех документов, проектные связи задач, вики-ссылки [[old]] в контенте, активные указатели сидов. Только свои (видимые) документы.",
+            "inputSchema": {"type":"object","properties":{
+                "document_id": {"type":"string"},
+                "new_document_id": {"type":"string","description":"новый уникальный id (slug)"}
+            },"required":["document_id","new_document_id"]}
+        }),
+        json!({
+            "name": "rename_task",
+            "description": "Переименовать задачу: новый id = slug от new_name, name обновляется; auto_load/references/проектные связи/указатели сидов чинятся каскадно.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"},
+                "new_name": {"type":"string"}
+            },"required":["task_id","new_name"]}
+        }),
+        json!({
+            "name": "rename_project",
+            "description": "Переименовать проект: новый id = slug от new_name, name обновляется; задачи проекта и ссылки чинятся каскадно.",
+            "inputSchema": {"type":"object","properties":{
+                "project_id": {"type":"string"},
+                "new_name": {"type":"string"}
+            },"required":["project_id","new_name"]}
+        }),
+        json!({
+            "name": "list_documents",
+            "description": "List knowledge documents (id/category/folder/tags, no content) with optional filters",
+            "inputSchema": {"type":"object","properties":{
+                "category": {"type":"string","description":"core|module|task|project|code_snippet|documentation|skill|custom|system"},
+                "folder": {"type":"string","description":"relative vault folder, e.g. docs/projects/slc"},
+                "query": {"type":"string","description":"substring filter on id/content"},
+                "limit": {"type":"number","default":100}
+            },"required":[]}
+        }),
+        json!({
+            "name": "update_document",
+            "description": "Update an existing document. Тело редактируется ТОЛЬКО через diff (append/prepend/replace_section/remove_section по markdown-заголовкам) — полное переписывание содержимого запрещено. Остальные поля — patch.",
+            "inputSchema": {"type":"object","properties":{
+                "document_id": {"type":"string"},
+                "diff": {"type":"array","items":{"type":"object","properties":{
+                    "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
+                    "content": {"type":"string"},
+                    "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
+                },"required":["op"]},"description":"ЕДИНСТВЕННЫЙ способ редактирования тела — дифф-операции, применяются по порядку; полная пересылка тела запрещена"},
+                "tags": {"type":"array","items":{"type":"string"}},
+                "auto_load": {"type":"array","items":{"type":"string"}},
+                "references": {"type":"array","items":{"type":"string"}},
+                "metadata": {"type":"object"},
+                "seat_id": {"type":"string","description":"owner seat; empty string = public"}
+            },"required":["document_id"]}
+        }),
+        json!({
+            "name": "delete_document",
+            "description": "Soft-delete a document (or purge it with purge=true)",
+            "inputSchema": {"type":"object","properties":{
+                "document_id": {"type":"string"},
+                "purge": {"type":"boolean","default":false}
+            },"required":["document_id"]}
+        }),
+        json!({
+            "name": "document_stats",
+            "description": "Knowledge base counts: total, by category, episodic, seats, tasks, projects",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        }),
+        json!({
+            "name": "list_seats",
+            "description": "List active seats with usage stats",
+            "inputSchema": {"type":"object","properties":{
+                "limit": {"type":"number","default":100}
+            },"required":[]}
+        }),
+        json!({
+            "name": "notification_list",
+            "description": "List notifications for the seat (without popping; optional status filter)",
+            "inputSchema": {"type":"object","properties":{
+                "status": {"type":"string","description":"pending|delivered|dismissed"}
+            },"required":[]}
         }),
         // pagination
         json!({
@@ -756,9 +945,11 @@ pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инс�
 4. **Обогащай по ходу.** После значимых шагов обновляй документы
    (`add_document` с тем же document_id — upsert): статусы, решения,
    новые факты. История (remember) — это сырьё, а документы — рабочий
-   артефакт. Задачи/проекты обновляй ДИФФОМ (`update_task` c
-   `description_patch`: append / replace_section / remove_section) —
-   НЕ пересылай всю description целиком, если меняешь часть тела.
+   артефакт. Тела задач/проектов/документов редактируются ТОЛЬКО через
+   `diff` (`update_task`/`update_project`/`update_document`:
+   append / prepend / replace_section / remove_section по
+   markdown-заголовкам) — полное переписывание тела запрещено; для
+   простых правок используй replace_section с точным заголовком секции.
 5. **auto_load vs references (важно, не путай).**
    - `auto_load` — РАБОЧИЕ связи: документы, которые должны подтягиваться
      в контекст при обновлении этого документа (состав, зависимости,
@@ -822,6 +1013,23 @@ pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инс�
 
 `check_notifications` в начале каждого хода — там могут быть фокус- или
 таймер-напоминания, требующие действий.
+
+## Переименование
+
+`rename_document` меняет document_id (имя файла) любого документа, задачи
+или проекта с каскадным исправлением ссылок (auto_load/references,
+проектные связи, вики-ссылки [[old]], активные указатели сидов).
+`rename_task`/`rename_project` принимают новое человекочитаемое имя и сами
+строят новый id (slug) — предпочитай их для задач и проектов.
+
+## Роли сидов
+
+Сид с ролью `operator` (настраивается сервером, `SLC_SEAT_ROLES`) может
+управлять рабочим контекстом других сидов: `activate_task` /
+`activate_document` / `deactivate_document` / `deactivate_task` с параметром
+`target_seat`, а также `project_set_status` и `focus_set_archived` для чужого
+сида. Свои сущности активируются как обычно (target_seat не нужен).
+`seat_roles` показывает роли сида.
 "#;
 
 async fn build_context(
@@ -1243,11 +1451,12 @@ async fn call_tool(
                 .get("document_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // Видимость: свой/публичный документ или сид с ролью operator.
             match engine.get_document(id).await.map_err(json_err)? {
-                Some(d) => {
-                    json!({"document_id": d.document_id, "category": d.category.as_str(), "content": d.content, "tags": d.tags, "metadata": d.metadata})
+                Some(d) if engine.can_read_document(seat_id, &d) => {
+                    json!({"document_id": d.document_id, "category": d.category.as_str(), "folder": d.folder, "content": d.content, "tags": d.tags, "metadata": d.metadata, "seat_id": d.seat_id, "auto_load": d.auto_load, "references": d.references, "created_at": d.created_at.to_rfc3339(), "updated_at": d.updated_at.to_rfc3339()})
                 }
-                None => json!({"error": format!("not found: {id}")}),
+                _ => json!({"error": format!("not found: {id}")}),
             }
         }
         "add_document" => {
@@ -1474,11 +1683,9 @@ async fn call_tool(
         "update_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
-            let description = args.get("description").and_then(|v| v.as_str());
-            let description_patch = args.get("description_patch").cloned();
-            if description.is_some() && description_patch.is_some() {
-                return Err(json!({"code": -32602, "message": "pass either description (полная замена) or description_patch (дифф), не оба"}));
-            }
+            // Тело — только через diff (полная пересылка запрещена).
+            let description = None;
+            let description_patch = args.get("diff").cloned();
             let project_id = args
                 .get("project_id")
                 .and_then(|v| v.as_str())
@@ -1521,20 +1728,23 @@ async fn call_tool(
         }
         "activate_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
             let ok = engine
-                .task_activate(seat_id, task_id)
+                .task_activate_for(seat_id, target, task_id)
                 .await
                 .map_err(json_err)?;
-            json!({"success": ok, "task_id": task_id, "message": "Task activated"})
+            json!({"success": ok, "task_id": task_id, "target_seat": target, "message": "Task activated"})
         }
         "deactivate_task" => {
             // clear the active task pointer
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
             engine
                 .seats
-                .set_active_task(seat_id, None, None)
+                .set_active_task(target, None, None)
                 .await
                 .map_err(json_err)?;
-            json!({"success": true, "seat_id": seat_id, "message": "Task deactivated"})
+            json!({"success": true, "seat_id": target, "message": "Task deactivated"})
         }
         "get_active_task" => match engine.task_get_active(seat_id).await.map_err(json_err)? {
             Some(t) => {
@@ -1547,26 +1757,28 @@ async fn call_tool(
                 .get("document_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
             let ok = engine
-                .document_activate(seat_id, document_id)
+                .document_activate_for(seat_id, target, document_id)
                 .await
                 .map_err(json_err)?;
             if ok {
                 // Hook: notify subscribers (SSE) so automation can react.
                 let _ = events.send(json!({
-                    "type": "document_activated", "seat_id": seat_id, "document_id": document_id,
+                    "type": "document_activated", "seat_id": target, "document_id": document_id,
                 }));
-                json!({"success": true, "document_id": document_id, "message": "Document activated (context anchor)"})
+                json!({"success": true, "document_id": document_id, "target_seat": target, "message": "Document activated (context anchor)"})
             } else {
                 json!({"success": false, "error": format!("document not found: {document_id}")})
             }
         }
         "deactivate_document" => {
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
             engine
-                .document_deactivate(seat_id)
+                .document_deactivate_for(seat_id, target)
                 .await
                 .map_err(json_err)?;
-            json!({"success": true, "message": "Active document cleared"})
+            json!({"success": true, "target_seat": target, "message": "Active document cleared"})
         }
         "get_active_document" => {
             match engine
@@ -1619,11 +1831,9 @@ async fn call_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
-            let description = args.get("description").and_then(|v| v.as_str());
-            let description_patch = args.get("description_patch").cloned();
-            if description.is_some() && description_patch.is_some() {
-                return Err(json!({"code": -32602, "message": "pass either description (полная замена) or description_patch (дифф), не оба"}));
-            }
+            // Тело — только через diff (полная пересылка запрещена).
+            let description = None;
+            let description_patch = args.get("diff").cloned();
             let auto_load = args.get("auto_load").map(|_| str_array(args, "auto_load"));
             let status = args.get("status").and_then(|v| v.as_str());
             let metadata = args.get("metadata").cloned();
@@ -1784,6 +1994,241 @@ async fn call_tool(
             } else {
                 json!({"success": true, "module": module, "loaded_count": 0, "skipped_count": 0, "loaded_documents": []})
             }
+        }
+        "project_set_status" => {
+            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            match engine
+                .project_set_status_for(seat_id, target, project_id, status)
+                .await
+                .map_err(json_err)?
+            {
+                Some(p) => json!({"success": true, "project_id": p.project_id, "status": p.status, "target_seat": target, "message": format!("Project status set to {}", p.status)}),
+                None => json!({"success": false, "error": format!("project not found: {project_id}")}),
+            }
+        }
+        "focus_set_archived" => {
+            let focus_id = args.get("focus_id").and_then(|v| v.as_str()).unwrap_or("");
+            let archived = args.get("archived").and_then(|v| v.as_bool()).unwrap_or(false);
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let ok = engine
+                .focus_set_archived_for(seat_id, target, focus_id, archived)
+                .await
+                .map_err(json_err)?;
+            json!({"success": ok, "focus_id": focus_id, "archived": archived, "target_seat": target, "message": if ok { "Focus updated" } else { "Focus not found" }})
+        }
+        "seat_roles" => {
+            let q = args.get("seat_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let roles: Vec<&str> = engine
+                .seat_roles(q)
+                .iter()
+                .map(|r| r.as_str())
+                .collect();
+            json!({"success": true, "seat_id": q, "roles": roles, "can_manage_seats": engine.can_manage_seats(q)})
+        }
+        "rename_document" => {
+            let document_id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let new_id = args.get("new_document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let report = engine
+                .rename_document(seat_id, document_id, new_id, None)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "old_id": report.old_id, "new_id": report.new_id,
+                   "links_fixed": report.links_fixed, "content_links_fixed": report.content_links_fixed,
+                   "seats_updated": report.seats_updated,
+                   "message": format!("Renamed {} → {}", report.old_id, report.new_id)})
+        }
+        "rename_task" => {
+            let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let new_name = args.get("new_name").and_then(|v| v.as_str()).unwrap_or("");
+            let report = engine
+                .rename_task(seat_id, task_id, new_name)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "old_id": report.old_id, "new_id": report.new_id,
+                   "name": new_name, "links_fixed": report.links_fixed,
+                   "seats_updated": report.seats_updated,
+                   "message": format!("Task renamed: {} → {}", report.old_id, report.new_id)})
+        }
+        "rename_project" => {
+            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let new_name = args.get("new_name").and_then(|v| v.as_str()).unwrap_or("");
+            let report = engine
+                .rename_project(seat_id, project_id, new_name)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "old_id": report.old_id, "new_id": report.new_id,
+                   "name": new_name, "links_fixed": report.links_fixed,
+                   "seats_updated": report.seats_updated,
+                   "message": format!("Project renamed: {} → {}", report.old_id, report.new_id)})
+        }
+        "list_documents" => {
+            let category = args
+                .get("category")
+                .and_then(|v| v.as_str())
+                .and_then(DocumentCategory::parse);
+            let folder = args.get("folder").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            let query = args.get("query").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).min(500) as usize;
+            let filter = DocFilter {
+                category,
+                visible_to: Some(seat_id.into()),
+                ..Default::default()
+            };
+            let docs = engine
+                .store()
+                .kb_find(&filter, &DocSort::by_updated(SortDir::Desc), limit)
+                .await
+                .map_err(json_err)?;
+            let out: Vec<Value> = docs
+                .iter()
+                .filter(|d| folder.map_or(true, |f| d.folder.as_deref() == Some(f)))
+                .filter(|d| {
+                    query.map_or(true, |q| {
+                        let q = q.to_lowercase();
+                        d.document_id.to_lowercase().contains(&q)
+                            || d.content.to_lowercase().contains(&q)
+                    })
+                })
+                .map(|d| {
+                    json!({
+                        "document_id": d.document_id,
+                        "category": d.category.as_str(),
+                        "folder": d.folder,
+                        "tags": d.tags,
+                        "seat_id": d.seat_id,
+                        "created_at": d.created_at.to_rfc3339(),
+                        "updated_at": d.updated_at.to_rfc3339(),
+                        "content_preview": d.content.chars().take(200).collect::<String>(),
+                    })
+                })
+                .collect();
+            json!({"success": true, "documents": out, "count": out.len()})
+        }
+        "update_document" => {
+            let id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(mut doc) = engine.get_document(id).await.map_err(json_err)? else {
+                return Err(json!({"code": -32602, "message": format!("document not found: {id}")}));
+            };
+            // Тело — только через diff (полная пересылка запрещена).
+            if let Some(patch) = args.get("diff").cloned() {
+                doc.content = slc_core::tasks::apply_description_patch(&doc.content, &patch)
+                    .map_err(|e| json!({"code": -32602, "message": e}))?;
+                doc.content_hash = slc_core::content_hash(&doc.content);
+            }
+            if let Some(t) = args.get("tags").and_then(|v| v.as_array()) {
+                doc.tags = t.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+            }
+            if let Some(al) = args.get("auto_load").and_then(|v| v.as_array()) {
+                doc.auto_load = al.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+            }
+            if let Some(r) = args.get("references").and_then(|v| v.as_array()) {
+                doc.references = r.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+            }
+            if let Some(m) = args.get("metadata").and_then(|v| v.as_object()) {
+                for (k, v) in m {
+                    doc.metadata.extra.insert(k.clone(), v.clone());
+                }
+            }
+            if let Some(s) = args.get("seat_id").and_then(|v| v.as_str()) {
+                doc.seat_id = if s.is_empty() { None } else { Some(s.into()) };
+            }
+            doc.updated_at = chrono::Utc::now();
+            doc.version += 1;
+            engine.store().kb_replace(&doc).await.map_err(json_err)?;
+            let _ = engine.reembed_document(id).await;
+            json!({"success": true, "document_id": id})
+        }
+        "delete_document" => {
+            let id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let purge = args.get("purge").and_then(|v| v.as_bool()).unwrap_or(false);
+            let ok = if purge {
+                engine.store().kb_purge(id).await.map_err(json_err)?
+            } else {
+                engine.store().kb_soft_delete(id).await.map_err(json_err)?
+            };
+            json!({"success": ok, "document_id": id, "purged": purge})
+        }
+        "document_stats" => {
+            let mut by_cat = serde_json::Map::new();
+            for cat in [
+                DocumentCategory::Core,
+                DocumentCategory::Module,
+                DocumentCategory::Task,
+                DocumentCategory::Project,
+                DocumentCategory::CodeSnippet,
+                DocumentCategory::Documentation,
+                DocumentCategory::Skill,
+                DocumentCategory::Custom,
+                DocumentCategory::System,
+            ] {
+                let n = engine
+                    .store()
+                    .kb_count(&DocFilter {
+                        category: Some(cat),
+                        visible_to: Some(seat_id.into()),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(json_err)?;
+                by_cat.insert(cat.as_str().into(), json!(n));
+            }
+            let total = engine
+                .store()
+                .kb_count(&DocFilter {
+                    visible_to: Some(seat_id.into()),
+                    ..Default::default()
+                })
+                .await
+                .map_err(json_err)?;
+            let episodic = engine
+                .store()
+                .episodic_count(&DocFilter::default())
+                .await
+                .map_err(json_err)?;
+            let seats = engine.seats.list_active(1000).await.map_err(json_err)?.len();
+            json!({
+                "total": total,
+                "by_category": by_cat,
+                "episodic": episodic,
+                "seats": seats,
+                "tasks": by_cat.get("task").cloned().unwrap_or(json!(0)),
+                "projects": by_cat.get("project").cloned().unwrap_or(json!(0)),
+            })
+        }
+        "list_seats" => {
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+            let seats = engine.seats.list_active(limit).await.map_err(json_err)?;
+            json!({
+                "seats": seats.iter().map(|s| json!({
+                    "seat_id": s.seat_id,
+                    "name": s.name,
+                    "status": s.status.as_str(),
+                    "created_at": s.created_at.to_rfc3339(),
+                    "last_accessed": s.last_accessed.to_rfc3339(),
+                    "usage_stats": s.usage_stats,
+                    "active_document_id": s.active_document_id,
+                })).collect::<Vec<_>>(),
+                "count": seats.len(),
+            })
+        }
+        "notification_list" => {
+            let status = args.get("status").and_then(|v| v.as_str());
+            let notes = engine
+                .list_notifications(seat_id, status)
+                .await
+                .map_err(json_err)?;
+            json!({
+                "notifications": notes.iter().map(|n| json!({
+                    "notification_id": n.notification_id,
+                    "source": n.source,
+                    "title": n.title,
+                    "body": n.body,
+                    "status": n.status,
+                    "created_at": n.created_at.to_rfc3339(),
+                })).collect::<Vec<_>>(),
+            })
         }
         _ => return Err(json!({"code": -32601, "message": format!("unknown tool: {name}")})),
     };
