@@ -3,6 +3,8 @@ target/
 .git
 .gitignore
 data/
+secrets/
+vault/
 docs/
 hooks/
 tests/

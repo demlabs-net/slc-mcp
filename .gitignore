@@ -3,3 +3,6 @@ target/
 Cargo.lock
 .zcode
 slc-mcp.legacy
+secrets/
+vault/
+docker-compose.*.yml

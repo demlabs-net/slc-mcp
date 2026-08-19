@@ -519,9 +519,10 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "focus_list",
-            "description": "List active focus items for the seat",
+            "description": "List active focus items for the seat. An operator may select an explicitly allowed subordinate with target_seat.",
             "inputSchema": {"type":"object","properties":{
-                "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]}
+                "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]},
+                "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
             },"required":[]}
         }),
         json!({
@@ -628,8 +629,10 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_active_task",
-            "description": "Get the currently active task",
-            "inputSchema": {"type":"object","properties":{},"required":[]}
+            "description": "Get the currently active task. An operator may inspect an explicitly allowed subordinate with target_seat.",
+            "inputSchema": {"type":"object","properties":{
+                "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
+            },"required":[]}
         }),
         json!({
             "name": "activate_document",
@@ -648,16 +651,19 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_active_document",
-            "description": "Get the currently active document (any category)",
-            "inputSchema": {"type":"object","properties":{},"required":[]}
+            "description": "Get the currently active document (any category). An operator may inspect an explicitly allowed subordinate with target_seat.",
+            "inputSchema": {"type":"object","properties":{
+                "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
+            },"required":[]}
         }),
         json!({
             "name": "list_tasks",
-            "description": "List your tasks with optional filters",
+            "description": "List tasks with optional filters. An operator may inspect an explicitly allowed subordinate with target_seat.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
                 "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","CANCELLED"]},
-                "limit": {"type":"number","default":50}
+                "limit": {"type":"number","default":50},
+                "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
             },"required":[]}
         }),
         // projects
@@ -703,10 +709,11 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "list_projects",
-            "description": "List all projects",
+            "description": "List projects visible to the seat. An operator may inspect an explicitly allowed subordinate with target_seat.",
             "inputSchema": {"type":"object","properties":{
                 "status": {"type":"string","enum":["active","archived"]},
-                "limit": {"type":"number","default":50}
+                "limit": {"type":"number","default":50},
+                "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
             },"required":[]}
         }),
         // profiles
@@ -756,7 +763,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "seat_roles",
-            "description": "Роли сида (operator = управление контекстом других сидов). Без seat_id — роли текущего сида.",
+            "description": "Seat roles and explicitly allowed management targets. operator grants no cross-seat access without SLC_SEAT_MANAGE_ACL.",
             "inputSchema": {"type":"object","properties":{
                 "seat_id": {"type":"string"}
             },"required":[]}
@@ -878,6 +885,17 @@ fn tools() -> Vec<Value> {
                 "next_steps": {"type":"array","items":{"type":"string"}},
                 "include_base_docs": {"type":"boolean","default":true}
             },"required":[]}
+        }),
+        json!({
+            "name": "save_context",
+            "description": "Persist the completed iteration as episodic history, then return the refreshed context. Use once at the end of every agent iteration, including cron, subagent and runner iterations.",
+            "inputSchema": {"type":"object","properties":{
+                "summary": {"type":"string"},
+                "changes": {"type":"array","items":{"type":"string"}},
+                "decisions": {"type":"array","items":{"type":"string"}},
+                "next_steps": {"type":"array","items":{"type":"string"}},
+                "include_base_docs": {"type":"boolean","default":true}
+            },"required":["summary"]}
         }),
         json!({
             "name": "load_module",
@@ -1028,8 +1046,10 @@ pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инс�
 управлять рабочим контекстом других сидов: `activate_task` /
 `activate_document` / `deactivate_document` / `deactivate_task` с параметром
 `target_seat`, а также `project_set_status` и `focus_set_archived` для чужого
-сида. Свои сущности активируются как обычно (target_seat не нужен).
-`seat_roles` показывает роли сида.
+сида. Cross-seat цель обязательно должна быть разрешена в
+`SLC_SEAT_MANAGE_ACL`; роль без ACL не даёт глобальных прав. Свои сущности
+активируются как обычно (target_seat не нужен). `seat_roles` показывает роль
+и разрешённые цели.
 "#;
 
 async fn build_context(
@@ -1556,18 +1576,27 @@ async fn call_tool(
             json!({"focus_id": item.focus_id, "priority": item.priority})
         }
         "focus_list" => {
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
+            engine
+                .require_seat_manage(seat_id, target)
+                .await
+                .map_err(json_err)?;
             let mind_type = args
                 .get("mind_type")
                 .and_then(|v| v.as_str())
                 .and_then(parse_mind);
             let items = engine
-                .focus_list(seat_id, mind_type)
+                .focus_list(target, mind_type)
                 .await
                 .map_err(json_err)?;
             json!({"focuses": items.iter().map(|f| json!({
                 "focus_id": f.focus_id, "title": f.title, "description": f.description,
                 "priority": f.priority, "depends_on": f.depends_on,
-            })).collect::<Vec<_>>()})
+            })).collect::<Vec<_>>(), "target_seat": target})
         }
         "focus_update" => {
             let focus_id = args.get("focus_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -1746,12 +1775,16 @@ async fn call_tool(
                 .map_err(json_err)?;
             json!({"success": true, "seat_id": target, "message": "Task deactivated"})
         }
-        "get_active_task" => match engine.task_get_active(seat_id).await.map_err(json_err)? {
-            Some(t) => {
-                json!({"success": true, "has_active_task": true, "task_id": t.task_id, "name": t.name, "description": t.description, "status": t.status, "project_id": t.project_id})
+        "get_active_task" => {
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
+            match engine.task_get_active(target).await.map_err(json_err)? {
+                Some(t) => {
+                    json!({"success": true, "has_active_task": true, "target_seat": target, "task_id": t.task_id, "name": t.name, "description": t.description, "status": t.status, "project_id": t.project_id})
+                }
+                None => json!({"success": true, "has_active_task": false, "target_seat": target, "message": "No active task"}),
             }
-            None => json!({"success": true, "has_active_task": false, "message": "No active task"}),
-        },
+        }
         "activate_document" => {
             let document_id = args
                 .get("document_id")
@@ -1781,20 +1814,24 @@ async fn call_tool(
             json!({"success": true, "target_seat": target, "message": "Active document cleared"})
         }
         "get_active_document" => {
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
             match engine
-                .document_get_active(seat_id)
+                .document_get_active(target)
                 .await
                 .map_err(json_err)?
             {
                 Some(d) => {
-                    json!({"success": true, "has_active_document": true, "document_id": d.document_id, "category": d.category.as_str(), "content": truncate(&d.content, 2000), "tags": d.tags})
+                    json!({"success": true, "has_active_document": true, "target_seat": target, "document_id": d.document_id, "category": d.category.as_str(), "content": truncate(&d.content, 2000), "tags": d.tags})
                 }
                 None => {
-                    json!({"success": true, "has_active_document": false, "message": "No active document"})
+                    json!({"success": true, "has_active_document": false, "target_seat": target, "message": "No active document"})
                 }
             }
         }
         "list_tasks" => {
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
             let project_id = args
                 .get("project_id")
                 .and_then(|v| v.as_str())
@@ -1802,13 +1839,13 @@ async fn call_tool(
             let status = args.get("status").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
             let tasks = engine
-                .task_list(seat_id, project_id, status, limit)
+                .task_list(target, project_id, status, limit)
                 .await
                 .map_err(json_err)?;
             json!({"success": true, "tasks": tasks.iter().map(|t| json!({
                 "task_id": t.task_id, "name": t.name, "status": t.status,
                 "project_id": t.project_id, "auto_load_count": t.auto_load.len(),
-            })).collect::<Vec<_>>(), "count": tasks.len()})
+            })).collect::<Vec<_>>(), "count": tasks.len(), "target_seat": target})
         }
         // projects
         "create_project" => {
@@ -1890,16 +1927,18 @@ async fn call_tool(
             }
         }
         "list_projects" => {
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
             let status = args.get("status").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
             let projects = engine
-                .project_list(seat_id, status, limit)
+                .project_list(target, status, limit)
                 .await
                 .map_err(json_err)?;
             json!({"success": true, "projects": projects.iter().map(|p| json!({
                 "project_id": p.project_id, "name": p.name, "status": p.status,
                 "auto_load_count": p.auto_load.len(),
-            })).collect::<Vec<_>>(), "count": projects.len()})
+            })).collect::<Vec<_>>(), "count": projects.len(), "target_seat": target})
         }
         // profiles
         "get_user_profile" => match engine.get_user_profile(seat_id).await.map_err(json_err)? {
@@ -1980,6 +2019,30 @@ async fn call_tool(
             )
             .await?
         }
+        "save_context" => {
+            let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+            if summary.trim().is_empty() {
+                return Err(json!({"code": -32602, "message": "summary is required"}));
+            }
+            let include_base = args
+                .get("include_base_docs")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let changes = str_array(args, "changes");
+            let decisions = str_array(args, "decisions");
+            let next_steps = str_array(args, "next_steps");
+            build_context(
+                engine,
+                seat_id,
+                summary,
+                &changes,
+                &decisions,
+                &next_steps,
+                include_base,
+                events,
+            )
+            .await?
+        }
         "load_module" => {
             // Requires knowledge:public:write; in embedded/legacy modes every
             // principal is a superuser, so accept. Module seeding is out of
@@ -2025,7 +2088,13 @@ async fn call_tool(
                 .iter()
                 .map(|r| r.as_str())
                 .collect();
-            json!({"success": true, "seat_id": q, "roles": roles, "can_manage_seats": engine.can_manage_seats(q)})
+            json!({
+                "success": true,
+                "seat_id": q,
+                "roles": roles,
+                "can_manage_seats": engine.can_manage_seats(q),
+                "allowed_targets": engine.allowed_manage_targets(q),
+            })
         }
         "rename_document" => {
             let document_id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -2199,7 +2268,14 @@ async fn call_tool(
         }
         "list_seats" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-            let seats = engine.seats.list_active(limit).await.map_err(json_err)?;
+            let seats = engine
+                .seats
+                .list_active(limit)
+                .await
+                .map_err(json_err)?
+                .into_iter()
+                .filter(|seat| engine.can_manage_target(seat_id, &seat.seat_id))
+                .collect::<Vec<_>>();
             json!({
                 "seats": seats.iter().map(|s| json!({
                     "seat_id": s.seat_id,
