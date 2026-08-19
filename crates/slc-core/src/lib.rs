@@ -169,9 +169,9 @@ pub struct SlcConfig {
     pub text_weight: f32,
     pub seat_ttl_seconds: i64,
     /// Total context budget in TOKENS handed to the model per
-    /// `update_context` call. Per-seat override: `/limit N` (tokens) or the
-    /// client's window from `initialize` (tokens). The compression counts
-    /// usage in tokens too (~3 chars per token via CHARS_PER_TOKEN).
+    /// `update_context` call. A connection header or per-seat `/limit N`
+    /// value may override this fallback. The compression counts usage in
+    /// tokens too (~3 chars per token via CHARS_PER_TOKEN).
     pub context_limit_tokens: usize,
     /// MongoDB connection URI (used when `storage = MongoDB`).
     pub mongodb_uri: Option<String>,
@@ -541,9 +541,10 @@ impl SlcEngine {
         }
     }
 
-    /// Effective context budget for a seat (TOKENS): per-seat override
-    /// (`context_limit_tokens` from /limit or initialize) wins over the
-    /// config default. Legacy `context_limit_chars` values are converted.
+    /// Effective context budget for a seat (TOKENS): the per-seat
+    /// `context_limit_tokens` written by `/limit` wins over the config
+    /// default. A connection header is applied by the MCP server above this
+    /// layer. Legacy `context_limit_chars` values are converted.
     pub async fn context_limit_for(&self, seat_id: &str) -> SlcResult<usize> {
         if let Ok(Some(seat)) = self.seats.get_seat(seat_id).await {
             if let Some(v) = seat

@@ -1220,8 +1220,8 @@ async fn build_context(
     let limit_tokens = effective_context_token_limit(context_token_limit, seat_limit);
     let mut docs: Vec<Value> = Vec::new();
     // ЕДИНАЯ единица бюджета — ТОКЕНЫ (~3 симв/токен, RU/EN смесь).
-    // Никаких байтовых ограничений вывода: размер окна определяет клиент
-    // (initialize / /limit), а об обрезке на своей стороне заботится харнес.
+    // Никаких байтовых ограничений вывода: бюджет задаёт клиент заголовком
+    // либо для seat через /limit, а об обрезке транспорта заботится харнес.
     let to_tokens = |chars: usize| chars.div_ceil(slc_core::CHARS_PER_TOKEN).max(1);
     let mut used_tokens = 0usize;
 
@@ -2892,13 +2892,10 @@ mod seat_filter_tests {
         assert_eq!(effective_context_token_limit(None, 100_000), 100_000);
 
         headers.insert("x-slc-pagination", "enabled".parse().unwrap());
-        headers.insert("x-slc-page-token-limit", "1".parse().unwrap());
+        headers.insert("x-slc-page-token-limit", "350000".parse().unwrap());
         let policy = pagination_policy_from_request(&headers);
         assert!(policy.enabled);
-        assert_eq!(
-            policy.page_token_limit,
-            Some(slc_core::pagination::MIN_PAGE_TOKEN_LIMIT)
-        );
+        assert_eq!(policy.page_token_limit, Some(350_000));
     }
 
     #[test]
