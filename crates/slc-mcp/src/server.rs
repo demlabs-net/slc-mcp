@@ -260,12 +260,20 @@ async fn messages(
     headers: axum::http::HeaderMap,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
+    // JSON-RPC notifications never receive a JSON-RPC response.  Streamable
+    // HTTP represents successful notification acceptance as HTTP 202 with an
+    // empty body (MCP 2025-03-26, Transports).  This path is shared with the
+    // legacy SSE transport so standard SDKs do not receive a fabricated
+    // response with `id: null` on their /messages POST.
+    if is_jsonrpc_notification(&req) {
+        return StatusCode::ACCEPTED.into_response();
+    }
     let sid = headers
         .get("sessionId")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let seat = seat_from_request(&headers).unwrap_or_default();
-    let (status, Json(body)) = mcp(State(state.clone()), headers, Json(req)).await;
+    let (status, Json(body)) = mcp_request(State(state.clone()), headers, Json(req)).await;
     // Ответ доставляется ДВУМЯ путями сразу:
     // 1. SSE-событие `message` на потоке /sse — легаси-SSE клиенты (SDK
     //    SSEClientTransport) игнорируют тело POST и ждут ответ там;
@@ -315,6 +323,23 @@ fn bearer_from_request(headers: &axum::http::HeaderMap) -> Option<String> {
 
 #[axum::debug_handler]
 async fn mcp(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<Value>,
+) -> axum::response::Response {
+    // Notifications are intentionally accepted before seat authentication:
+    // initialize/list/ping are likewise connection-level operations, and an
+    // `initialized` notification carries no tool data.  Unknown notifications
+    // are ignored as required by JSON-RPC rather than answered with an error.
+    if is_jsonrpc_notification(&req) {
+        return StatusCode::ACCEPTED.into_response();
+    }
+
+    let response = mcp_request(State(state), headers, Json(req)).await;
+    response.into_response()
+}
+
+async fn mcp_request(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<Value>,
@@ -405,7 +430,10 @@ async fn mcp(
                 "serverInfo": { "name": "slc-mcp", "version": env!("CARGO_PKG_VERSION") },
             }))
         }
-        "ping" => Ok(Value::Null),
+        // MCP ping responses must contain an object result.  Returning JSON
+        // null is legal in generic JSON-RPC, but the MCP SDK models `result`
+        // as an object and rejects null before the keepalive can complete.
+        "ping" => Ok(ping_result()),
         "tools/list" => Ok(json!({ "tools": tools() })),
         "prompts/list" => Ok(json!({ "prompts": prompts() })),
         "prompts/get" => {
@@ -413,7 +441,7 @@ async fn mcp(
             match name {
                 "instructions" => Ok(json!({
                     "name": "instructions",
-                    "description": "Полная рабочая инструкция агента: рабочий процесс, auto_load vs references, рефлексия через истории",
+                    "description": "Complete agent working contract: lifecycle, document maintenance, auto_load versus references, and reflection over history",
                     "arguments": [],
                     "messages": [ { "role": "user", "content": { "type": "text", "text": INSTRUCTIONS_PROMPT } } ],
                 })),
@@ -447,6 +475,14 @@ async fn mcp(
             Json(json!({"jsonrpc":"2.0","id":id,"error":error})),
         ),
     }
+}
+
+fn is_jsonrpc_notification(req: &Value) -> bool {
+    req.get("id").is_none()
+        && req
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some()
 }
 
 fn tools() -> Vec<Value> {
@@ -590,15 +626,15 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_task",
-            "description": "Update an existing task. Канон: тело редактируется через diff (append/prepend/replace_section/remove_section по markdown-заголовкам).",
+            "description": "Update an existing task. Edit its body only through ordered diff operations: append, prepend, replace_section, or remove_section by markdown heading.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "name": {"type":"string"},
                 "diff": {"type":"array","items":{"type":"object","properties":{
                     "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
                     "content": {"type":"string"},
-                    "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
-                },"required":["op"]},"description":"ЕДИНСТВЕННЫЙ способ редактирования тела — дифф-операции, применяются по порядку; полная пересылка тела запрещена"},
+                    "heading": {"type":"string","description":"markdown section heading for *_section operations"}
+                },"required":["op"]},"description":"The only supported body-edit mechanism. Operations run in order; resending the full body is forbidden."},
                 "project_id": {"type":"string"},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","CANCELLED"]},
@@ -614,17 +650,17 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "activate_task",
-            "description": "Activate a task (included in update_context). target_seat (только для сидов с ролью operator): поставить активную задачу другому сиду.",
+            "description": "Activate a task so update_context includes it. An operator may set another explicitly authorized seat through target_seat.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
-                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+                "target_seat": {"type":"string","description":"target seat; defaults to the caller and requires operator authority for another seat"}
             },"required":["task_id"]}
         }),
         json!({
             "name": "deactivate_task",
-            "description": "Deactivate the current active task. target_seat (только для сидов с ролью operator): снять активную задачу другого сида.",
+            "description": "Deactivate the current task. An operator may clear another explicitly authorized seat through target_seat.",
             "inputSchema": {"type":"object","properties":{
-                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+                "target_seat": {"type":"string","description":"target seat; defaults to the caller and requires operator authority for another seat"}
             },"required":[]}
         }),
         json!({
@@ -636,17 +672,17 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "activate_document",
-            "description": "Activate ANY document (task, project, skill, knowledge doc…) as the seat's context anchor — it is included in update_context and its auto_load links are followed on updates. The effect is identical to activate_task, but for every category. target_seat (только для сидов с ролью operator): активировать документ другому сиду.",
+            "description": "Activate any task, project, skill, or knowledge document as the seat's context anchor. update_context includes it and follows its auto_load links. An operator may target another explicitly authorized seat.",
             "inputSchema": {"type":"object","properties":{
                 "document_id": {"type":"string"},
-                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+                "target_seat": {"type":"string","description":"target seat; defaults to the caller and requires operator authority for another seat"}
             },"required":["document_id"]}
         }),
         json!({
             "name": "deactivate_document",
-            "description": "Clear the seat's active document (any category). target_seat (только для сидов с ролью operator): снять активный документ другого сида.",
+            "description": "Clear the seat's active document in any category. An operator may target another explicitly authorized seat.",
             "inputSchema": {"type":"object","properties":{
-                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+                "target_seat": {"type":"string","description":"target seat; defaults to the caller and requires operator authority for another seat"}
             },"required":[]}
         }),
         json!({
@@ -679,15 +715,15 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_project",
-            "description": "Update an existing project. Канон: тело редактируется через diff (append/prepend/replace_section/remove_section по markdown-заголовкам).",
+            "description": "Update an existing project. Edit its body only through ordered diff operations: append, prepend, replace_section, or remove_section by markdown heading.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
                 "name": {"type":"string"},
                 "diff": {"type":"array","items":{"type":"object","properties":{
                     "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
                     "content": {"type":"string"},
-                    "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
-                },"required":["op"]},"description":"ЕДИНСТВЕННЫЙ способ редактирования тела — дифф-операции, применяются по порядку; полная пересылка тела запрещена"},
+                    "heading": {"type":"string","description":"markdown section heading for *_section operations"}
+                },"required":["op"]},"description":"The only supported body-edit mechanism. Operations run in order; resending the full body is forbidden."},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "status": {"type":"string","enum":["active","archived"]},
                 "metadata": {"type":"object"}
@@ -745,20 +781,20 @@ fn tools() -> Vec<Value> {
         // UI-ориентированные read/write-тулы
         json!({
             "name": "project_set_status",
-            "description": "Archive/unarchive a project (active|archived). target_seat (только для сидов с ролью operator): сменить статус проекта другого сида.",
+            "description": "Archive or unarchive a project (active|archived). An operator may change another explicitly authorized seat through target_seat.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
                 "status": {"type":"string","enum":["active","archived"]},
-                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+                "target_seat": {"type":"string","description":"target seat; defaults to the caller and requires operator authority for another seat"}
             },"required":["project_id","status"]}
         }),
         json!({
             "name": "focus_set_archived",
-            "description": "Archive/unarchive a focus item. target_seat (только для сидов с ролью operator): архивировать фокус другого сида.",
+            "description": "Archive or unarchive a focus item. An operator may change another explicitly authorized seat through target_seat.",
             "inputSchema": {"type":"object","properties":{
                 "focus_id": {"type":"string"},
                 "archived": {"type":"boolean"},
-                "target_seat": {"type":"string","description":"целевой сид (по умолчанию — свой); требует роль operator"}
+                "target_seat": {"type":"string","description":"target seat; defaults to the caller and requires operator authority for another seat"}
             },"required":["focus_id","archived"]}
         }),
         json!({
@@ -770,15 +806,15 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "rename_document",
-            "description": "Переименовать документ (сменить document_id/имя файла) — работает для документов, задач и проектов. Каскадно чинит: auto_load/references всех документов, проектные связи задач, вики-ссылки [[old]] в контенте, активные указатели сидов. Только свои (видимые) документы.",
+            "description": "Rename a visible document, task, or project by changing its document_id/file name. Cascades auto_load, references, task-project links, wiki links, and active seat pointers.",
             "inputSchema": {"type":"object","properties":{
                 "document_id": {"type":"string"},
-                "new_document_id": {"type":"string","description":"новый уникальный id (slug)"}
+                "new_document_id": {"type":"string","description":"new unique document slug"}
             },"required":["document_id","new_document_id"]}
         }),
         json!({
             "name": "rename_task",
-            "description": "Переименовать задачу: новый id = slug от new_name, name обновляется; auto_load/references/проектные связи/указатели сидов чинятся каскадно.",
+            "description": "Rename a task. Generates its new ID from new_name and cascades auto_load, references, project links, and active seat pointers.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "new_name": {"type":"string"}
@@ -786,7 +822,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "rename_project",
-            "description": "Переименовать проект: новый id = slug от new_name, name обновляется; задачи проекта и ссылки чинятся каскадно.",
+            "description": "Rename a project. Generates its new ID from new_name and cascades project task paths and links.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
                 "new_name": {"type":"string"}
@@ -804,14 +840,14 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_document",
-            "description": "Update an existing document. Канон: тело редактируется через diff (append/prepend/replace_section/remove_section по markdown-заголовкам); остальные поля — patch.",
+            "description": "Update an existing document. Edit its body only through ordered diff operations; update other fields through patch.",
             "inputSchema": {"type":"object","properties":{
                 "document_id": {"type":"string"},
                 "diff": {"type":"array","items":{"type":"object","properties":{
                     "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
                     "content": {"type":"string"},
-                    "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
-                },"required":["op"]},"description":"ЕДИНСТВЕННЫЙ способ редактирования тела — дифф-операции, применяются по порядку; полная пересылка тела запрещена"},
+                    "heading": {"type":"string","description":"markdown section heading for *_section operations"}
+                },"required":["op"]},"description":"The only supported body-edit mechanism. Operations run in order; resending the full body is forbidden."},
                 "tags": {"type":"array","items":{"type":"string"}},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "references": {"type":"array","items":{"type":"string"}},
@@ -826,6 +862,46 @@ fn tools() -> Vec<Value> {
                 "document_id": {"type":"string"},
                 "purge": {"type":"boolean","default":false}
             },"required":["document_id"]}
+        }),
+        // Generic, seat-scoped text state. This remains ordinary MCP tooling
+        // rather than a Hermes-specific endpoint, so every conforming MCP
+        // client can use SLC as an external state engine.
+        json!({
+            "name": "state_get",
+            "description": "Read one seat-scoped external-state text object by namespace and key",
+            "inputSchema": {"type":"object","properties":{
+                "namespace": {"type":"string","minLength":1,"maxLength":64},
+                "key": {"type":"string","minLength":1,"maxLength":512}
+            },"required":["namespace","key"]}
+        }),
+        json!({
+            "name": "state_put",
+            "description": "Create or replace one seat-scoped external-state text object; expected_etag enables optimistic concurrency",
+            "inputSchema": {"type":"object","properties":{
+                "namespace": {"type":"string","minLength":1,"maxLength":64},
+                "key": {"type":"string","minLength":1,"maxLength":512},
+                "content": {"type":"string","maxLength":5242880},
+                "content_type": {"type":"string","default":"text/plain; charset=utf-8"},
+                "expected_etag": {"type":"string","description":"etag returned by state_get; empty requires creation"}
+            },"required":["namespace","key","content"]}
+        }),
+        json!({
+            "name": "state_list",
+            "description": "List seat-scoped external-state objects in a namespace without returning contents",
+            "inputSchema": {"type":"object","properties":{
+                "namespace": {"type":"string","minLength":1,"maxLength":64},
+                "prefix": {"type":"string","maxLength":512,"default":""},
+                "limit": {"type":"integer","minimum":1,"maximum":1000,"default":1000}
+            },"required":["namespace"]}
+        }),
+        json!({
+            "name": "state_delete",
+            "description": "Permanently delete one seat-scoped external-state object",
+            "inputSchema": {"type":"object","properties":{
+                "namespace": {"type":"string","minLength":1,"maxLength":64},
+                "key": {"type":"string","minLength":1,"maxLength":512},
+                "expected_etag": {"type":"string","description":"optional optimistic-concurrency etag"}
+            },"required":["namespace","key"]}
         }),
         json!({
             "name": "document_stats",
@@ -906,9 +982,9 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "command",
-            "description": "Slash-команды для управления памятью: `/limit N` — лимит контекста, `/ctx` — текущий срез, `/update_context [summary]` / `/save_context <summary>` — как MCP-тулы, `/help` — список. Вызывай, когда пользователь пишет сообщение, начинающееся с '/'.",
+            "description": "Handle SLC slash commands: /limit N, /ctx, /search, /update_context [summary], /save_context <summary>, and /help. Call when user input begins with '/'.",
             "inputSchema": {"type":"object","properties":{
-                "input": {"type":"string","description":"строка, начинающаяся с /"}
+                "input": {"type":"string","description":"command string beginning with /"}
             },"required":["input"]}
         }),
     ]
@@ -918,7 +994,7 @@ fn prompts() -> Vec<Value> {
     vec![
         json!({
             "name": "instructions",
-            "description": "Полная рабочая инструкция агента: рабочий процесс, auto_load vs references, рефлексия через истории",
+            "description": "Complete agent working contract: lifecycle, document maintenance, auto_load versus references, and reflection over history",
         }),
         json!({
             "name": "check_notifications",
@@ -931,132 +1007,107 @@ fn prompts() -> Vec<Value> {
 /// to use the full memory surface: search/activate documents, create and
 /// enrich tasks/projects/skills, distinguish auto_load from references, and
 /// run reflection as work over SLC histories (NOT a separate mode).
-pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инструкция агента
+pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — Agent Working Contract
 
-Ты работаешь с системой памяти SLC (Smart Layered Context): единая база
-документов (проекты, задачи, скилы, знания), эпизодическая история с
-прогрессивной суммаризацией, фокусы, напоминания.
+SLC (Smart Layered Context) is the durable memory system for documents,
+projects, tasks, reusable skills, knowledge, progressively summarized history,
+focus items, and reminders.
 
-## Рабочий процесс (обязателен)
+## Mandatory workflow
 
-1. **Ищи перед тем, как отвечать.** На любой вопрос сначала `search` по
-   базе знаний; если есть активный документ — начни с него (`get_document`
-   по `get_active_document`). Не отвечай по памяти — SLC помнит за тебя.
-2. **Активируй контекст.** Когда работа идёт над проектом/задачей/скилом —
-   `activate_document` — документ станет контекст-якорем сита и будет
-   включён в `update_context`. Активируй один главный документ, не
-   несколько.
-3. **Веди работу документами.** Новая деятельность → `create_task` (или
-   `add_document` с category=task) и/или проект (`create_project`). Скилы —
-   это тоже документы (category=skill): инструкции «как делать X».
+1. **Search before answering.** Search the knowledge base first. If a document
+   is active, resolve it with `get_active_document` and load the full document
+   with `get_document`; do not rely on a search snippet or model memory.
+2. **Activate one context anchor.** When work concerns a project, task, skill,
+   or knowledge document, call `activate_document`. That document and its
+   `auto_load` links become the main context returned by `update_context`.
+3. **Represent ongoing work as documents.** Use `create_project`, `create_task`,
+   or `add_document` for new work. A skill is a document with `category=skill`.
+   Generated IDs are slugs without redundant `task_` or `project_` prefixes.
+   Canonical task statuses are `PENDING`, `IN_WORK`, `COMPLETED`, and
+   `CANCELLED`. Supply `project_id` when a task belongs to a project.
+4. **Update durable state while work evolves.** Use `update_task`,
+   `update_project`, or `update_document`; edit markdown bodies only through
+   their `diff` operations (`append`, `prepend`, `replace_section`, or
+   `remove_section`). Do not resend or overwrite an entire existing body.
+   History is raw evidence; maintained documents are the working artifact.
+5. **Keep link semantics precise.** `auto_load` contains working dependencies
+   that must load with the anchor. `references` contains passive citations that
+   are not needed in every context refresh. Do not put the same link in both.
+6. **Refresh and save context.** `update_context` returns base documents, the
+   active anchor, profiles, and focus items. Call `save_context` with a concise,
+   verified summary at meaningful checkpoints and before ending work. Never
+   store credentials, private keys, cookies, or client secrets.
 
-   **Создание задач/проектов (как это устроено):**
-   - id генерируется сам: транслит названия, БЕЗ категорийных префиксов
-     (`task_…`/`project_…` не добавляются) — папка уже несёт категорию;
-   - статусы — канонический набор: `PENDING` (новая), `IN_WORK`,
-     `COMPLETED`, `CANCELLED` (не lowercase);
-   - `project_id` при создании задачи привязывает её к проекту — документ
-     ложится в `docs/projects/<проект>/tasks/` (папка вычисляется из
-     `metadata.project`);
-   - `name` — короткое имя, `description` — markdown-тело задачи;
-   - `auto_load` — рабочие связи (см. п. 5), не дублируй в references.
-4. **Обогащай по ходу.** После значимых шагов обновляй документы
-   (`add_document` с тем же document_id — upsert): статусы, решения,
-   новые факты. История (remember) — это сырьё, а документы — рабочий
-   артефакт. Тела задач/проектов/документов редактируются ТОЛЬКО через
-   `diff` (`update_task`/`update_project`/`update_document`:
-   append / prepend / replace_section / remove_section по
-   markdown-заголовкам) — полное переписывание тела запрещено; для
-   простых правок используй replace_section с точным заголовком секции.
-5. **auto_load vs references (важно, не путай).**
-   - `auto_load` — РАБОЧИЕ связи: документы, которые должны подтягиваться
-     в контекст при обновлении этого документа (состав, зависимости,
-     связанные задачи). Ставь сюда то, что нужно видеть вместе.
-   - `references` — ПАССИВНЫЕ упоминания: документы, на которые этот
-     документ ссылается, но которые не нужны в контексте автоматически.
-   Не дублируй одно и то же в оба списка.
-6. **Контекст.** `update_context` возвращает текущий срез (базовые
-   документы + активный документ + профили + фокусы). Сохраняй снимок
-   (summary) в конце крупного этапа — это попадёт в историю.
+## Reflection is maintenance over history
 
-## Рефлексия (это работа над историями, а не отдельный режим)
+When enough work has accumulated, or reflection is requested:
 
-Периодически, когда накопилась работа (или пользователь просит
-«порефлексируй»), проведи рефлексию через тулы:
+1. Use `recall` for recent seat history and, when useful, `compress` and
+   `consolidate` to extract a compact factual view.
+2. Move verified decisions, facts, agreements, problems, and metrics into the
+   appropriate maintained documents using the update tools and body diffs.
+3. Review documents for stale status, facts, and links; repair missing
+   `auto_load`/`references` relationships and remove duplicates.
+4. Update current priorities with `focus_add`/`focus_update`, and close obsolete
+   items with `focus_remove`.
+5. The result of reflection is improved documents and focus state, not a prose
+   claim that reflection happened. If no changes are warranted, say so briefly.
 
-1. `recall` — возьми свежую историю сита (10–30 событий); при
-   необходимости `compress` (L1→L2) и `consolidate` (извлечение фактов),
-   чтобы увидеть сжатую картину.
-2. **Извлеки данные для документов.** Из историй вытащи: факты о
-   пользователе, решения, договорённости, проблемы, метрики. Обогащай
-   существующие документы (`add_document` с тем же id) или создавай новые
-   (проект/задача/скил/знание), если темы ещё нет.
-3. **Сделай ревью документов:** проверь актуальность (устаревшие статусы,
-   факты, связи), обнови содержимое, добавь недостающие связи
-   (auto_load/references), удали дубли.
-4. **Обнови фокусы:** `focus_add`/`focus_update` — что реально важно
-   сейчас; `focus_remove` — что закрыто.
-5. **Результат рефлексии** — это изменённые/новые документы и фокусы, а
-   не текст «я порефлексировал». Если менять нечего — так и скажи кратко.
+## Context budget and compression
 
-## Лимиты и компрессия контекста
+- `update_context` reports `limit_tokens`, `used_tokens`, `compressed`, and a
+  `warning` when compression occurs. The seat budget is normally 80 percent of
+  the client model window or the explicit `/limit <tokens>` value.
+- Documents are never cut at an arbitrary character boundary. When necessary,
+  whole lower-priority blocks are omitted first, while the active document and
+  focus items remain; remaining documents may then be summarized by the LLM
+  while preserving names, numbers, decisions, and key facts.
+- When `compressed` is true, follow the warning, keep responses economical,
+  save a checkpoint, and retrieve omitted documents explicitly through search
+  or activation if the task needs them.
 
-- `update_context` возвращает `limit_tokens`/`used_tokens`/`compressed` и,
-  при сжатии, `warning`. Бюджет SLC — ТОКЕНЫ: 80% окна модели клиента (авто
-  при подключении) или `/limit <tokens>`.
-- **Документы НИКОГДА не обрезаются.** Если лимит превышен, компрессия:
-  1) исключаются целые блоки по приоритету (base-документы, затем
-     профили; активный документ и фокусы остаются);
-  2) если всё ещё не влезает — оставшиеся документы интеллектуально
-     сжимаются LLM (ключевые факты, имена, цифры).
-- При `compressed: true` реагируй на `warning`: сокращай ответы, сохраняй
-  снимок (`/save_context`), при необходимости верни исключённые документы
-  через поиск/активацию.
+## Agent lifecycle integration
 
-## Хуки для кодинг-агента (автоматизация контекста)
+The surrounding agent may already call `update_context` before a model
+iteration and `save_context` afterward. Use the injected context and do not
+duplicate a successful automatic call. Still update canonical tasks,
+documents, projects, and focus items after meaningful decisions; lifecycle
+snapshots do not replace document maintenance. Child runners, subagents, and
+cron jobs must use the same seat identity and lifecycle.
 
-Работая над кодом/задачами, автоматически:
+The server emits `context_updated` and `document_activated` events over SSE for
+clients that implement event-driven integration.
 
-1. **`update_context`** — после каждого значимого шага (закрыл задачу,
-   изменил план, принял решение): контекст всегда актуален.
-2. **`/save_context <summary>`** — в конце крупного этапа: снимок уходит
-   в историю для рефлексии и консолидации.
-3. **`activate_document`** — при смене темы работы (новая задача/проект/
-   скил) сразу переключай контекст-якорь.
-4. Сервер шлёт по SSE-каналу события `context_updated` и
-   `document_activated` — обёртки агента могут слушать их для триггеров
-   (например, авто-сохранение контекста после больших изменений).
+## Notifications
 
-## Напоминания
+Call `check_notifications` at the start of a work cycle; focus and timer
+notifications may require action.
 
-`check_notifications` в начале каждого хода — там могут быть фокус- или
-таймер-напоминания, требующие действий.
+## Renaming
 
-## Переименование
+`rename_document` changes a document ID and cascades `auto_load`, `references`,
+project links, wiki links, and active seat pointers. Prefer `rename_task` and
+`rename_project` for those entity types because they accept a human-readable
+name and generate the new slug.
 
-`rename_document` меняет document_id (имя файла) любого документа, задачи
-или проекта с каскадным исправлением ссылок (auto_load/references,
-проектные связи, вики-ссылки [[old]], активные указатели сидов).
-`rename_task`/`rename_project` принимают новое человекочитаемое имя и сами
-строят новый id (slug) — предпочитай их для задач и проектов.
+## Seat roles
 
-## Пагинация больших ответов
+## Paginating large responses
 
-Если ответ любого тула содержит `_pagination` (response_id/page/total_pages)
-или текст «ОТВЕТ ОБРЕЗАН БЮДЖЕТОМ КЛИЕНТА» — выхлоп порезан: забери
-остальные страницы по одной через `get_page(response_id=…, page=2..N)`
-и сложи содержимое. Не завершай обработку, пока не получишь все страницы.
+When any tool response contains `_pagination` with
+`response_id`/`page`/`total_pages`, or says that the client budget truncated
+the response, retrieve every remaining page in order through
+`get_page(response_id=..., page=2..N)` and combine the content. Do not finish
+processing the response until all pages have been read.
 
-## Роли сидов
+## Seat roles
 
-Сид с ролью `operator` (настраивается сервером, `SLC_SEAT_ROLES`) может
-управлять рабочим контекстом других сидов: `activate_task` /
-`activate_document` / `deactivate_document` / `deactivate_task` с параметром
-`target_seat`, а также `project_set_status` и `focus_set_archived` для чужого
-сида. Cross-seat цель обязательно должна быть разрешена в
-`SLC_SEAT_MANAGE_ACL`; роль без ACL не даёт глобальных прав. Свои сущности
-активируются как обычно (target_seat не нужен). `seat_roles` показывает роль
-и разрешённые цели.
+A seat with the server-configured `operator` role may manage another seat's
+active task/document, project status, and focus archive state only when the
+target is explicitly allowed by `SLC_SEAT_MANAGE_ACL`. The role alone grants no
+global authority. Omit `target_seat` for the caller's own state, and use
+`seat_roles` to inspect the effective role and allowed targets.
 "#;
 
 async fn build_context(
@@ -1297,16 +1348,16 @@ async fn build_context(
     let warning = if compressed || !llm_compressed.is_empty() {
         let mut parts = Vec::new();
         if !omitted.is_empty() {
-            parts.push(format!("исключены целые блоки: {}", omitted.join(", ")));
+            parts.push(format!("whole blocks omitted: {}", omitted.join(", ")));
         }
         if !llm_compressed.is_empty() {
             parts.push(format!(
-                "документы сжаты LLM: {}",
+                "documents summarized by the LLM: {}",
                 llm_compressed.join(", ")
             ));
         }
         Some(format!(
-            "ВНИМАНИЕ: контекст сжат — {}.                      Используй save_context/обогащение, чтобы вернуть нужное.",
+            "WARNING: context was compressed — {}. Use save_context and explicit document maintenance/search to restore required details.",
             parts.join("; ")
         ))
     } else {
@@ -1389,6 +1440,67 @@ async fn task_list(engine: &SlcEngine, _seat_id: Option<&str>) -> Result<Vec<Val
             v
         })
         .collect())
+}
+
+const STATE_MAX_CONTENT_CHARS: usize = 5 * 1024 * 1024;
+
+fn state_namespace(args: &Value) -> Result<&str, Value> {
+    let namespace = args
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if namespace.is_empty()
+        || namespace.len() > 64
+        || !namespace
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(json!({
+            "code": -32602,
+            "message": "namespace must be 1-64 ASCII letters, digits, '.', '_' or '-'"
+        }));
+    }
+    Ok(namespace)
+}
+
+fn state_key(args: &Value) -> Result<&str, Value> {
+    let key = args.get("key").and_then(Value::as_str).unwrap_or("");
+    if key.is_empty() || key.chars().count() > 512 || key.contains('\0') {
+        return Err(json!({
+            "code": -32602,
+            "message": "key must be 1-512 characters and contain no NUL"
+        }));
+    }
+    Ok(key)
+}
+
+fn state_document_id(seat_id: &str, namespace: &str, key: &str) -> String {
+    let identity = format!("{seat_id}\0{namespace}\0{key}");
+    format!("external_state_{}", slc_core::content_hash(&identity))
+}
+
+fn state_namespace_tag(namespace: &str) -> String {
+    format!("external-state-namespace-{namespace}")
+}
+
+fn state_etag(content: &str) -> String {
+    slc_core::content_hash(content)
+}
+
+fn state_document_matches(doc: &Document, seat_id: &str, namespace: &str, key: &str) -> bool {
+    doc.seat_id.as_deref() == Some(seat_id)
+        && doc
+            .metadata
+            .extra
+            .get("external_state_namespace")
+            .and_then(Value::as_str)
+            == Some(namespace)
+        && doc
+            .metadata
+            .extra
+            .get("external_state_key")
+            .and_then(Value::as_str)
+            == Some(key)
 }
 
 async fn call_tool(
@@ -1482,12 +1594,12 @@ async fn call_tool(
                     })).collect::<Vec<_>>()}))
                 }
                 "help" => Ok(json!({"commands": [
-                    "/limit <chars> — установить лимит контекста (символы)",
-                    "/ctx — показать текущий срез контекста (лимит, активный документ, проекты, задачи, фокусы)",
-                    "/search <query> — поиск по документам БЗ",
-                    "/update_context [summary] — собрать контекст (как MCP-тул)",
-                    "/save_context <summary> — сохранить снимок контекста в историю",
-                    "/help — этот список",
+                    "/limit <tokens> — set the seat context budget in tokens",
+                    "/ctx — show the current context slice and active state",
+                    "/search <query> — search knowledge-base documents",
+                    "/update_context [summary] — build context like the MCP tool",
+                    "/save_context <summary> — save a context snapshot to history",
+                    "/help — show this list",
                 ]})),
                 other => {
                     return Err(
@@ -1766,7 +1878,7 @@ async fn call_tool(
                 .cloned()
                 .or_else(|| args.get("description_patch").cloned());
             if description.is_some() && description_patch.is_some() {
-                return Err(json!({"code": -32602, "message": "pass either description (полная замена) or diff/description_patch (дифф), не оба"}));
+                return Err(json!({"code": -32602, "message": "pass either full-replacement description or diff/description_patch, not both"}));
             }
             let project_id = args
                 .get("project_id")
@@ -1927,7 +2039,7 @@ async fn call_tool(
                 .cloned()
                 .or_else(|| args.get("description_patch").cloned());
             if description.is_some() && description_patch.is_some() {
-                return Err(json!({"code": -32602, "message": "pass either description (полная замена) or diff/description_patch (дифф), не оба"}));
+                return Err(json!({"code": -32602, "message": "pass either full-replacement description or diff/description_patch, not both"}));
             }
             let auto_load = args.get("auto_load").map(|_| str_array(args, "auto_load"));
             let status = args.get("status").and_then(|v| v.as_str());
@@ -2282,6 +2394,192 @@ async fn call_tool(
             };
             json!({"success": ok, "document_id": id, "purged": purge})
         }
+        "state_get" => {
+            let namespace = state_namespace(args)?;
+            let key = state_key(args)?;
+            let id = state_document_id(seat_id, namespace, key);
+            match engine.store().kb_get(&id).await.map_err(json_err)? {
+                Some(doc) if state_document_matches(&doc, seat_id, namespace, key) => json!({
+                    "found": true,
+                    "namespace": namespace,
+                    "key": key,
+                    "content": doc.content,
+                    "content_type": doc.metadata.extra.get("external_state_content_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("text/plain; charset=utf-8"),
+                    "etag": state_etag(&doc.content),
+                    "version": doc.version,
+                    "updated_at": doc.updated_at.to_rfc3339(),
+                }),
+                _ => json!({"found": false, "namespace": namespace, "key": key}),
+            }
+        }
+        "state_put" => {
+            let namespace = state_namespace(args)?;
+            let key = state_key(args)?;
+            let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+            if content.chars().count() > STATE_MAX_CONTENT_CHARS {
+                return Err(json!({
+                    "code": -32602,
+                    "message": format!("content exceeds {STATE_MAX_CONTENT_CHARS} characters")
+                }));
+            }
+            let content_type = args
+                .get("content_type")
+                .and_then(Value::as_str)
+                .unwrap_or("text/plain; charset=utf-8");
+            let expected = args.get("expected_etag").and_then(Value::as_str);
+            let id = state_document_id(seat_id, namespace, key);
+            let existing = engine.store().kb_get(&id).await.map_err(json_err)?;
+            if let Some(ref doc) = existing {
+                if !state_document_matches(doc, seat_id, namespace, key) {
+                    return Err(json!({"code": -32009, "message": "external-state identity collision"}));
+                }
+            }
+            let actual = existing.as_ref().map(|doc| state_etag(&doc.content));
+            if let Some(expected) = expected {
+                let matches = if expected.is_empty() {
+                    actual.is_none()
+                } else {
+                    actual.as_deref() == Some(expected)
+                };
+                if !matches {
+                    return Err(json!({
+                        "code": -32009,
+                        "message": "external-state etag conflict",
+                        "expected_etag": expected,
+                        "actual_etag": actual,
+                    }));
+                }
+            }
+
+            let mut metadata = DocMeta::default();
+            metadata.extra.insert("external_state_namespace".into(), json!(namespace));
+            metadata.extra.insert("external_state_key".into(), json!(key));
+            metadata
+                .extra
+                .insert("external_state_content_type".into(), json!(content_type));
+            let seat_hash = slc_core::content_hash(seat_id);
+            let mut doc = Document::with_folder(
+                &id,
+                if namespace.contains("skill") {
+                    DocumentCategory::Skill
+                } else {
+                    DocumentCategory::Custom
+                },
+                Some(format!("external-state/{}/{}", &seat_hash[..16], namespace)),
+                content,
+                metadata,
+                vec!["external-state".into(), state_namespace_tag(namespace)],
+                Some(seat_id.into()),
+            );
+            if let Some(previous) = existing {
+                doc.created_at = previous.created_at;
+                doc.version = previous.version + 1;
+            }
+            engine.store().kb_replace(&doc).await.map_err(json_err)?;
+            json!({
+                "success": true,
+                "created": actual.is_none(),
+                "namespace": namespace,
+                "key": key,
+                "etag": state_etag(content),
+                "version": doc.version,
+            })
+        }
+        "state_list" => {
+            let namespace = state_namespace(args)?;
+            let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("");
+            if prefix.chars().count() > 512 || prefix.contains('\0') {
+                return Err(json!({"code": -32602, "message": "prefix exceeds 512 characters or contains NUL"}));
+            }
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(1000)
+                .clamp(1, 1000) as usize;
+            let docs = engine
+                .store()
+                .kb_find(
+                    &DocFilter {
+                        seat_id: Some(seat_id.into()),
+                        tags_all: vec!["external-state".into(), state_namespace_tag(namespace)],
+                        ..Default::default()
+                    },
+                    &DocSort::by_updated(SortDir::Desc),
+                    1000,
+                )
+                .await
+                .map_err(json_err)?;
+            let objects = docs
+                .iter()
+                .filter_map(|doc| {
+                    let key = doc
+                        .metadata
+                        .extra
+                        .get("external_state_key")
+                        .and_then(Value::as_str)?;
+                    if !key.starts_with(prefix) {
+                        return None;
+                    }
+                    Some(json!({
+                        "key": key,
+                        "content_type": doc.metadata.extra.get("external_state_content_type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("text/plain; charset=utf-8"),
+                        "etag": state_etag(&doc.content),
+                        "version": doc.version,
+                        "size_chars": doc.content.chars().count(),
+                        "updated_at": doc.updated_at.to_rfc3339(),
+                    }))
+                })
+                .take(limit)
+                .collect::<Vec<_>>();
+            json!({
+                "success": true,
+                "namespace": namespace,
+                "prefix": prefix,
+                "count": objects.len(),
+                "objects": objects,
+            })
+        }
+        "state_delete" => {
+            let namespace = state_namespace(args)?;
+            let key = state_key(args)?;
+            let id = state_document_id(seat_id, namespace, key);
+            let existing = engine.store().kb_get(&id).await.map_err(json_err)?;
+            if let Some(doc) = existing {
+                if !state_document_matches(&doc, seat_id, namespace, key) {
+                    return Err(json!({"code": -32009, "message": "external-state identity collision"}));
+                }
+                if let Some(expected) = args.get("expected_etag").and_then(Value::as_str) {
+                    let actual = state_etag(&doc.content);
+                    if expected != actual {
+                        return Err(json!({
+                            "code": -32009,
+                            "message": "external-state etag conflict",
+                            "expected_etag": expected,
+                            "actual_etag": actual,
+                        }));
+                    }
+                }
+                let deleted = engine.store().kb_purge(&id).await.map_err(json_err)?;
+                let _ = engine.store().delete_embeddings(&id).await;
+                json!({
+                    "success": true,
+                    "deleted": deleted,
+                    "namespace": namespace,
+                    "key": key,
+                })
+            } else {
+                json!({
+                    "success": true,
+                    "deleted": false,
+                    "namespace": namespace,
+                    "key": key,
+                })
+            }
+        }
         "document_stats" => {
             let mut by_cat = serde_json::Map::new();
             for cat in [
@@ -2374,7 +2672,11 @@ async fn call_tool(
     let _ = engine.seats.record_tool_use(seat_id, name, 0).await;
     let mut text = text.to_string();
     // Inject pending notifications into the tool response (UX channel).
-    if name != "pop_notifications" {
+    // Machine-oriented external-state operations must remain parseable JSON.
+    // Human notification prose is useful on interactive knowledge tools, but
+    // appending it would corrupt the generic state backend contract for every
+    // MCP client, not just Hermes.
+    if name != "pop_notifications" && !name.starts_with("state_") {
         if let Ok(notes) = engine.pop_notifications(seat_id, 3).await {
             if !notes.is_empty() {
                 let mut block = String::from("\n\n📬 Notifications:");
@@ -2483,6 +2785,10 @@ fn seat_matches_event(evt: &serde_json::Value, seat: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn ping_result() -> Value {
+    json!({})
+}
+
 #[cfg(test)]
 mod seat_filter_tests {
     use super::*;
@@ -2511,5 +2817,65 @@ mod seat_filter_tests {
             &json!({"type": "x", "seat_id": 42}),
             "cursor-1"
         ));
+    }
+
+    #[test]
+    fn ping_result_is_an_mcp_response_object() {
+        assert_eq!(ping_result(), json!({}));
+        assert!(ping_result().is_object());
+    }
+
+    #[test]
+    fn jsonrpc_notifications_are_distinguished_from_requests_and_responses() {
+        assert!(is_jsonrpc_notification(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        })));
+        assert!(is_jsonrpc_notification(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 7}
+        })));
+        assert!(is_jsonrpc_notification(&json!({
+            "jsonrpc": "2.0",
+            "method": "vendor/custom-notification"
+        })));
+        assert!(!is_jsonrpc_notification(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping"
+        })));
+        assert!(!is_jsonrpc_notification(&json!({
+            "jsonrpc": "2.0",
+            "id": "sampling-1",
+            "result": {"content": []}
+        })));
+    }
+
+    #[test]
+    fn external_state_identity_is_seat_and_namespace_scoped() {
+        let first = state_document_id("seat-a", "hermes-memory", "MEMORY.md");
+        assert_eq!(
+            first,
+            state_document_id("seat-a", "hermes-memory", "MEMORY.md")
+        );
+        assert_ne!(
+            first,
+            state_document_id("seat-b", "hermes-memory", "MEMORY.md")
+        );
+        assert_ne!(
+            first,
+            state_document_id("seat-a", "hermes-skills", "MEMORY.md")
+        );
+    }
+
+    #[test]
+    fn external_state_namespace_validation_is_strict() {
+        assert_eq!(
+            state_namespace(&json!({"namespace": "hermes-skills.v1"})).unwrap(),
+            "hermes-skills.v1"
+        );
+        assert!(state_namespace(&json!({"namespace": "../escape"})).is_err());
+        assert!(state_namespace(&json!({"namespace": ""})).is_err());
     }
 }

@@ -21,6 +21,19 @@ Set `SLC_VAULT_PATH` to the Obsidian vault. Inference is configured with
 `SLC_LLM` and the matching provider variables; the development swarm uses the
 OpenAI-compatible LM Studio endpoint and models from `.env`.
 
+The MCP endpoint is standard Streamable HTTP and currently negotiates MCP
+`2025-03-26`. It returns an object result for legacy `ping` requests and
+accepts JSON-RPC notifications with HTTP 202 and an empty body. No Hermes
+patch is required: compatibility is verified with the official MCP SDK as an
+independent client. Newer protocol revisions that omit `ping` continue to use
+the same initialize/tools flow.
+
+The generic seat-scoped `state_get`, `state_put`, `state_list`, and
+`state_delete` tools expose optimistic-concurrency text objects for external
+memory, skills, or other clients. They are ordinary MCP tools, not a
+Hermes-specific transport. `expected_etag` prevents silent concurrent
+overwrites; SLC also isolates every object by the authenticated `X-Seat-ID`.
+
 ## agent-dev-0 deployment
 
 The development swarm uses:
@@ -55,8 +68,11 @@ be listed explicitly in `SLC_SEAT_MANAGE_ACL`.
 
 Hermes hooks call `update_context` before every model iteration and
 `save_context` afterward. Cron runs and delegated subagents use the same
-hooks. Developer Codex runners receive the SLC URL and seat header from their
-wrapper, which also records runner-start and runner-end lifecycle snapshots.
+hooks. Developer and junior DeepSeek Harness runners receive the SLC URL and
+seat header from their wrapper, which also records runner-start and runner-end
+lifecycle snapshots. Hermes' built-in memory and agent-created skill tree use
+the same seat through the generic external-state tools; the container-local
+writable tree is only a process cache.
 
 ## Mongo migration
 
