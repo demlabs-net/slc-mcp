@@ -279,12 +279,17 @@ mod tests {
         }
     }
 
-    /// Advance the paused clock in small steps, yielding in between. This is
-    /// race-free: even if a spawned task registers its `sleep` *after* some
-    /// steps, a later step still advances past it.
-    async fn advance_in_steps(total_ms: u64) {
-        for _ in 0..20 {
-            tokio::time::advance(StdDuration::from_millis(total_ms / 20)).await;
+    /// Advance the paused clock in small steps until `cond` holds (or the
+    /// budget is exhausted), yielding in between. Unlike a single fixed
+    /// advance, this is race-free against a spawned task that registers its
+    /// `sleep` late (after some steps already passed): a later step still
+    /// advances past its deadline.
+    async fn advance_until(total_ms: u64, cond: impl Fn() -> bool) {
+        for _ in 0..40 {
+            if cond() {
+                return;
+            }
+            tokio::time::advance(StdDuration::from_millis(total_ms / 40)).await;
             yield_a_bit().await;
         }
     }
@@ -310,10 +315,9 @@ mod tests {
         let _ = registry.start().await;
         assert_eq!(registry.spawned_count(), 1);
 
-        // let the spawned task reach its first sleep before advancing
-        yield_a_bit().await;
-        // advance past the first fire (next_fire_at = now + 1s)
-        advance_in_steps(1500).await;
+        // advance until the first fire (next_fire_at = now + 1s); keep
+        // advancing while the spawned task may have registered its sleep late.
+        advance_until(4000, || fired.load(Ordering::Relaxed) >= 1).await;
         assert_eq!(fired.load(Ordering::Relaxed), 1, "first fire");
 
         // periodic → still active and rescheduled
@@ -322,8 +326,8 @@ mod tests {
         assert!(active[0].is_active);
         assert!(active[0].last_fired_at.is_some());
 
-        // advance past the second fire
-        advance_in_steps(1500).await;
+        // advance until the second fire
+        advance_until(4000, || fired.load(Ordering::Relaxed) >= 2).await;
         assert!(fired.load(Ordering::Relaxed) >= 2, "rescheduled fire");
 
         assert!(registry.cancel(&tid).await.unwrap());
@@ -348,8 +352,7 @@ mod tests {
             .await
             .unwrap();
         let _ = registry.start().await;
-        yield_a_bit().await;
-        advance_in_steps(1500).await;
+        advance_until(4000, || fired.load(Ordering::Relaxed) >= 1).await;
         assert_eq!(fired.load(Ordering::Relaxed), 1);
         assert!(registry.list(Some("seat_o")).await.unwrap().is_empty(), "one-shot done → inactive");
     }

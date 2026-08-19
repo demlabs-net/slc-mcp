@@ -735,6 +735,20 @@ impl StorageBackend for ObsidianVaultStore {
         Ok(true)
     }
 
+    async fn kb_replace_many(&self, docs: &[Document]) -> SlcResult<()> {
+        for doc in docs {
+            if !doc.category.is_kb() {
+                return Err(SlcError::Storage(
+                    "history docs go to the episodic store, not the KB".into(),
+                ));
+            }
+            let doc = doc.clone();
+            self.write_note(&doc)?;
+        }
+        self.git_commit().await;
+        Ok(())
+    }
+
     async fn kb_rename(&self, old_id: &str, new_id: &str) -> SlcResult<bool> {
         // Вся работа с guard — в блоке без await (future должен быть Send).
         let renamed = {

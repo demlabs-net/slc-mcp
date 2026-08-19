@@ -114,6 +114,15 @@ pub trait StorageBackend: Send + Sync {
     /// Full replace: insert or overwrite the whole document (metadata, tags,
     /// auto_load, content — everything). Returns true if it replaced existing.
     async fn kb_replace(&self, doc: &Document) -> SlcResult<bool>;
+    /// Пакетная замена документов: один git-коммит на весь пакет
+    /// (obsidian); default — цикл [`StorageBackend::kb_replace`].
+    async fn kb_replace_many(&self, docs: &[Document]) -> SlcResult<()> {
+        for d in docs {
+            self.kb_replace(d).await?;
+        }
+        Ok(())
+    }
+
     /// Переименовать документ (сменить document_id/имя файла). Каскадные
     /// ссылки (auto_load/references/указатели сидов) чинит движок.
     /// Default: insert под новым id + purge старого; obsidian/sqlite

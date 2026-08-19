@@ -69,12 +69,23 @@ pub async fn resolve_seat(
     } else {
         seat_from_cookie(headers).unwrap_or_else(|| format!("slc_web_{}", uuid_like()))
     };
-    state
+    // Ленивое создание: существующий сид не трогаем (без перезаписи файла
+    // на каждый запрос); last_accessed обновляется в MCP-пути (ensure_seat).
+    if state
         .engine
         .seats
-        .ensure_seat(&seat_id)
+        .get_seat(&seat_id)
         .await
-        .map_err(|e| internal(e.to_string()))?;
+        .map_err(|e| internal(e.to_string()))?
+        .is_none()
+    {
+        state
+            .engine
+            .seats
+            .ensure_seat(&seat_id)
+            .await
+            .map_err(|e| internal(e.to_string()))?;
+    }
     let cookie = if has_cookie(&seat_id, headers) {
         None
     } else {
@@ -305,12 +316,12 @@ pub async fn get_document(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let (_seat, cookie) = match resolve_seat(&state, &headers).await {
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
         Ok(x) => x,
         Err(e) => return e.into_response(),
     };
     match state.engine.get_document(&id).await {
-        Ok(Some(d)) => with_seat_cookie(
+        Ok(Some(d)) if state.engine.can_read_document(&seat, &d) => with_seat_cookie(
             Json(json!({
                 "document_id": d.document_id,
                 "category": d.category.as_str(),
@@ -326,6 +337,7 @@ pub async fn get_document(
             })),
             cookie,
         ),
+        Ok(Some(_)) => ApiError(StatusCode::NOT_FOUND, format!("not found: {id}")).into_response(),
         Ok(None) => ApiError(StatusCode::NOT_FOUND, format!("not found: {id}")).into_response(),
         Err(e) => internal(e.to_string()).into_response(),
     }
@@ -380,14 +392,14 @@ pub async fn update_document(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let (_seat, cookie) = match resolve_seat(&state, &headers).await {
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
         Ok(x) => x,
         Err(e) => return e.into_response(),
     };
     let engine = &state.engine;
     let doc = match engine.get_document(&id).await {
-        Ok(Some(d)) => d,
-        Ok(None) => {
+        Ok(Some(d)) if engine.can_read_document(&seat, &d) => d,
+        Ok(_) => {
             return ApiError(StatusCode::NOT_FOUND, format!("not found: {id}")).into_response();
         }
         Err(e) => return internal(e.to_string()).into_response(),
@@ -431,11 +443,16 @@ pub async fn delete_document(
     Path(id): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let (_seat, cookie) = match resolve_seat(&state, &headers).await {
+    let (seat, cookie) = match resolve_seat(&state, &headers).await {
         Ok(x) => x,
         Err(e) => return e.into_response(),
     };
     let engine = &state.engine;
+    if let Ok(Some(d)) = engine.get_document(&id).await {
+        if !engine.can_read_document(&seat, &d) {
+            return ApiError(StatusCode::NOT_FOUND, format!("not found: {id}")).into_response();
+        }
+    }
     let purge = q.get("purge").map(|v| v == "true").unwrap_or(false);
     let res = if purge {
         engine.store().kb_purge(&id).await

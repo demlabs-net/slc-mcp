@@ -1451,11 +1451,12 @@ async fn call_tool(
                 .get("document_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // Видимость: свой/публичный документ или сид с ролью operator.
             match engine.get_document(id).await.map_err(json_err)? {
-                Some(d) => {
-                    json!({"document_id": d.document_id, "category": d.category.as_str(), "content": d.content, "tags": d.tags, "metadata": d.metadata})
+                Some(d) if engine.can_read_document(seat_id, &d) => {
+                    json!({"document_id": d.document_id, "category": d.category.as_str(), "folder": d.folder, "content": d.content, "tags": d.tags, "metadata": d.metadata, "seat_id": d.seat_id, "auto_load": d.auto_load, "references": d.references, "created_at": d.created_at.to_rfc3339(), "updated_at": d.updated_at.to_rfc3339()})
                 }
-                None => json!({"error": format!("not found: {id}")}),
+                _ => json!({"error": format!("not found: {id}")}),
             }
         }
         "add_document" => {

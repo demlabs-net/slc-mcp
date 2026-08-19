@@ -957,6 +957,12 @@ impl SlcEngine {
             .any(|r| *r == roles::SeatRole::Operator)
     }
 
+    /// Может ли сид читать/редактировать документ: свой/публичный
+    /// (is_kb_visible) или оператор (управление контекстом других сидов).
+    pub fn can_read_document(&self, seat_id: &str, doc: &Document) -> bool {
+        doc.is_kb_visible(seat_id) || self.can_manage_seats(seat_id)
+    }
+
     /// Проверка права: actor может управлять target_seat (свой сид — всегда).
     pub async fn require_seat_manage(&self, actor: &str, target_seat: &str) -> SlcResult<()> {
         if actor == target_seat || self.can_manage_seats(actor) {
@@ -1069,6 +1075,9 @@ impl SlcEngine {
             .kb_find(&DocFilter::default(), &DocSort::default(), 100_000)
             .await?;
         let mut reembed: Vec<String> = Vec::new();
+        // Изменённые документы применяем пакетом — один git-коммит
+        // вместо коммита на каждый документ (kb_replace_many).
+        let mut changed_docs: Vec<Document> = Vec::new();
         for mut d in all {
             let mut changed = false;
             // Ссылочные поля.
@@ -1109,8 +1118,8 @@ impl SlcEngine {
             if c1 || c2 || c3 || c4 {
                 d.updated_at = chrono::Utc::now();
                 d.version += 1;
-                self.store.kb_replace(&d).await?;
                 changed = true;
+                changed_docs.push(d.clone());
             }
             if changed && c4 {
                 links_fixed += 1;
@@ -1121,6 +1130,11 @@ impl SlcEngine {
             if c4 {
                 reembed.push(d.document_id);
             }
+        }
+
+        // Применяем каскадные правки одним пакетом (один git-коммит).
+        if !changed_docs.is_empty() {
+            self.store.kb_replace_many(&changed_docs).await?;
         }
 
         // Само переименование (файл/ключ).
