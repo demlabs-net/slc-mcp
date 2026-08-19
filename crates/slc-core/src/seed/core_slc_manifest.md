@@ -163,11 +163,6 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 | `SLC_CONTEXT_LIMIT_TOKENS` | `100000` | Fallback context budget when neither the connection nor seat specifies one |
 | `SLC_PAGINATION_ENABLED` | `true` | Enable pagination for large list-shaped MCP tool results |
 | `SLC_PAGE_TOKEN_LIMIT` | `50000` | Approximate page size and pagination threshold in tokens |
-
-Per-connection MCP HTTP headers: `X-SLC-Pagination`,
-`X-SLC-Page-Token-Limit`, and `X-SLC-Context-Token-Limit`. Explicit context
-limits are deployment configuration; SLC does not infer them from model names
-or hard-code model-window tiers.
 | `SLC_LLM` | auto | Provider: hash/ollama/lmstudio/candle |
 | `LMSTUDIO_URL` | — | LM Studio URL |
 | `LMSTUDIO_MODEL` | `google/gemma-4-e4b` | Reasoning model |
@@ -180,6 +175,11 @@ or hard-code model-window tiers.
 | `SLC_MCP_AUTH` | `legacy_seat_id` | Auth: legacy_seat_id / bearer_plus_seat / embedded |
 | `SLC_MCP_TOKEN` | — | Bearer token for auth |
 | `OBSIDIAN_AUTO_GIT_COMMIT` | `false` | Auto git commit on vault writes |
+
+Per-connection MCP HTTP headers: `X-SLC-Pagination`,
+`X-SLC-Page-Token-Limit`, and `X-SLC-Context-Token-Limit`. Explicit context
+limits are deployment configuration; SLC does not infer them from model names
+or hard-code model-window tiers.
 
 ## SSE Events
 
