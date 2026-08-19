@@ -589,7 +589,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_task",
-            "description": "Update an existing task. Тело редактируется ТОЛЬКО через diff (append/prepend/replace_section/remove_section по markdown-заголовкам) — полное переписывание описания запрещено.",
+            "description": "Update an existing task. Тело редактируется ТОЛЬКО через diff (append/prepend/replace_section/remove_section по markdown-заголовкам) — полное переписывание описания запрещено; устаревшие параметры description/description_patch удалены и возвращают ошибку.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "name": {"type":"string"},
@@ -673,7 +673,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_project",
-            "description": "Update an existing project. Тело редактируется ТОЛЬКО через diff (append/prepend/replace_section/remove_section по markdown-заголовкам) — полное переписывание описания запрещено.",
+            "description": "Update an existing project. Тело редактируется ТОЛЬКО через diff (append/prepend/replace_section/remove_section по markdown-заголовкам) — полное переписывание описания запрещено; устаревшие параметры description/description_patch удалены и возвращают ошибку.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
                 "name": {"type":"string"},
@@ -797,7 +797,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_document",
-            "description": "Update an existing document. Тело редактируется ТОЛЬКО через diff (append/prepend/replace_section/remove_section по markdown-заголовкам) — полное переписывание содержимого запрещено. Остальные поля — patch.",
+            "description": "Update an existing document. Тело редактируется ТОЛЬКО через diff (append/prepend/replace_section/remove_section по markdown-заголовкам) — полное переписывание содержимого запрещено (устаревший параметр content возвращает ошибку). Остальные поля — patch.",
             "inputSchema": {"type":"object","properties":{
                 "document_id": {"type":"string"},
                 "diff": {"type":"array","items":{"type":"object","properties":{
@@ -1683,7 +1683,15 @@ async fn call_tool(
         "update_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
-            // Тело — только через diff (полная пересылка запрещена).
+            // Устаревшие параметры удалены — явная ошибка вместо тихого
+            // игнора (иначе агенты получают success без изменений).
+            for legacy in ["description", "description_patch"] {
+                if args.get(legacy).is_some() {
+                    return Err(json!({"code": -32602, "message": format!(
+                        "parameter `{legacy}` removed: тело редактируется ТОЛЬКО через `diff` (append/prepend/replace_section/remove_section по markdown-заголовкам)"
+                    )}));
+                }
+            }
             let description = None;
             let description_patch = args.get("diff").cloned();
             let project_id = args
@@ -1831,7 +1839,13 @@ async fn call_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
-            // Тело — только через diff (полная пересылка запрещена).
+            for legacy in ["description", "description_patch"] {
+                if args.get(legacy).is_some() {
+                    return Err(json!({"code": -32602, "message": format!(
+                        "parameter `{legacy}` removed: тело редактируется ТОЛЬКО через `diff` (append/prepend/replace_section/remove_section по markdown-заголовкам)"
+                    )}));
+                }
+            }
             let description = None;
             let description_patch = args.get("diff").cloned();
             let auto_load = args.get("auto_load").map(|_| str_array(args, "auto_load"));
@@ -2111,6 +2125,9 @@ async fn call_tool(
             let Some(mut doc) = engine.get_document(id).await.map_err(json_err)? else {
                 return Err(json!({"code": -32602, "message": format!("document not found: {id}")}));
             };
+            if args.get("content").is_some() {
+                return Err(json!({"code": -32602, "message": "parameter `content` removed: тело редактируется ТОЛЬКО через `diff` (append/prepend/replace_section/remove_section по markdown-заголовкам)"}));
+            }
             // Тело — только через diff (полная пересылка запрещена).
             if let Some(patch) = args.get("diff").cloned() {
                 doc.content = slc_core::tasks::apply_description_patch(&doc.content, &patch)
