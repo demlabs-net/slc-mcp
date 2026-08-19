@@ -589,16 +589,15 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_task",
-            "description": "Update an existing task. Для РЕДАКТИРОВАНИЯ большого тела используй description_patch (дифф: append/prepend/replace_section/remove_section) — НЕ пересылай всю description целиком. Полная description — только для полной замены.",
+            "description": "Update an existing task. Тело редактируется ТОЛЬКО через diff (append/prepend/replace_section/remove_section по markdown-заголовкам) — полное переписывание описания запрещено.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "name": {"type":"string"},
-                "description": {"type":"string","description":"полная замена тела (не используй вместе с description_patch)"},
-                "description_patch": {"type":"array","items":{"type":"object","properties":{
+                "diff": {"type":"array","items":{"type":"object","properties":{
                     "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
                     "content": {"type":"string"},
                     "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
-                },"required":["op"]},"description":"дифф-операции, применяются по порядку"},
+                },"required":["op"]},"description":"ЕДИНСТВЕННЫЙ способ редактирования тела — дифф-операции, применяются по порядку; полная пересылка тела запрещена"},
                 "project_id": {"type":"string"},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","CANCELLED"]},
@@ -674,16 +673,15 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_project",
-            "description": "Update an existing project. Для редактирования большого тела используй description_patch (дифф), полную description — только для полной замены.",
+            "description": "Update an existing project. Тело редактируется ТОЛЬКО через diff (append/prepend/replace_section/remove_section по markdown-заголовкам) — полное переписывание описания запрещено.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
                 "name": {"type":"string"},
-                "description": {"type":"string","description":"полная замена тела"},
-                "description_patch": {"type":"array","items":{"type":"object","properties":{
+                "diff": {"type":"array","items":{"type":"object","properties":{
                     "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
                     "content": {"type":"string"},
                     "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
-                },"required":["op"]}},
+                },"required":["op"]},"description":"ЕДИНСТВЕННЫЙ способ редактирования тела — дифф-операции, применяются по порядку; полная пересылка тела запрещена"},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "status": {"type":"string","enum":["active","archived"]},
                 "metadata": {"type":"object"}
@@ -799,10 +797,14 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_document",
-            "description": "Update an existing document (patch: content, tags, metadata, auto_load, references, seat_id)",
+            "description": "Update an existing document. Тело редактируется ТОЛЬКО через diff (append/prepend/replace_section/remove_section по markdown-заголовкам) — полное переписывание содержимого запрещено. Остальные поля — patch.",
             "inputSchema": {"type":"object","properties":{
                 "document_id": {"type":"string"},
-                "content": {"type":"string"},
+                "diff": {"type":"array","items":{"type":"object","properties":{
+                    "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
+                    "content": {"type":"string"},
+                    "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
+                },"required":["op"]},"description":"ЕДИНСТВЕННЫЙ способ редактирования тела — дифф-операции, применяются по порядку; полная пересылка тела запрещена"},
                 "tags": {"type":"array","items":{"type":"string"}},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "references": {"type":"array","items":{"type":"string"}},
@@ -943,9 +945,11 @@ pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инс�
 4. **Обогащай по ходу.** После значимых шагов обновляй документы
    (`add_document` с тем же document_id — upsert): статусы, решения,
    новые факты. История (remember) — это сырьё, а документы — рабочий
-   артефакт. Задачи/проекты обновляй ДИФФОМ (`update_task` c
-   `description_patch`: append / replace_section / remove_section) —
-   НЕ пересылай всю description целиком, если меняешь часть тела.
+   артефакт. Тела задач/проектов/документов редактируются ТОЛЬКО через
+   `diff` (`update_task`/`update_project`/`update_document`:
+   append / prepend / replace_section / remove_section по
+   markdown-заголовкам) — полное переписывание тела запрещено; для
+   простых правок используй replace_section с точным заголовком секции.
 5. **auto_load vs references (важно, не путай).**
    - `auto_load` — РАБОЧИЕ связи: документы, которые должны подтягиваться
      в контекст при обновлении этого документа (состав, зависимости,
@@ -1678,11 +1682,9 @@ async fn call_tool(
         "update_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
-            let description = args.get("description").and_then(|v| v.as_str());
-            let description_patch = args.get("description_patch").cloned();
-            if description.is_some() && description_patch.is_some() {
-                return Err(json!({"code": -32602, "message": "pass either description (полная замена) or description_patch (дифф), не оба"}));
-            }
+            // Тело — только через diff (полная пересылка запрещена).
+            let description = None;
+            let description_patch = args.get("diff").cloned();
             let project_id = args
                 .get("project_id")
                 .and_then(|v| v.as_str())
@@ -1828,11 +1830,9 @@ async fn call_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
-            let description = args.get("description").and_then(|v| v.as_str());
-            let description_patch = args.get("description_patch").cloned();
-            if description.is_some() && description_patch.is_some() {
-                return Err(json!({"code": -32602, "message": "pass either description (полная замена) or description_patch (дифф), не оба"}));
-            }
+            // Тело — только через diff (полная пересылка запрещена).
+            let description = None;
+            let description_patch = args.get("diff").cloned();
             let auto_load = args.get("auto_load").map(|_| str_array(args, "auto_load"));
             let status = args.get("status").and_then(|v| v.as_str());
             let metadata = args.get("metadata").cloned();
@@ -2110,9 +2110,11 @@ async fn call_tool(
             let Some(mut doc) = engine.get_document(id).await.map_err(json_err)? else {
                 return Err(json!({"code": -32602, "message": format!("document not found: {id}")}));
             };
-            if let Some(c) = args.get("content").and_then(|v| v.as_str()) {
-                doc.content = c.to_string();
-                doc.content_hash = slc_core::content_hash(c);
+            // Тело — только через diff (полная пересылка запрещена).
+            if let Some(patch) = args.get("diff").cloned() {
+                doc.content = slc_core::tasks::apply_description_patch(&doc.content, &patch)
+                    .map_err(|e| json!({"code": -32602, "message": e}))?;
+                doc.content_hash = slc_core::content_hash(&doc.content);
             }
             if let Some(t) = args.get("tags").and_then(|v| v.as_array()) {
                 doc.tags = t.iter().filter_map(|x| x.as_str().map(String::from)).collect();
