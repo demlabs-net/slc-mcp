@@ -2766,14 +2766,6 @@ fn uid(prefix: &str) -> String {
     format!("{prefix}_{}", &u[..12])
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
-    }
-}
-
 /// SSE fan-out filter: forward `evt` only to the subscriber of `seat`.
 /// Deny-by-default — an event WITHOUT a `seat_id` goes to nobody: it carries
 /// no routing context, and broadcasting it to every subscriber would leak
