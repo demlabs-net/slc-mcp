@@ -2,13 +2,13 @@
 # SLC MCP — deploy helper (Docker, Obsidian vault, LM Studio provider, web UI).
 #
 # Usage:
-#   ./deploy.sh build     — собрать образы (slc-mcp + slc-webui)
-#   ./deploy.sh up        — создать vault (+git init), поднять сервисы, ждать /health
+#   ./deploy.sh build     — собрать образ slc-mcp (MCP + REST + SPA одним процессом)
+#   ./deploy.sh up        — создать vault (+git init), поднять сервис, ждать /health
 #   ./deploy.sh down      — остановить сервисы
 #   ./deploy.sh status    — статус + /health (MCP) и /api/health (webui)
 #   ./deploy.sh logs      — логи (follow)
-#   ./deploy.sh migrate   — импорт БЗ+сидов из легаси-Mongo (CLI --from-mongo,
-#                           с AI-переименованием id через LLM из .env)
+#   ./deploy.sh migrate   — импорт БЗ+сидов из легаси-Mongo (CLI --from-mongo;
+#                           legacy id сохраняются, если явно не включён rename)
 #   ./deploy.sh reindex   — пересобрать эмбеддинги текущим провайдером
 #
 # Config: .env в корне репо (копия .env.example). Путь vault: $SLC_VAULT
@@ -65,7 +65,7 @@ cmd_up() {
     wait_health
     echo
     echo "SLC MCP:   http://127.0.0.1:3000/mcp  (health: $HEALTH_URL)"
-    echo "Web UI:    http://127.0.0.1:3002/      (health: /api/health)"
+    echo "Web UI:    http://127.0.0.1:3000/      (REST /api/*, health: /api/health)"
     echo "vault:     $VAULT_PATH"
 }
 
@@ -78,7 +78,7 @@ cmd_status() {
     echo
     curl -sS -m 3 "$HEALTH_URL" || echo "(health недоступен)"
     echo
-    curl -sS -m 3 "http://127.0.0.1:3002/api/health" || echo "(webui health недоступен)"
+    curl -sS -m 3 "http://127.0.0.1:3000/api/health" || echo "(webui health недоступен)"
 }
 
 cmd_logs() {
@@ -88,26 +88,40 @@ cmd_logs() {
 cmd_migrate() {
     ensure_env
     local net
-    net="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' slc-mongodb 2>/dev/null | awk '{print $1}')"
+    local mongo_container="${SLC_LEGACY_MONGO_CONTAINER:-slc-mongodb}"
+    local mongo_db="${SLC_LEGACY_MONGO_DB:-slc_mcp}"
+    local rename="${SLC_MIGRATE_RENAME_WITH_AI:-false}"
+    if ! docker inspect "$mongo_container" >/dev/null 2>&1 \
+       && docker inspect dev-swarm-slc-mongodb >/dev/null 2>&1; then
+        mongo_container=dev-swarm-slc-mongodb
+    fi
+    net="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$mongo_container" 2>/dev/null | awk '{print $1}')"
     if [ -z "$net" ]; then
-        echo "ERROR: контейнер slc-mongodb не найден — легаси-Mongo не запущена" >&2
+        echo "ERROR: legacy Mongo container not found: $mongo_container" >&2
         exit 1
     fi
+    local rename_args=()
+    case "$rename" in
+        true|1|yes|on) rename_args=(--rename-with-ai) ;;
+        false|0|no|off) ;;
+        *) echo "ERROR: SLC_MIGRATE_RENAME_WITH_AI must be boolean" >&2; exit 1 ;;
+    esac
     echo "legacy mongo network: $net"
     echo "target vault:         $VAULT_PATH"
-    echo "rename ids with LLM:  --rename-with-ai (модель из .env: LMSTUDIO_MODEL)"
+    echo "rename ids with LLM:  $rename"
     docker run --rm \
         --network "$net" \
         --add-host host.docker.internal:host-gateway \
         --env-file "$ENV_FILE" \
+        -e OBSIDIAN_AUTO_GIT_COMMIT=false \
         --entrypoint slc-mcp \
         -v "$VAULT_PATH:/data/vault" \
         slc-mcp:local \
         migrate \
-            --from-mongo "mongodb://slc-mongodb:27017" \
-            --db slc_mcp \
+            --from-mongo "mongodb://$mongo_container:27017" \
+            --db "$mongo_db" \
             --to-vault /data/vault \
-            --rename-with-ai
+            "${rename_args[@]}"
     echo
     echo "Импорт завершён. Перезапустите сервер, чтобы он пересобрал индекс:"
     echo "  ./deploy.sh down && ./deploy.sh up"

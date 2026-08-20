@@ -11,11 +11,13 @@ use axum::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
 use serde_json::{Value, json};
 use slc_core::{DocFilter, DocMeta, DocSort, Document, DocumentCategory, SlcEngine, SortDir};
 use std::sync::Arc;
+
+use crate::{auth, webui};
 
 pub struct AppState {
     pub engine: Arc<SlcEngine>,
@@ -26,11 +28,17 @@ pub struct AppState {
     pub sampling: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
     >,
+    /// Каталог со статикой SPA (web-ui/dist) для встроенной веб-морды.
+    pub dist: std::path::PathBuf,
+    /// Авторизация веб-морды (users/JWT/RBAC/Yandex OAuth, SLC_AUTH).
+    pub auth: std::sync::Arc<auth::AuthState>,
 }
 
 pub async fn run(
     engine: SlcEngine,
     port: u16,
+    dist: std::path::PathBuf,
+    auth_state: auth::AuthState,
     sampling_out: Option<tokio::sync::mpsc::Receiver<Value>>,
     sampling: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
@@ -53,16 +61,89 @@ pub async fn run(
         engine: Arc::new(engine),
         events: tx,
         sampling,
+        dist,
+        auth: std::sync::Arc::new(auth_state),
     });
     let app = Router::new()
         .route("/mcp", post(mcp))
         .route("/sse", get(sse_endpoint))
         .route("/messages", post(messages))
         .route("/health", get(health))
+        // ── Веб-морда (REST + SPA, тот же процесс) ──
+        .route("/api/health", get(webui::api::health))
+        .route("/api/stats", get(webui::api::stats))
+        .route("/api/context", get(webui::api::context))
+        .route(
+            "/api/documents",
+            get(webui::api::list_documents).post(webui::api::add_document),
+        )
+        .route(
+            "/api/documents/{id}",
+            get(webui::api::get_document)
+                .put(webui::api::update_document)
+                .delete(webui::api::delete_document),
+        )
+        .route("/api/search", get(webui::api::search))
+        .route("/api/tasks", get(webui::api::list_tasks).post(webui::api::create_task))
+        .route(
+            "/api/tasks/{id}",
+            put(webui::api::update_task).delete(webui::api::delete_task),
+        )
+        .route(
+            "/api/projects",
+            get(webui::api::list_projects).post(webui::api::create_project),
+        )
+        .route(
+            "/api/projects/{id}",
+            put(webui::api::update_project).delete(webui::api::delete_project),
+        )
+        .route("/api/seats", get(webui::api::list_seats))
+        .route(
+            "/api/notifications",
+            get(webui::api::notification_list).post(webui::api::pop_notifications),
+        )
+        .route(
+            "/api/reminders",
+            get(webui::api::reminder_list).post(webui::api::reminder_create),
+        )
+        .route("/api/reminders/{id}", delete(webui::api::reminder_cancel))
+        .route("/api/focuses", get(webui::api::focus_list).post(webui::api::focus_add))
+        .route(
+            "/api/focuses/{id}",
+            put(webui::api::focus_update).delete(webui::api::focus_remove),
+        )
+        .route("/api/events", get(webui::api::sse_events))
+        // ── Авторизация веб-морды (полный порт легаси) ──
+        .route("/api/auth/register", post(auth::routes::register))
+        .route("/api/auth/login", post(auth::routes::login))
+        .route("/api/auth/refresh", post(auth::routes::refresh))
+        .route("/api/auth/logout", post(auth::routes::logout))
+        .route("/api/auth/me", get(auth::routes::me))
+        .route(
+            "/api/auth/oauth/yandex",
+            get(auth::routes::oauth_yandex_redirect).post(auth::routes::oauth_yandex_code),
+        )
+        .route("/api/auth/oauth/yandex/callback", get(auth::routes::oauth_yandex_callback))
+        .route("/api/auth/oauth/yandex/callback_uri", get(auth::routes::oauth_callback_uri))
+        .route("/api/auth/exchange", post(auth::routes::exchange))
+        .route("/api/auth/users", get(auth::routes::list_users))
+        .route("/api/auth/users/{user_id}/groups", put(auth::routes::update_user_groups))
+        .route("/api/auth/users/{user_id}/active", put(auth::routes::toggle_user_active))
+        .route("/api/auth/groups", get(auth::routes::list_groups))
+        .route("/api/admin/oauth/rules", get(auth::routes::oauth_rules_list).post(auth::routes::oauth_rule_create))
+        .route(
+            "/api/admin/oauth/rules/{rule_id}",
+            put(auth::routes::oauth_rule_update).delete(auth::routes::oauth_rule_delete),
+        )
+        .route("/api/admin/oauth/ya360/status", get(auth::routes::ya360_status))
+        .fallback(webui::static_files::handler)
+        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("SLC MCP listening on http://{addr}/mcp (SSE: /sse → /messages)");
+    tracing::info!(
+        "SLC MCP listening on http://{addr}/mcp (SSE: /sse → /messages; web UI: /api, /)"
+    );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -179,12 +260,20 @@ async fn messages(
     headers: axum::http::HeaderMap,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
+    // JSON-RPC notifications never receive a JSON-RPC response.  Streamable
+    // HTTP represents successful notification acceptance as HTTP 202 with an
+    // empty body (MCP 2025-03-26, Transports).  This path is shared with the
+    // legacy SSE transport so standard SDKs do not receive a fabricated
+    // response with `id: null` on their /messages POST.
+    if is_jsonrpc_notification(&req) {
+        return StatusCode::ACCEPTED.into_response();
+    }
     let sid = headers
         .get("sessionId")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let seat = seat_from_request(&headers).unwrap_or_default();
-    let (status, Json(body)) = mcp(State(state.clone()), headers, Json(req)).await;
+    let (status, Json(body)) = mcp_request(State(state.clone()), headers, Json(req)).await;
     // Ответ доставляется ДВУМЯ путями сразу:
     // 1. SSE-событие `message` на потоке /sse — легаси-SSE клиенты (SDK
     //    SSEClientTransport) игнорируют тело POST и ждут ответ там;
@@ -232,8 +321,70 @@ fn bearer_from_request(headers: &axum::http::HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaginationPolicy {
+    enabled: bool,
+    page_token_limit: Option<usize>,
+    context_token_limit: Option<usize>,
+}
+
+/// Resolve the response-shaping policy for one MCP connection. Custom HTTP
+/// headers are transport metadata, not protocol changes: clients that do not
+/// send them continue to receive the server defaults.
+fn pagination_policy_from_request(headers: &axum::http::HeaderMap) -> PaginationPolicy {
+    let enabled = headers
+        .get("x-slc-pagination")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_pagination_enabled)
+        .unwrap_or_else(slc_core::pagination::pagination_enabled_from_env);
+    let page_token_limit = headers
+        .get("x-slc-page-token-limit")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(slc_core::pagination::normalize_page_token_limit);
+    let context_token_limit = headers
+        .get("x-slc-context-token-limit")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    PaginationPolicy {
+        enabled,
+        page_token_limit,
+        context_token_limit,
+    }
+}
+
+fn parse_pagination_enabled(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+fn effective_context_token_limit(connection_limit: Option<usize>, seat_limit: usize) -> usize {
+    connection_limit.unwrap_or(seat_limit)
+}
+
 #[axum::debug_handler]
 async fn mcp(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<Value>,
+) -> axum::response::Response {
+    // Notifications are intentionally accepted before seat authentication:
+    // initialize/list/ping are likewise connection-level operations, and an
+    // `initialized` notification carries no tool data.  Unknown notifications
+    // are ignored as required by JSON-RPC rather than answered with an error.
+    if is_jsonrpc_notification(&req) {
+        return StatusCode::ACCEPTED.into_response();
+    }
+
+    let response = mcp_request(State(state), headers, Json(req)).await;
+    response.into_response()
+}
+
+async fn mcp_request(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<Value>,
@@ -268,6 +419,7 @@ async fn mcp(
     let engine = state.engine.as_ref();
     let seat_hdr = seat_from_request(&headers);
     let bearer = bearer_from_request(&headers);
+    let pagination = pagination_policy_from_request(&headers);
 
     // Tool calls need a seat; initialize/list/ping are unauthenticated.
     if !matches!(
@@ -298,33 +450,16 @@ async fn mcp(
 
     let result = match method {
         "initialize" => {
-            // Auto-apply the client's context budget when it advertises one
-            // (capabilities.experimental.context_limit_chars — ТОКЕНЫ) as the
-            // per-seat override used by update_context compression.
-            if let Some(window) = params
-                .pointer("/capabilities/experimental/context_limit_chars")
-                .and_then(|v| v.as_u64())
-            {
-                if let Some(seat) = seat_hdr.as_deref() {
-                    // The seat may not exist yet — create it first.
-                    let _ = engine.seats.ensure_seat(seat).await;
-                    // SLC budget = 80% of the client's model window in TOKENS
-                    // (the rest is left for the conversation itself), capped
-                    // at the configured limit (SLC_CONTEXT_LIMIT_TOKENS).
-                    let limit = (window * 4 / 5).min(engine.config.context_limit_tokens as u64);
-                    let _ = engine
-                        .seats
-                        .set_context_key(seat, "context_limit_tokens", json!(limit))
-                        .await;
-                }
-            }
             Ok(json!({
                 "protocolVersion": "2025-03-26",
                 "capabilities": { "tools": {}, "prompts": {} },
                 "serverInfo": { "name": "slc-mcp", "version": env!("CARGO_PKG_VERSION") },
             }))
         }
-        "ping" => Ok(Value::Null),
+        // MCP ping responses must contain an object result.  Returning JSON
+        // null is legal in generic JSON-RPC, but the MCP SDK models `result`
+        // as an object and rejects null before the keepalive can complete.
+        "ping" => Ok(ping_result()),
         "tools/list" => Ok(json!({ "tools": tools() })),
         "prompts/list" => Ok(json!({ "prompts": prompts() })),
         "prompts/get" => {
@@ -332,7 +467,7 @@ async fn mcp(
             match name {
                 "instructions" => Ok(json!({
                     "name": "instructions",
-                    "description": "Полная рабочая инструкция агента: рабочий процесс, auto_load vs references, рефлексия через истории",
+                    "description": "Complete agent working contract: lifecycle, document maintenance, auto_load versus references, and reflection over history",
                     "arguments": [],
                     "messages": [ { "role": "user", "content": { "type": "text", "text": INSTRUCTIONS_PROMPT } } ],
                 })),
@@ -351,7 +486,15 @@ async fn mcp(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let seat = seat_hdr.clone().unwrap_or_default();
-            call_tool(engine, &seat, name, &args, &state.events).await
+            call_tool(
+                engine,
+                &seat,
+                name,
+                &args,
+                &state.events,
+                pagination,
+            )
+            .await
         }
         _ => Err(json!({"code": -32601, "message": format!("method not found: {method}")})),
     };
@@ -366,6 +509,14 @@ async fn mcp(
             Json(json!({"jsonrpc":"2.0","id":id,"error":error})),
         ),
     }
+}
+
+fn is_jsonrpc_notification(req: &Value) -> bool {
+    req.get("id").is_none()
+        && req
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some()
 }
 
 fn tools() -> Vec<Value> {
@@ -438,9 +589,10 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "focus_list",
-            "description": "List active focus items for the seat",
+            "description": "List active focus items for the seat. An operator may select an explicitly allowed subordinate with target_seat.",
             "inputSchema": {"type":"object","properties":{
-                "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]}
+                "mind_type": {"type":"string","enum":["front","planner","executor","critic","shared"]},
+                "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
             },"required":[]}
         }),
         json!({
@@ -508,16 +660,15 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_task",
-            "description": "Update an existing task. Для РЕДАКТИРОВАНИЯ большого тела используй description_patch (дифф: append/prepend/replace_section/remove_section) — НЕ пересылай всю description целиком. Полная description — только для полной замены.",
+            "description": "Update an existing task. Edit its body only through ordered diff operations: append, prepend, replace_section, or remove_section by markdown heading.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "name": {"type":"string"},
-                "description": {"type":"string","description":"полная замена тела (не используй вместе с description_patch)"},
-                "description_patch": {"type":"array","items":{"type":"object","properties":{
+                "diff": {"type":"array","items":{"type":"object","properties":{
                     "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
                     "content": {"type":"string"},
-                    "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
-                },"required":["op"]},"description":"дифф-операции, применяются по порядку"},
+                    "heading": {"type":"string","description":"markdown section heading for *_section operations"}
+                },"required":["op"]},"description":"The only supported body-edit mechanism. Operations run in order; resending the full body is forbidden."},
                 "project_id": {"type":"string"},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","CANCELLED"]},
@@ -533,45 +684,56 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "activate_task",
-            "description": "Activate a task (included in update_context)",
+            "description": "Activate a task so update_context includes it. An operator may set another explicitly authorized seat through target_seat.",
             "inputSchema": {"type":"object","properties":{
-                "task_id": {"type":"string"}
+                "task_id": {"type":"string"},
+                "target_seat": {"type":"string","description":"target seat; defaults to the caller and requires operator authority for another seat"}
             },"required":["task_id"]}
         }),
         json!({
             "name": "deactivate_task",
-            "description": "Deactivate the current active task",
-            "inputSchema": {"type":"object","properties":{},"required":[]}
+            "description": "Deactivate the current task. An operator may clear another explicitly authorized seat through target_seat.",
+            "inputSchema": {"type":"object","properties":{
+                "target_seat": {"type":"string","description":"target seat; defaults to the caller and requires operator authority for another seat"}
+            },"required":[]}
         }),
         json!({
             "name": "get_active_task",
-            "description": "Get the currently active task",
-            "inputSchema": {"type":"object","properties":{},"required":[]}
+            "description": "Get the currently active task. An operator may inspect an explicitly allowed subordinate with target_seat.",
+            "inputSchema": {"type":"object","properties":{
+                "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
+            },"required":[]}
         }),
         json!({
             "name": "activate_document",
-            "description": "Activate ANY document (task, project, skill, knowledge doc…) as the seat's context anchor — it is included in update_context and its auto_load links are followed on updates. The effect is identical to activate_task, but for every category.",
+            "description": "Activate any task, project, skill, or knowledge document as the seat's context anchor. update_context includes it and follows its auto_load links. An operator may target another explicitly authorized seat.",
             "inputSchema": {"type":"object","properties":{
-                "document_id": {"type":"string"}
+                "document_id": {"type":"string"},
+                "target_seat": {"type":"string","description":"target seat; defaults to the caller and requires operator authority for another seat"}
             },"required":["document_id"]}
         }),
         json!({
             "name": "deactivate_document",
-            "description": "Clear the seat's active document (any category)",
-            "inputSchema": {"type":"object","properties":{},"required":[]}
+            "description": "Clear the seat's active document in any category. An operator may target another explicitly authorized seat.",
+            "inputSchema": {"type":"object","properties":{
+                "target_seat": {"type":"string","description":"target seat; defaults to the caller and requires operator authority for another seat"}
+            },"required":[]}
         }),
         json!({
             "name": "get_active_document",
-            "description": "Get the currently active document (any category)",
-            "inputSchema": {"type":"object","properties":{},"required":[]}
+            "description": "Get the currently active document (any category). An operator may inspect an explicitly allowed subordinate with target_seat.",
+            "inputSchema": {"type":"object","properties":{
+                "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
+            },"required":[]}
         }),
         json!({
             "name": "list_tasks",
-            "description": "List your tasks with optional filters",
+            "description": "List tasks with optional filters. An operator may inspect an explicitly allowed subordinate with target_seat.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
                 "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","CANCELLED"]},
-                "limit": {"type":"number","default":50}
+                "limit": {"type":"number","default":50},
+                "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
             },"required":[]}
         }),
         // projects
@@ -587,16 +749,15 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_project",
-            "description": "Update an existing project. Для редактирования большого тела используй description_patch (дифф), полную description — только для полной замены.",
+            "description": "Update an existing project. Edit its body only through ordered diff operations: append, prepend, replace_section, or remove_section by markdown heading.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
                 "name": {"type":"string"},
-                "description": {"type":"string","description":"полная замена тела"},
-                "description_patch": {"type":"array","items":{"type":"object","properties":{
+                "diff": {"type":"array","items":{"type":"object","properties":{
                     "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
                     "content": {"type":"string"},
-                    "heading": {"type":"string","description":"markdown-заголовок секции (для *_section)"}
-                },"required":["op"]}},
+                    "heading": {"type":"string","description":"markdown section heading for *_section operations"}
+                },"required":["op"]},"description":"The only supported body-edit mechanism. Operations run in order; resending the full body is forbidden."},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "status": {"type":"string","enum":["active","archived"]},
                 "metadata": {"type":"object"}
@@ -618,10 +779,11 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "list_projects",
-            "description": "List all projects",
+            "description": "List projects visible to the seat. An operator may inspect an explicitly allowed subordinate with target_seat.",
             "inputSchema": {"type":"object","properties":{
                 "status": {"type":"string","enum":["active","archived"]},
-                "limit": {"type":"number","default":50}
+                "limit": {"type":"number","default":50},
+                "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
             },"required":[]}
         }),
         // profiles
@@ -652,6 +814,55 @@ fn tools() -> Vec<Value> {
         }),
         // UI-ориентированные read/write-тулы
         json!({
+            "name": "project_set_status",
+            "description": "Archive or unarchive a project (active|archived). An operator may change another explicitly authorized seat through target_seat.",
+            "inputSchema": {"type":"object","properties":{
+                "project_id": {"type":"string"},
+                "status": {"type":"string","enum":["active","archived"]},
+                "target_seat": {"type":"string","description":"target seat; defaults to the caller and requires operator authority for another seat"}
+            },"required":["project_id","status"]}
+        }),
+        json!({
+            "name": "focus_set_archived",
+            "description": "Archive or unarchive a focus item. An operator may change another explicitly authorized seat through target_seat.",
+            "inputSchema": {"type":"object","properties":{
+                "focus_id": {"type":"string"},
+                "archived": {"type":"boolean"},
+                "target_seat": {"type":"string","description":"target seat; defaults to the caller and requires operator authority for another seat"}
+            },"required":["focus_id","archived"]}
+        }),
+        json!({
+            "name": "seat_roles",
+            "description": "Seat roles and explicitly allowed management targets. operator grants no cross-seat access without SLC_SEAT_MANAGE_ACL.",
+            "inputSchema": {"type":"object","properties":{
+                "seat_id": {"type":"string"}
+            },"required":[]}
+        }),
+        json!({
+            "name": "rename_document",
+            "description": "Rename a visible document, task, or project by changing its document_id/file name. Cascades auto_load, references, task-project links, wiki links, and active seat pointers.",
+            "inputSchema": {"type":"object","properties":{
+                "document_id": {"type":"string"},
+                "new_document_id": {"type":"string","description":"new unique document slug"}
+            },"required":["document_id","new_document_id"]}
+        }),
+        json!({
+            "name": "rename_task",
+            "description": "Rename a task. Generates its new ID from new_name and cascades auto_load, references, project links, and active seat pointers.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"},
+                "new_name": {"type":"string"}
+            },"required":["task_id","new_name"]}
+        }),
+        json!({
+            "name": "rename_project",
+            "description": "Rename a project. Generates its new ID from new_name and cascades project task paths and links.",
+            "inputSchema": {"type":"object","properties":{
+                "project_id": {"type":"string"},
+                "new_name": {"type":"string"}
+            },"required":["project_id","new_name"]}
+        }),
+        json!({
             "name": "list_documents",
             "description": "List knowledge documents (id/category/folder/tags, no content) with optional filters",
             "inputSchema": {"type":"object","properties":{
@@ -663,10 +874,14 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_document",
-            "description": "Update an existing document (patch: content, tags, metadata, auto_load, references, seat_id)",
+            "description": "Update an existing document. Edit its body only through ordered diff operations; update other fields through patch.",
             "inputSchema": {"type":"object","properties":{
                 "document_id": {"type":"string"},
-                "content": {"type":"string"},
+                "diff": {"type":"array","items":{"type":"object","properties":{
+                    "op": {"type":"string","enum":["append","prepend","replace_section","remove_section"]},
+                    "content": {"type":"string"},
+                    "heading": {"type":"string","description":"markdown section heading for *_section operations"}
+                },"required":["op"]},"description":"The only supported body-edit mechanism. Operations run in order; resending the full body is forbidden."},
                 "tags": {"type":"array","items":{"type":"string"}},
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "references": {"type":"array","items":{"type":"string"}},
@@ -681,6 +896,46 @@ fn tools() -> Vec<Value> {
                 "document_id": {"type":"string"},
                 "purge": {"type":"boolean","default":false}
             },"required":["document_id"]}
+        }),
+        // Generic, seat-scoped text state. This remains ordinary MCP tooling
+        // rather than a Hermes-specific endpoint, so every conforming MCP
+        // client can use SLC as an external state engine.
+        json!({
+            "name": "state_get",
+            "description": "Read one seat-scoped external-state text object by namespace and key",
+            "inputSchema": {"type":"object","properties":{
+                "namespace": {"type":"string","minLength":1,"maxLength":64},
+                "key": {"type":"string","minLength":1,"maxLength":512}
+            },"required":["namespace","key"]}
+        }),
+        json!({
+            "name": "state_put",
+            "description": "Create or replace one seat-scoped external-state text object; expected_etag enables optimistic concurrency",
+            "inputSchema": {"type":"object","properties":{
+                "namespace": {"type":"string","minLength":1,"maxLength":64},
+                "key": {"type":"string","minLength":1,"maxLength":512},
+                "content": {"type":"string","maxLength":5242880},
+                "content_type": {"type":"string","default":"text/plain; charset=utf-8"},
+                "expected_etag": {"type":"string","description":"etag returned by state_get; empty requires creation"}
+            },"required":["namespace","key","content"]}
+        }),
+        json!({
+            "name": "state_list",
+            "description": "List seat-scoped external-state objects in a namespace without returning contents",
+            "inputSchema": {"type":"object","properties":{
+                "namespace": {"type":"string","minLength":1,"maxLength":64},
+                "prefix": {"type":"string","maxLength":512,"default":""},
+                "limit": {"type":"integer","minimum":1,"maximum":1000,"default":1000}
+            },"required":["namespace"]}
+        }),
+        json!({
+            "name": "state_delete",
+            "description": "Permanently delete one seat-scoped external-state object",
+            "inputSchema": {"type":"object","properties":{
+                "namespace": {"type":"string","minLength":1,"maxLength":64},
+                "key": {"type":"string","minLength":1,"maxLength":512},
+                "expected_etag": {"type":"string","description":"optional optimistic-concurrency etag"}
+            },"required":["namespace","key"]}
         }),
         json!({
             "name": "document_stats",
@@ -719,14 +974,14 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "set_page_limit",
-            "description": "Set the maximum page size (in tokens) for response pagination",
+            "description": "Persist the default response page size in tokens. SLC_PAGE_TOKEN_LIMIT, when set by the operator, has precedence.",
             "inputSchema": {"type":"object","properties":{
                 "page_token_limit": {"type":"number"}
             },"required":["page_token_limit"]}
         }),
         json!({
             "name": "get_page_settings",
-            "description": "Get current pagination settings",
+            "description": "Get server pagination defaults and effective settings for this MCP connection",
             "inputSchema": {"type":"object","properties":{},"required":[]}
         }),
         // context
@@ -742,6 +997,17 @@ fn tools() -> Vec<Value> {
             },"required":[]}
         }),
         json!({
+            "name": "save_context",
+            "description": "Persist the completed iteration as episodic history, then return the refreshed context. Use once at the end of every agent iteration, including cron, subagent and runner iterations.",
+            "inputSchema": {"type":"object","properties":{
+                "summary": {"type":"string"},
+                "changes": {"type":"array","items":{"type":"string"}},
+                "decisions": {"type":"array","items":{"type":"string"}},
+                "next_steps": {"type":"array","items":{"type":"string"}},
+                "include_base_docs": {"type":"boolean","default":true}
+            },"required":["summary"]}
+        }),
+        json!({
             "name": "load_module",
             "description": "Load a public knowledge module (requires knowledge:public:write)",
             "inputSchema": {"type":"object","properties":{
@@ -750,9 +1016,9 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "command",
-            "description": "Slash-команды для управления памятью: `/limit N` — лимит контекста, `/ctx` — текущий срез, `/update_context [summary]` / `/save_context <summary>` — как MCP-тулы, `/help` — список. Вызывай, когда пользователь пишет сообщение, начинающееся с '/'.",
+            "description": "Handle SLC slash commands: /limit N, /ctx, /search, /update_context [summary], /save_context <summary>, and /help. Call when user input begins with '/'.",
             "inputSchema": {"type":"object","properties":{
-                "input": {"type":"string","description":"строка, начинающаяся с /"}
+                "input": {"type":"string","description":"command string beginning with /"}
             },"required":["input"]}
         }),
     ]
@@ -762,7 +1028,7 @@ fn prompts() -> Vec<Value> {
     vec![
         json!({
             "name": "instructions",
-            "description": "Полная рабочая инструкция агента: рабочий процесс, auto_load vs references, рефлексия через истории",
+            "description": "Complete agent working contract: lifecycle, document maintenance, auto_load versus references, and reflection over history",
         }),
         json!({
             "name": "check_notifications",
@@ -775,104 +1041,106 @@ fn prompts() -> Vec<Value> {
 /// to use the full memory surface: search/activate documents, create and
 /// enrich tasks/projects/skills, distinguish auto_load from references, and
 /// run reflection as work over SLC histories (NOT a separate mode).
-pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — рабочая инструкция агента
+pub const INSTRUCTIONS_PROMPT: &str = r#"# SLC Memory — Agent Working Contract
 
-Ты работаешь с системой памяти SLC (Smart Layered Context): единая база
-документов (проекты, задачи, скилы, знания), эпизодическая история с
-прогрессивной суммаризацией, фокусы, напоминания.
+SLC (Smart Layered Context) is the durable memory system for documents,
+projects, tasks, reusable skills, knowledge, progressively summarized history,
+focus items, and reminders.
 
-## Рабочий процесс (обязателен)
+## Mandatory workflow
 
-1. **Ищи перед тем, как отвечать.** На любой вопрос сначала `search` по
-   базе знаний; если есть активный документ — начни с него (`get_document`
-   по `get_active_document`). Не отвечай по памяти — SLC помнит за тебя.
-2. **Активируй контекст.** Когда работа идёт над проектом/задачей/скилом —
-   `activate_document` — документ станет контекст-якорем сита и будет
-   включён в `update_context`. Активируй один главный документ, не
-   несколько.
-3. **Веди работу документами.** Новая деятельность → `create_task` (или
-   `add_document` с category=task) и/или проект (`create_project`). Скилы —
-   это тоже документы (category=skill): инструкции «как делать X».
+1. **Search before answering.** Search the knowledge base first. If a document
+   is active, resolve it with `get_active_document` and load the full document
+   with `get_document`; do not rely on a search snippet or model memory.
+2. **Activate one context anchor.** When work concerns a project, task, skill,
+   or knowledge document, call `activate_document`. That document and its
+   `auto_load` links become the main context returned by `update_context`.
+3. **Represent ongoing work as documents.** Use `create_project`, `create_task`,
+   or `add_document` for new work. A skill is a document with `category=skill`.
+   Generated IDs are slugs without redundant `task_` or `project_` prefixes.
+   Canonical task statuses are `PENDING`, `IN_WORK`, `COMPLETED`, and
+   `CANCELLED`. Supply `project_id` when a task belongs to a project.
+4. **Update durable state while work evolves.** Use `update_task`,
+   `update_project`, or `update_document`; edit markdown bodies only through
+   their `diff` operations (`append`, `prepend`, `replace_section`, or
+   `remove_section`). Do not resend or overwrite an entire existing body.
+   History is raw evidence; maintained documents are the working artifact.
+5. **Keep link semantics precise.** `auto_load` contains working dependencies
+   that must load with the anchor. `references` contains passive citations that
+   are not needed in every context refresh. Do not put the same link in both.
+6. **Refresh and save context.** `update_context` returns base documents, the
+   active anchor, profiles, and focus items. Call `save_context` with a concise,
+   verified summary at meaningful checkpoints and before ending work. Never
+   store credentials, private keys, cookies, or client secrets.
 
-   **Создание задач/проектов (как это устроено):**
-   - id генерируется сам: транслит названия, БЕЗ категорийных префиксов
-     (`task_…`/`project_…` не добавляются) — папка уже несёт категорию;
-   - статусы — канонический набор: `PENDING` (новая), `IN_WORK`,
-     `COMPLETED`, `CANCELLED` (не lowercase);
-   - `project_id` при создании задачи привязывает её к проекту — документ
-     ложится в `docs/projects/<проект>/tasks/` (папка вычисляется из
-     `metadata.project`);
-   - `name` — короткое имя, `description` — markdown-тело задачи;
-   - `auto_load` — рабочие связи (см. п. 5), не дублируй в references.
-4. **Обогащай по ходу.** После значимых шагов обновляй документы
-   (`add_document` с тем же document_id — upsert): статусы, решения,
-   новые факты. История (remember) — это сырьё, а документы — рабочий
-   артефакт. Задачи/проекты обновляй ДИФФОМ (`update_task` c
-   `description_patch`: append / replace_section / remove_section) —
-   НЕ пересылай всю description целиком, если меняешь часть тела.
-5. **auto_load vs references (важно, не путай).**
-   - `auto_load` — РАБОЧИЕ связи: документы, которые должны подтягиваться
-     в контекст при обновлении этого документа (состав, зависимости,
-     связанные задачи). Ставь сюда то, что нужно видеть вместе.
-   - `references` — ПАССИВНЫЕ упоминания: документы, на которые этот
-     документ ссылается, но которые не нужны в контексте автоматически.
-   Не дублируй одно и то же в оба списка.
-6. **Контекст.** `update_context` возвращает текущий срез (базовые
-   документы + активный документ + профили + фокусы). Сохраняй снимок
-   (summary) в конце крупного этапа — это попадёт в историю.
+## Reflection is maintenance over history
 
-## Рефлексия (это работа над историями, а не отдельный режим)
+When enough work has accumulated, or reflection is requested:
 
-Периодически, когда накопилась работа (или пользователь просит
-«порефлексируй»), проведи рефлексию через тулы:
+1. Use `recall` for recent seat history and, when useful, `compress` and
+   `consolidate` to extract a compact factual view.
+2. Move verified decisions, facts, agreements, problems, and metrics into the
+   appropriate maintained documents using the update tools and body diffs.
+3. Review documents for stale status, facts, and links; repair missing
+   `auto_load`/`references` relationships and remove duplicates.
+4. Update current priorities with `focus_add`/`focus_update`, and close obsolete
+   items with `focus_remove`.
+5. The result of reflection is improved documents and focus state, not a prose
+   claim that reflection happened. If no changes are warranted, say so briefly.
 
-1. `recall` — возьми свежую историю сита (10–30 событий); при
-   необходимости `compress` (L1→L2) и `consolidate` (извлечение фактов),
-   чтобы увидеть сжатую картину.
-2. **Извлеки данные для документов.** Из историй вытащи: факты о
-   пользователе, решения, договорённости, проблемы, метрики. Обогащай
-   существующие документы (`add_document` с тем же id) или создавай новые
-   (проект/задача/скил/знание), если темы ещё нет.
-3. **Сделай ревью документов:** проверь актуальность (устаревшие статусы,
-   факты, связи), обнови содержимое, добавь недостающие связи
-   (auto_load/references), удали дубли.
-4. **Обнови фокусы:** `focus_add`/`focus_update` — что реально важно
-   сейчас; `focus_remove` — что закрыто.
-5. **Результат рефлексии** — это изменённые/новые документы и фокусы, а
-   не текст «я порефлексировал». Если менять нечего — так и скажи кратко.
+## Context budget and compression
 
-## Лимиты и компрессия контекста
+- `update_context` reports `limit_tokens`, `used_tokens`, `compressed`, and a
+  `warning` when compression occurs. The effective budget comes from the
+  `X-SLC-Context-Token-Limit` connection header, a seat-specific
+  `/limit <tokens>` value, or the server fallback, in that order.
+- Documents are never cut at an arbitrary character boundary. When necessary,
+  whole lower-priority blocks are omitted first, while the active document and
+  focus items remain; remaining documents may then be summarized by the LLM
+  while preserving names, numbers, decisions, and key facts.
+- When `compressed` is true, follow the warning, keep responses economical,
+  save a checkpoint, and retrieve omitted documents explicitly through search
+  or activation if the task needs them.
 
-- `update_context` возвращает `limit_tokens`/`used_tokens`/`compressed` и,
-  при сжатии, `warning`. Бюджет SLC — ТОКЕНЫ: 80% окна модели клиента (авто
-  при подключении) или `/limit <tokens>`.
-- **Документы НИКОГДА не обрезаются.** Если лимит превышен, компрессия:
-  1) исключаются целые блоки по приоритету (base-документы, затем
-     профили; активный документ и фокусы остаются);
-  2) если всё ещё не влезает — оставшиеся документы интеллектуально
-     сжимаются LLM (ключевые факты, имена, цифры).
-- При `compressed: true` реагируй на `warning`: сокращай ответы, сохраняй
-  снимок (`/save_context`), при необходимости верни исключённые документы
-  через поиск/активацию.
+## Agent lifecycle integration
 
-## Хуки для кодинг-агента (автоматизация контекста)
+The surrounding agent may already call `update_context` before a model
+iteration and `save_context` afterward. Use the injected context and do not
+duplicate a successful automatic call. Still update canonical tasks,
+documents, projects, and focus items after meaningful decisions; lifecycle
+snapshots do not replace document maintenance. Child runners, subagents, and
+cron jobs must use the same seat identity and lifecycle.
 
-Работая над кодом/задачами, автоматически:
+The server emits `context_updated` and `document_activated` events over SSE for
+clients that implement event-driven integration.
 
-1. **`update_context`** — после каждого значимого шага (закрыл задачу,
-   изменил план, принял решение): контекст всегда актуален.
-2. **`/save_context <summary>`** — в конце крупного этапа: снимок уходит
-   в историю для рефлексии и консолидации.
-3. **`activate_document`** — при смене темы работы (новая задача/проект/
-   скил) сразу переключай контекст-якорь.
-4. Сервер шлёт по SSE-каналу события `context_updated` и
-   `document_activated` — обёртки агента могут слушать их для триггеров
-   (например, авто-сохранение контекста после больших изменений).
+## Notifications
 
-## Напоминания
+Call `check_notifications` at the start of a work cycle; focus and timer
+notifications may require action.
 
-`check_notifications` в начале каждого хода — там могут быть фокус- или
-таймер-напоминания, требующие действий.
+## Renaming
+
+`rename_document` changes a document ID and cascades `auto_load`, `references`,
+project links, wiki links, and active seat pointers. Prefer `rename_task` and
+`rename_project` for those entity types because they accept a human-readable
+name and generate the new slug.
+
+## Paginating large responses
+
+When any tool response contains `_pagination` with
+`response_id`/`page`/`total_pages`, or says that the client budget truncated
+the response, retrieve every remaining page in order through
+`get_page(response_id=..., page=2..N)` and combine the content. Do not finish
+processing the response until all pages have been read.
+
+## Seat roles
+
+A seat with the server-configured `operator` role may manage another seat's
+active task/document, project status, and focus archive state only when the
+target is explicitly allowed by `SLC_SEAT_MANAGE_ACL`. The role alone grants no
+global authority. Omit `target_seat` for the caller's own state, and use
+`seat_roles` to inspect the effective role and allowed targets.
 "#;
 
 async fn build_context(
@@ -883,6 +1151,7 @@ async fn build_context(
     decisions: &[String],
     next_steps: &[String],
     include_base: bool,
+    context_token_limit: Option<usize>,
     events: &tokio::sync::broadcast::Sender<Value>,
 ) -> Result<Value, Value> {
     // persist a context snapshot if summary provided
@@ -947,11 +1216,12 @@ async fn build_context(
     //    in by dropping whole low-priority blocks (base docs first,
     //    then profiles), keeping the active document and focuses.
     // 3. The model is warned about the compression in the reply.
-    let limit_tokens = engine.context_limit_for(seat_id).await.map_err(json_err)?;
+    let seat_limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
+    let limit_tokens = effective_context_token_limit(context_token_limit, seat_limit);
     let mut docs: Vec<Value> = Vec::new();
     // ЕДИНАЯ единица бюджета — ТОКЕНЫ (~3 симв/токен, RU/EN смесь).
-    // Никаких байтовых ограничений вывода: размер окна определяет клиент
-    // (initialize / /limit), а об обрезке на своей стороне заботится харнес.
+    // Никаких байтовых ограничений вывода: бюджет задаёт клиент заголовком
+    // либо для seat через /limit, а об обрезке транспорта заботится харнес.
     let to_tokens = |chars: usize| chars.div_ceil(slc_core::CHARS_PER_TOKEN).max(1);
     let mut used_tokens = 0usize;
 
@@ -1073,16 +1343,16 @@ async fn build_context(
     let warning = if compressed || !llm_compressed.is_empty() {
         let mut parts = Vec::new();
         if !omitted.is_empty() {
-            parts.push(format!("исключены целые блоки: {}", omitted.join(", ")));
+            parts.push(format!("whole blocks omitted: {}", omitted.join(", ")));
         }
         if !llm_compressed.is_empty() {
             parts.push(format!(
-                "документы сжаты LLM: {}",
+                "documents summarized by the LLM: {}",
                 llm_compressed.join(", ")
             ));
         }
         Some(format!(
-            "ВНИМАНИЕ: контекст сжат — {}.                      Используй save_context/обогащение, чтобы вернуть нужное.",
+            "WARNING: context was compressed — {}. Use save_context and explicit document maintenance/search to restore required details.",
             parts.join("; ")
         ))
     } else {
@@ -1167,12 +1437,74 @@ async fn task_list(engine: &SlcEngine, _seat_id: Option<&str>) -> Result<Vec<Val
         .collect())
 }
 
+const STATE_MAX_CONTENT_CHARS: usize = 5 * 1024 * 1024;
+
+fn state_namespace(args: &Value) -> Result<&str, Value> {
+    let namespace = args
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if namespace.is_empty()
+        || namespace.len() > 64
+        || !namespace
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(json!({
+            "code": -32602,
+            "message": "namespace must be 1-64 ASCII letters, digits, '.', '_' or '-'"
+        }));
+    }
+    Ok(namespace)
+}
+
+fn state_key(args: &Value) -> Result<&str, Value> {
+    let key = args.get("key").and_then(Value::as_str).unwrap_or("");
+    if key.is_empty() || key.chars().count() > 512 || key.contains('\0') {
+        return Err(json!({
+            "code": -32602,
+            "message": "key must be 1-512 characters and contain no NUL"
+        }));
+    }
+    Ok(key)
+}
+
+fn state_document_id(seat_id: &str, namespace: &str, key: &str) -> String {
+    let identity = format!("{seat_id}\0{namespace}\0{key}");
+    format!("external_state_{}", slc_core::content_hash(&identity))
+}
+
+fn state_namespace_tag(namespace: &str) -> String {
+    format!("external-state-namespace-{namespace}")
+}
+
+fn state_etag(content: &str) -> String {
+    slc_core::content_hash(content)
+}
+
+fn state_document_matches(doc: &Document, seat_id: &str, namespace: &str, key: &str) -> bool {
+    doc.seat_id.as_deref() == Some(seat_id)
+        && doc
+            .metadata
+            .extra
+            .get("external_state_namespace")
+            .and_then(Value::as_str)
+            == Some(namespace)
+        && doc
+            .metadata
+            .extra
+            .get("external_state_key")
+            .and_then(Value::as_str)
+            == Some(key)
+}
+
 async fn call_tool(
     engine: &SlcEngine,
     seat_id: &str,
     name: &str,
     args: &Value,
     events: &tokio::sync::broadcast::Sender<Value>,
+    pagination: PaginationPolicy,
 ) -> Result<Value, Value> {
     engine
         .seats
@@ -1222,7 +1554,15 @@ async fn call_tool(
                     let summary = parts.collect::<Vec<_>>().join(" ");
                     let empty: Vec<String> = Vec::new();
                     build_context(
-                        engine, seat_id, &summary, &empty, &empty, &empty, true, events,
+                        engine,
+                        seat_id,
+                        &summary,
+                        &empty,
+                        &empty,
+                        &empty,
+                        true,
+                        pagination.context_token_limit,
+                        events,
                     )
                     .await
                 }
@@ -1236,7 +1576,15 @@ async fn call_tool(
                     }
                     let empty: Vec<String> = Vec::new();
                     build_context(
-                        engine, seat_id, &summary, &empty, &empty, &empty, true, events,
+                        engine,
+                        seat_id,
+                        &summary,
+                        &empty,
+                        &empty,
+                        &empty,
+                        true,
+                        pagination.context_token_limit,
+                        events,
                     )
                     .await
                 }
@@ -1255,16 +1603,15 @@ async fn call_tool(
                         "category": h.document.category.as_str(),
                         "folder": h.document.folder,
                         "score": h.rank_score,
-                        "snippet": h.document.content.chars().take(200).collect::<String>(),
                     })).collect::<Vec<_>>()}))
                 }
                 "help" => Ok(json!({"commands": [
-                    "/limit <chars> — установить лимит контекста (символы)",
-                    "/ctx — показать текущий срез контекста (лимит, активный документ, проекты, задачи, фокусы)",
-                    "/search <query> — поиск по документам БЗ",
-                    "/update_context [summary] — собрать контекст (как MCP-тул)",
-                    "/save_context <summary> — сохранить снимок контекста в историю",
-                    "/help — этот список",
+                    "/limit <tokens> — set the seat context budget in tokens",
+                    "/ctx — show the current context slice and active state",
+                    "/search <query> — search knowledge-base documents",
+                    "/update_context [summary] — build context like the MCP tool",
+                    "/save_context <summary> — save a context snapshot to history",
+                    "/help — show this list",
                 ]})),
                 other => {
                     return Err(
@@ -1286,7 +1633,7 @@ async fn call_tool(
                 "category": h.document.category.as_str(),
                 "folder": h.document.folder,
                 "score": h.rank_score,
-                "content": truncate(&h.document.content, 2000),
+                "content": h.document.content,
             })).collect::<Vec<_>>()})
         }
         "get_document" => {
@@ -1294,11 +1641,12 @@ async fn call_tool(
                 .get("document_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // Видимость: свой/публичный документ или сид с ролью operator.
             match engine.get_document(id).await.map_err(json_err)? {
-                Some(d) => {
-                    json!({"document_id": d.document_id, "category": d.category.as_str(), "content": d.content, "tags": d.tags, "metadata": d.metadata})
+                Some(d) if engine.can_read_document(seat_id, &d) => {
+                    json!({"document_id": d.document_id, "category": d.category.as_str(), "folder": d.folder, "content": d.content, "tags": d.tags, "metadata": d.metadata, "seat_id": d.seat_id, "auto_load": d.auto_load, "references": d.references, "created_at": d.created_at.to_rfc3339(), "updated_at": d.updated_at.to_rfc3339()})
                 }
-                None => json!({"error": format!("not found: {id}")}),
+                _ => json!({"error": format!("not found: {id}")}),
             }
         }
         "add_document" => {
@@ -1347,7 +1695,7 @@ async fn call_tool(
             json!({"events": docs.iter().map(|d| json!({
                 "document_id": d.document_id,
                 "level": d.metadata.doc_level.map(|l| l.as_str()),
-                "content": truncate(&d.content, 1000),
+                "content": d.content,
             })).collect::<Vec<_>>()})
         }
         "seat_info" => match engine.seats.get_seat(seat_id).await.map_err(json_err)? {
@@ -1398,18 +1746,27 @@ async fn call_tool(
             json!({"focus_id": item.focus_id, "priority": item.priority})
         }
         "focus_list" => {
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
+            engine
+                .require_seat_manage(seat_id, target)
+                .await
+                .map_err(json_err)?;
             let mind_type = args
                 .get("mind_type")
                 .and_then(|v| v.as_str())
                 .and_then(parse_mind);
             let items = engine
-                .focus_list(seat_id, mind_type)
+                .focus_list(target, mind_type)
                 .await
                 .map_err(json_err)?;
             json!({"focuses": items.iter().map(|f| json!({
                 "focus_id": f.focus_id, "title": f.title, "description": f.description,
                 "priority": f.priority, "depends_on": f.depends_on,
-            })).collect::<Vec<_>>()})
+            })).collect::<Vec<_>>(), "target_seat": target})
         }
         "focus_update" => {
             let focus_id = args.get("focus_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -1525,10 +1882,15 @@ async fn call_tool(
         "update_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
+            // Тело: diff (новый канон) или legacy description/description_patch
+            // (старые инструкции агентов) — принимаются оба.
             let description = args.get("description").and_then(|v| v.as_str());
-            let description_patch = args.get("description_patch").cloned();
+            let description_patch = args
+                .get("diff")
+                .cloned()
+                .or_else(|| args.get("description_patch").cloned());
             if description.is_some() && description_patch.is_some() {
-                return Err(json!({"code": -32602, "message": "pass either description (полная замена) or description_patch (дифф), не оба"}));
+                return Err(json!({"code": -32602, "message": "pass either full-replacement description or diff/description_patch, not both"}));
             }
             let project_id = args
                 .get("project_id")
@@ -1572,68 +1934,81 @@ async fn call_tool(
         }
         "activate_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
             let ok = engine
-                .task_activate(seat_id, task_id)
+                .task_activate_for(seat_id, target, task_id)
                 .await
                 .map_err(json_err)?;
-            json!({"success": ok, "task_id": task_id, "message": "Task activated"})
+            json!({"success": ok, "task_id": task_id, "target_seat": target, "message": "Task activated"})
         }
         "deactivate_task" => {
             // clear the active task pointer
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
             engine
                 .seats
-                .set_active_task(seat_id, None, None)
+                .set_active_task(target, None, None)
                 .await
                 .map_err(json_err)?;
-            json!({"success": true, "seat_id": seat_id, "message": "Task deactivated"})
+            json!({"success": true, "seat_id": target, "message": "Task deactivated"})
         }
-        "get_active_task" => match engine.task_get_active(seat_id).await.map_err(json_err)? {
-            Some(t) => {
-                json!({"success": true, "has_active_task": true, "task_id": t.task_id, "name": t.name, "description": t.description, "status": t.status, "project_id": t.project_id})
+        "get_active_task" => {
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
+            match engine.task_get_active(target).await.map_err(json_err)? {
+                Some(t) => {
+                    json!({"success": true, "has_active_task": true, "target_seat": target, "task_id": t.task_id, "name": t.name, "description": t.description, "status": t.status, "project_id": t.project_id})
+                }
+                None => json!({"success": true, "has_active_task": false, "target_seat": target, "message": "No active task"}),
             }
-            None => json!({"success": true, "has_active_task": false, "message": "No active task"}),
-        },
+        }
         "activate_document" => {
             let document_id = args
                 .get("document_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
             let ok = engine
-                .document_activate(seat_id, document_id)
+                .document_activate_for(seat_id, target, document_id)
                 .await
                 .map_err(json_err)?;
             if ok {
                 // Hook: notify subscribers (SSE) so automation can react.
                 let _ = events.send(json!({
-                    "type": "document_activated", "seat_id": seat_id, "document_id": document_id,
+                    "type": "document_activated", "seat_id": target, "document_id": document_id,
                 }));
-                json!({"success": true, "document_id": document_id, "message": "Document activated (context anchor)"})
+                json!({"success": true, "document_id": document_id, "target_seat": target, "message": "Document activated (context anchor)"})
             } else {
                 json!({"success": false, "error": format!("document not found: {document_id}")})
             }
         }
         "deactivate_document" => {
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
             engine
-                .document_deactivate(seat_id)
+                .document_deactivate_for(seat_id, target)
                 .await
                 .map_err(json_err)?;
-            json!({"success": true, "message": "Active document cleared"})
+            json!({"success": true, "target_seat": target, "message": "Active document cleared"})
         }
         "get_active_document" => {
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
             match engine
-                .document_get_active(seat_id)
+                .document_get_active(target)
                 .await
                 .map_err(json_err)?
             {
                 Some(d) => {
-                    json!({"success": true, "has_active_document": true, "document_id": d.document_id, "category": d.category.as_str(), "content": truncate(&d.content, 2000), "tags": d.tags})
+                    json!({"success": true, "has_active_document": true, "target_seat": target, "document_id": d.document_id, "category": d.category.as_str(), "content": d.content, "tags": d.tags})
                 }
                 None => {
-                    json!({"success": true, "has_active_document": false, "message": "No active document"})
+                    json!({"success": true, "has_active_document": false, "target_seat": target, "message": "No active document"})
                 }
             }
         }
         "list_tasks" => {
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
             let project_id = args
                 .get("project_id")
                 .and_then(|v| v.as_str())
@@ -1641,13 +2016,13 @@ async fn call_tool(
             let status = args.get("status").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
             let tasks = engine
-                .task_list(seat_id, project_id, status, limit)
+                .task_list(target, project_id, status, limit)
                 .await
                 .map_err(json_err)?;
             json!({"success": true, "tasks": tasks.iter().map(|t| json!({
                 "task_id": t.task_id, "name": t.name, "status": t.status,
                 "project_id": t.project_id, "auto_load_count": t.auto_load.len(),
-            })).collect::<Vec<_>>(), "count": tasks.len()})
+            })).collect::<Vec<_>>(), "count": tasks.len(), "target_seat": target})
         }
         // projects
         "create_project" => {
@@ -1671,9 +2046,12 @@ async fn call_tool(
                 .unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
             let description = args.get("description").and_then(|v| v.as_str());
-            let description_patch = args.get("description_patch").cloned();
+            let description_patch = args
+                .get("diff")
+                .cloned()
+                .or_else(|| args.get("description_patch").cloned());
             if description.is_some() && description_patch.is_some() {
-                return Err(json!({"code": -32602, "message": "pass either description (полная замена) or description_patch (дифф), не оба"}));
+                return Err(json!({"code": -32602, "message": "pass either full-replacement description or diff/description_patch, not both"}));
             }
             let auto_load = args.get("auto_load").map(|_| str_array(args, "auto_load"));
             let status = args.get("status").and_then(|v| v.as_str());
@@ -1731,16 +2109,18 @@ async fn call_tool(
             }
         }
         "list_projects" => {
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
             let status = args.get("status").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
             let projects = engine
-                .project_list(seat_id, status, limit)
+                .project_list(target, status, limit)
                 .await
                 .map_err(json_err)?;
             json!({"success": true, "projects": projects.iter().map(|p| json!({
                 "project_id": p.project_id, "name": p.name, "status": p.status,
                 "auto_load_count": p.auto_load.len(),
-            })).collect::<Vec<_>>(), "count": projects.len()})
+            })).collect::<Vec<_>>(), "count": projects.len(), "target_seat": target})
         }
         // profiles
         "get_user_profile" => match engine.get_user_profile(seat_id).await.map_err(json_err)? {
@@ -1793,13 +2173,31 @@ async fn call_tool(
                 .map_err(json_err)?
         }
         "set_page_limit" => {
-            let tokens = args
+            let Some(tokens) = args
                 .get("page_token_limit")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(16000) as usize;
+                .map(|value| value as usize)
+            else {
+                return Err(json!({"code": -32602, "message": "page_token_limit is required"}));
+            };
             engine.set_page_limit(tokens).await.map_err(json_err)?
         }
-        "get_page_settings" => engine.page_settings().await.map_err(json_err)?,
+        "get_page_settings" => {
+            let mut settings = engine.page_settings().await.map_err(json_err)?;
+            let effective_limit = match pagination.page_token_limit {
+                Some(limit) => limit,
+                None => engine.page_token_limit().await.map_err(json_err)?,
+            };
+            settings["effective_enabled"] = json!(pagination.enabled);
+            settings["effective_page_token_limit"] = json!(effective_limit);
+            settings["connection_override"] = json!({
+                "enabled": pagination.enabled
+                    != slc_core::pagination::pagination_enabled_from_env(),
+                "page_token_limit": pagination.page_token_limit.is_some(),
+                "context_token_limit": pagination.context_token_limit,
+            });
+            settings
+        }
         "update_context" => {
             let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
             let include_base = args
@@ -1817,6 +2215,32 @@ async fn call_tool(
                 &decisions,
                 &next_steps,
                 include_base,
+                pagination.context_token_limit,
+                events,
+            )
+            .await?
+        }
+        "save_context" => {
+            let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+            if summary.trim().is_empty() {
+                return Err(json!({"code": -32602, "message": "summary is required"}));
+            }
+            let include_base = args
+                .get("include_base_docs")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let changes = str_array(args, "changes");
+            let decisions = str_array(args, "decisions");
+            let next_steps = str_array(args, "next_steps");
+            build_context(
+                engine,
+                seat_id,
+                summary,
+                &changes,
+                &decisions,
+                &next_steps,
+                include_base,
+                pagination.context_token_limit,
                 events,
             )
             .await?
@@ -1835,6 +2259,80 @@ async fn call_tool(
             } else {
                 json!({"success": true, "module": module, "loaded_count": 0, "skipped_count": 0, "loaded_documents": []})
             }
+        }
+        "project_set_status" => {
+            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            match engine
+                .project_set_status_for(seat_id, target, project_id, status)
+                .await
+                .map_err(json_err)?
+            {
+                Some(p) => json!({"success": true, "project_id": p.project_id, "status": p.status, "target_seat": target, "message": format!("Project status set to {}", p.status)}),
+                None => json!({"success": false, "error": format!("project not found: {project_id}")}),
+            }
+        }
+        "focus_set_archived" => {
+            let focus_id = args.get("focus_id").and_then(|v| v.as_str()).unwrap_or("");
+            let archived = args.get("archived").and_then(|v| v.as_bool()).unwrap_or(false);
+            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let ok = engine
+                .focus_set_archived_for(seat_id, target, focus_id, archived)
+                .await
+                .map_err(json_err)?;
+            json!({"success": ok, "focus_id": focus_id, "archived": archived, "target_seat": target, "message": if ok { "Focus updated" } else { "Focus not found" }})
+        }
+        "seat_roles" => {
+            let q = args.get("seat_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let roles: Vec<&str> = engine
+                .seat_roles(q)
+                .iter()
+                .map(|r| r.as_str())
+                .collect();
+            json!({
+                "success": true,
+                "seat_id": q,
+                "roles": roles,
+                "can_manage_seats": engine.can_manage_seats(q),
+                "allowed_targets": engine.allowed_manage_targets(q),
+            })
+        }
+        "rename_document" => {
+            let document_id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let new_id = args.get("new_document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let report = engine
+                .rename_document(seat_id, document_id, new_id, None)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "old_id": report.old_id, "new_id": report.new_id,
+                   "links_fixed": report.links_fixed, "content_links_fixed": report.content_links_fixed,
+                   "seats_updated": report.seats_updated,
+                   "message": format!("Renamed {} → {}", report.old_id, report.new_id)})
+        }
+        "rename_task" => {
+            let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let new_name = args.get("new_name").and_then(|v| v.as_str()).unwrap_or("");
+            let report = engine
+                .rename_task(seat_id, task_id, new_name)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "old_id": report.old_id, "new_id": report.new_id,
+                   "name": new_name, "links_fixed": report.links_fixed,
+                   "seats_updated": report.seats_updated,
+                   "message": format!("Task renamed: {} → {}", report.old_id, report.new_id)})
+        }
+        "rename_project" => {
+            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let new_name = args.get("new_name").and_then(|v| v.as_str()).unwrap_or("");
+            let report = engine
+                .rename_project(seat_id, project_id, new_name)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "old_id": report.old_id, "new_id": report.new_id,
+                   "name": new_name, "links_fixed": report.links_fixed,
+                   "seats_updated": report.seats_updated,
+                   "message": format!("Project renamed: {} → {}", report.old_id, report.new_id)})
         }
         "list_documents" => {
             let category = args
@@ -1884,9 +2382,16 @@ async fn call_tool(
             let Some(mut doc) = engine.get_document(id).await.map_err(json_err)? else {
                 return Err(json!({"code": -32602, "message": format!("document not found: {id}")}));
             };
+            // Тело: content (legacy, полная замена) и/или diff — оба
+            // принимаются (старые инструкции агентов).
             if let Some(c) = args.get("content").and_then(|v| v.as_str()) {
                 doc.content = c.to_string();
                 doc.content_hash = slc_core::content_hash(c);
+            }
+            if let Some(patch) = args.get("diff").cloned() {
+                doc.content = slc_core::tasks::apply_description_patch(&doc.content, &patch)
+                    .map_err(|e| json!({"code": -32602, "message": e}))?;
+                doc.content_hash = slc_core::content_hash(&doc.content);
             }
             if let Some(t) = args.get("tags").and_then(|v| v.as_array()) {
                 doc.tags = t.iter().filter_map(|x| x.as_str().map(String::from)).collect();
@@ -1920,6 +2425,192 @@ async fn call_tool(
                 engine.store().kb_soft_delete(id).await.map_err(json_err)?
             };
             json!({"success": ok, "document_id": id, "purged": purge})
+        }
+        "state_get" => {
+            let namespace = state_namespace(args)?;
+            let key = state_key(args)?;
+            let id = state_document_id(seat_id, namespace, key);
+            match engine.store().kb_get(&id).await.map_err(json_err)? {
+                Some(doc) if state_document_matches(&doc, seat_id, namespace, key) => json!({
+                    "found": true,
+                    "namespace": namespace,
+                    "key": key,
+                    "content": doc.content,
+                    "content_type": doc.metadata.extra.get("external_state_content_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("text/plain; charset=utf-8"),
+                    "etag": state_etag(&doc.content),
+                    "version": doc.version,
+                    "updated_at": doc.updated_at.to_rfc3339(),
+                }),
+                _ => json!({"found": false, "namespace": namespace, "key": key}),
+            }
+        }
+        "state_put" => {
+            let namespace = state_namespace(args)?;
+            let key = state_key(args)?;
+            let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+            if content.chars().count() > STATE_MAX_CONTENT_CHARS {
+                return Err(json!({
+                    "code": -32602,
+                    "message": format!("content exceeds {STATE_MAX_CONTENT_CHARS} characters")
+                }));
+            }
+            let content_type = args
+                .get("content_type")
+                .and_then(Value::as_str)
+                .unwrap_or("text/plain; charset=utf-8");
+            let expected = args.get("expected_etag").and_then(Value::as_str);
+            let id = state_document_id(seat_id, namespace, key);
+            let existing = engine.store().kb_get(&id).await.map_err(json_err)?;
+            if let Some(ref doc) = existing {
+                if !state_document_matches(doc, seat_id, namespace, key) {
+                    return Err(json!({"code": -32009, "message": "external-state identity collision"}));
+                }
+            }
+            let actual = existing.as_ref().map(|doc| state_etag(&doc.content));
+            if let Some(expected) = expected {
+                let matches = if expected.is_empty() {
+                    actual.is_none()
+                } else {
+                    actual.as_deref() == Some(expected)
+                };
+                if !matches {
+                    return Err(json!({
+                        "code": -32009,
+                        "message": "external-state etag conflict",
+                        "expected_etag": expected,
+                        "actual_etag": actual,
+                    }));
+                }
+            }
+
+            let mut metadata = DocMeta::default();
+            metadata.extra.insert("external_state_namespace".into(), json!(namespace));
+            metadata.extra.insert("external_state_key".into(), json!(key));
+            metadata
+                .extra
+                .insert("external_state_content_type".into(), json!(content_type));
+            let seat_hash = slc_core::content_hash(seat_id);
+            let mut doc = Document::with_folder(
+                &id,
+                if namespace.contains("skill") {
+                    DocumentCategory::Skill
+                } else {
+                    DocumentCategory::Custom
+                },
+                Some(format!("external-state/{}/{}", &seat_hash[..16], namespace)),
+                content,
+                metadata,
+                vec!["external-state".into(), state_namespace_tag(namespace)],
+                Some(seat_id.into()),
+            );
+            if let Some(previous) = existing {
+                doc.created_at = previous.created_at;
+                doc.version = previous.version + 1;
+            }
+            engine.store().kb_replace(&doc).await.map_err(json_err)?;
+            json!({
+                "success": true,
+                "created": actual.is_none(),
+                "namespace": namespace,
+                "key": key,
+                "etag": state_etag(content),
+                "version": doc.version,
+            })
+        }
+        "state_list" => {
+            let namespace = state_namespace(args)?;
+            let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("");
+            if prefix.chars().count() > 512 || prefix.contains('\0') {
+                return Err(json!({"code": -32602, "message": "prefix exceeds 512 characters or contains NUL"}));
+            }
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(1000)
+                .clamp(1, 1000) as usize;
+            let docs = engine
+                .store()
+                .kb_find(
+                    &DocFilter {
+                        seat_id: Some(seat_id.into()),
+                        tags_all: vec!["external-state".into(), state_namespace_tag(namespace)],
+                        ..Default::default()
+                    },
+                    &DocSort::by_updated(SortDir::Desc),
+                    1000,
+                )
+                .await
+                .map_err(json_err)?;
+            let objects = docs
+                .iter()
+                .filter_map(|doc| {
+                    let key = doc
+                        .metadata
+                        .extra
+                        .get("external_state_key")
+                        .and_then(Value::as_str)?;
+                    if !key.starts_with(prefix) {
+                        return None;
+                    }
+                    Some(json!({
+                        "key": key,
+                        "content_type": doc.metadata.extra.get("external_state_content_type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("text/plain; charset=utf-8"),
+                        "etag": state_etag(&doc.content),
+                        "version": doc.version,
+                        "size_chars": doc.content.chars().count(),
+                        "updated_at": doc.updated_at.to_rfc3339(),
+                    }))
+                })
+                .take(limit)
+                .collect::<Vec<_>>();
+            json!({
+                "success": true,
+                "namespace": namespace,
+                "prefix": prefix,
+                "count": objects.len(),
+                "objects": objects,
+            })
+        }
+        "state_delete" => {
+            let namespace = state_namespace(args)?;
+            let key = state_key(args)?;
+            let id = state_document_id(seat_id, namespace, key);
+            let existing = engine.store().kb_get(&id).await.map_err(json_err)?;
+            if let Some(doc) = existing {
+                if !state_document_matches(&doc, seat_id, namespace, key) {
+                    return Err(json!({"code": -32009, "message": "external-state identity collision"}));
+                }
+                if let Some(expected) = args.get("expected_etag").and_then(Value::as_str) {
+                    let actual = state_etag(&doc.content);
+                    if expected != actual {
+                        return Err(json!({
+                            "code": -32009,
+                            "message": "external-state etag conflict",
+                            "expected_etag": expected,
+                            "actual_etag": actual,
+                        }));
+                    }
+                }
+                let deleted = engine.store().kb_purge(&id).await.map_err(json_err)?;
+                let _ = engine.store().delete_embeddings(&id).await;
+                json!({
+                    "success": true,
+                    "deleted": deleted,
+                    "namespace": namespace,
+                    "key": key,
+                })
+            } else {
+                json!({
+                    "success": true,
+                    "deleted": false,
+                    "namespace": namespace,
+                    "key": key,
+                })
+            }
         }
         "document_stats" => {
             let mut by_cat = serde_json::Map::new();
@@ -1970,7 +2661,14 @@ async fn call_tool(
         }
         "list_seats" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-            let seats = engine.seats.list_active(limit).await.map_err(json_err)?;
+            let seats = engine
+                .seats
+                .list_active(limit)
+                .await
+                .map_err(json_err)?
+                .into_iter()
+                .filter(|seat| engine.can_manage_target(seat_id, &seat.seat_id))
+                .collect::<Vec<_>>();
             json!({
                 "seats": seats.iter().map(|s| json!({
                     "seat_id": s.seat_id,
@@ -2006,7 +2704,12 @@ async fn call_tool(
     let _ = engine.seats.record_tool_use(seat_id, name, 0).await;
     let mut text = text.to_string();
     // Inject pending notifications into the tool response (UX channel).
-    if name != "pop_notifications" {
+    // Machine-oriented external-state operations must remain parseable JSON.
+    // Human notification prose is useful on interactive knowledge tools, but
+    // appending it would corrupt the generic state backend contract for every
+    // MCP client, not just Hermes.
+    let tool_text = text.clone();
+    if name != "pop_notifications" && !name.starts_with("state_") {
         if let Ok(notes) = engine.pop_notifications(seat_id, 3).await {
             if !notes.is_empty() {
                 let mut block = String::from("\n\n📬 Notifications:");
@@ -2022,19 +2725,72 @@ async fn call_tool(
     // outputSchema. Схем у наших тулов нет, поэтому для БОЛЬШИХ ответов
     // дубль не отдаём — он удваивал вывод (text + structuredContent) и
     // выводил за resultBudget харнеса (обрезка strategy=truncate).
-    if text.chars().count() <= 2000 {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+    if tool_text.chars().count() <= 2000 {
+        if let Ok(parsed) = serde_json::from_str::<Value>(&tool_text) {
             result["structuredContent"] = parsed;
         } else {
-            result["structuredContent"] = json!({"text": text});
+            result["structuredContent"] = json!({"text": tool_text});
         }
     }
     // Pagination envelope: cache oversized list responses and tag them.
-    if text.chars().count() > 20000 {
-        let response_id = uid("resp");
-        if let Ok(paginated) = engine.paginate(seat_id, &response_id, &result).await {
-            if let Some(page) = paginated.get("_pagination") {
-                result["_pagination"] = page.clone();
+    // Paginate the inner JSON value rather than the MCP ContentBlock array;
+    // otherwise `content` itself looks like the list and no useful split is
+    // possible. This is an application-level SLC tool contract layered on
+    // ordinary MCP TextContent, so it remains consumable by any MCP client.
+    let pagination_candidate = !matches!(
+        name,
+        "get_page" | "delete_response" | "set_page_limit" | "get_page_settings"
+    );
+    if pagination.enabled && pagination_candidate {
+        let effective_page_token_limit = match pagination.page_token_limit {
+            Some(limit) => limit,
+            None => engine.page_token_limit().await.map_err(json_err)?,
+        };
+        let pagination_threshold = effective_page_token_limit
+            .saturating_mul(slc_core::pagination::CHARS_PER_TOKEN);
+        if tool_text.chars().count() > pagination_threshold {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&tool_text) {
+                let response_id = uid("resp");
+                let paginated = engine
+                    .paginate_with_limit(
+                        seat_id,
+                        &response_id,
+                        &parsed,
+                        effective_page_token_limit,
+                    )
+                    .await
+                    .map_err(json_err)?;
+                if let Some(page) = paginated.get("_pagination") {
+                    result["_pagination"] = page.clone();
+                    // The first page contains only whole items. Remaining
+                    // items are available through the advertised get_page
+                    // tool without relying on a client-side patch.
+                    if let Ok(page_text) = serde_json::to_string(&paginated) {
+                        let notification_suffix = text
+                            .strip_prefix(&tool_text)
+                            .unwrap_or_default()
+                            .to_string();
+                        text = page_text;
+                        // Give every client an explicit, tool-level recovery
+                        // path for the remaining pages.
+                        if let (Some(pid), Some(total)) = (
+                            page.get("response_id").and_then(|v| v.as_str()),
+                            page.get("total_pages").and_then(|v| v.as_u64()),
+                        ) {
+                            if total > 1 {
+                                text.push_str(&format!(
+                                    "\n\n📄 Paginated response: page 1 of {total}.\n"
+                                ));
+                                text.push_str(&format!(
+                                    "Retrieve every remaining page in order with get_page(response_id={pid}, page=2..{total}), one page per call, and combine the items.\n"
+                                ));
+                                text.push_str("Do not finish processing the response until all pages have been retrieved.");
+                            }
+                        }
+                        text.push_str(&notification_suffix);
+                        result["content"][0]["text"] = json!(text);
+                    }
+                }
             }
         }
     }
@@ -2067,14 +2823,6 @@ fn uid(prefix: &str) -> String {
     format!("{prefix}_{}", &u[..12])
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
-    }
-}
-
 /// SSE fan-out filter: forward `evt` only to the subscriber of `seat`.
 /// Deny-by-default — an event WITHOUT a `seat_id` goes to nobody: it carries
 /// no routing context, and broadcasting it to every subscriber would leak
@@ -2084,6 +2832,10 @@ fn seat_matches_event(evt: &serde_json::Value, seat: &str) -> bool {
         .and_then(|v| v.as_str())
         .map(|s| s == seat)
         .unwrap_or(false)
+}
+
+fn ping_result() -> Value {
+    json!({})
 }
 
 #[cfg(test)]
@@ -2114,5 +2866,89 @@ mod seat_filter_tests {
             &json!({"type": "x", "seat_id": 42}),
             "cursor-1"
         ));
+    }
+
+    #[test]
+    fn ping_result_is_an_mcp_response_object() {
+        assert_eq!(ping_result(), json!({}));
+        assert!(ping_result().is_object());
+    }
+
+    #[test]
+    fn pagination_transport_overrides_are_connection_scoped() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-slc-pagination", "disabled".parse().unwrap());
+        headers.insert("x-slc-page-token-limit", "25000".parse().unwrap());
+        headers.insert(
+            "x-slc-context-token-limit",
+            "100000".parse().unwrap(),
+        );
+        let policy = pagination_policy_from_request(&headers);
+        assert!(!policy.enabled);
+        assert_eq!(policy.page_token_limit, Some(25_000));
+        assert_eq!(policy.context_token_limit, Some(100_000));
+
+        assert_eq!(effective_context_token_limit(Some(300_000), 100_000), 300_000);
+        assert_eq!(effective_context_token_limit(None, 100_000), 100_000);
+
+        headers.insert("x-slc-pagination", "enabled".parse().unwrap());
+        headers.insert("x-slc-page-token-limit", "350000".parse().unwrap());
+        let policy = pagination_policy_from_request(&headers);
+        assert!(policy.enabled);
+        assert_eq!(policy.page_token_limit, Some(350_000));
+    }
+
+    #[test]
+    fn jsonrpc_notifications_are_distinguished_from_requests_and_responses() {
+        assert!(is_jsonrpc_notification(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        })));
+        assert!(is_jsonrpc_notification(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 7}
+        })));
+        assert!(is_jsonrpc_notification(&json!({
+            "jsonrpc": "2.0",
+            "method": "vendor/custom-notification"
+        })));
+        assert!(!is_jsonrpc_notification(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping"
+        })));
+        assert!(!is_jsonrpc_notification(&json!({
+            "jsonrpc": "2.0",
+            "id": "sampling-1",
+            "result": {"content": []}
+        })));
+    }
+
+    #[test]
+    fn external_state_identity_is_seat_and_namespace_scoped() {
+        let first = state_document_id("seat-a", "hermes-memory", "MEMORY.md");
+        assert_eq!(
+            first,
+            state_document_id("seat-a", "hermes-memory", "MEMORY.md")
+        );
+        assert_ne!(
+            first,
+            state_document_id("seat-b", "hermes-memory", "MEMORY.md")
+        );
+        assert_ne!(
+            first,
+            state_document_id("seat-a", "hermes-skills", "MEMORY.md")
+        );
+    }
+
+    #[test]
+    fn external_state_namespace_validation_is_strict() {
+        assert_eq!(
+            state_namespace(&json!({"namespace": "hermes-skills.v1"})).unwrap(),
+            "hermes-skills.v1"
+        );
+        assert!(state_namespace(&json!({"namespace": "../escape"})).is_err());
+        assert!(state_namespace(&json!({"namespace": ""})).is_err());
     }
 }

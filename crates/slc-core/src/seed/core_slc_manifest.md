@@ -27,8 +27,8 @@ Compression on budget overflow:
 - If still over — LLM summarization of remaining docs.
 - Response includes `compressed: true` + `warning`.
 
-Budget: `/limit N` (TOKENS; ~3 chars per token) or
-`SLC_CONTEXT_LIMIT_TOKENS` env var. Default: 100000 tokens.
+Budget: `X-SLC-Context-Token-Limit` per connection, `/limit N` per seat, or
+the `SLC_CONTEXT_LIMIT_TOKENS` fallback. Default: 100000 tokens.
 
 ## Documents
 
@@ -132,8 +132,11 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 ### Pagination
 - `get_page(response_id, page)` — response page
 - `delete_response(response_id)` — delete cached response
-- `set_page_limit(page_token_limit)` — page size
-- `get_page_settings` — current settings
+- `set_page_limit(page_token_limit)` — persisted default page size (the
+  operator's `SLC_PAGE_TOKEN_LIMIT` environment value has precedence)
+- `get_page_settings` — server defaults and effective connection settings
+- When `_pagination.total_pages > 1`, retrieve every remaining page in order
+  with `get_page` before interpreting or acting on the result.
 
 ### Other
 - `seat_info` — seat info + usage stats
@@ -157,7 +160,9 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SLC_VAULT_PATH` | `~/.slc/vault` | Vault path |
-| `SLC_CONTEXT_LIMIT_TOKENS` | `100000` | Context limit (tokens; ~3 chars each) |
+| `SLC_CONTEXT_LIMIT_TOKENS` | `100000` | Fallback context budget when neither the connection nor seat specifies one |
+| `SLC_PAGINATION_ENABLED` | `true` | Enable pagination for large list-shaped MCP tool results |
+| `SLC_PAGE_TOKEN_LIMIT` | `50000` | Approximate page size and pagination threshold in tokens |
 | `SLC_LLM` | auto | Provider: hash/ollama/lmstudio/candle |
 | `LMSTUDIO_URL` | — | LM Studio URL |
 | `LMSTUDIO_MODEL` | `google/gemma-4-e4b` | Reasoning model |
@@ -170,6 +175,11 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 | `SLC_MCP_AUTH` | `legacy_seat_id` | Auth: legacy_seat_id / bearer_plus_seat / embedded |
 | `SLC_MCP_TOKEN` | — | Bearer token for auth |
 | `OBSIDIAN_AUTO_GIT_COMMIT` | `false` | Auto git commit on vault writes |
+
+Per-connection MCP HTTP headers: `X-SLC-Pagination`,
+`X-SLC-Page-Token-Limit`, and `X-SLC-Context-Token-Limit`. Explicit context
+limits are deployment configuration; SLC does not infer them from model names
+or hard-code model-window tiers.
 
 ## SSE Events
 

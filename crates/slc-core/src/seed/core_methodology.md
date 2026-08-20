@@ -222,7 +222,8 @@ Compression happens automatically by timer or manually via `compress_now`.
 ### Context Window
 
 - Assembled from: active document + focuses + profiles + core documents
-- Limit: `/limit N` or `SLC_CONTEXT_LIMIT_CHARS`
+- Limit: `X-SLC-Context-Token-Limit`, `/limit N`, or the
+  `SLC_CONTEXT_LIMIT_TOKENS` fallback
 - Compression: block dropping → LLM summarization
 - Snapshots: `/save_context <summary>` saves to history
 

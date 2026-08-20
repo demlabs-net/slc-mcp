@@ -181,7 +181,7 @@ impl<S: StorageBackend> WorkItemManager<S> {
     /// Говорящий id — транслит названия БЕЗ категорийного префикса
     /// (папка уже несёт категорию: `tasks/`, `docs/projects/<p>/tasks/`),
     /// при коллизии — `_2`, `_3`…; пустой слаг — unique_id fallback.
-    async fn speaking_id(&self, name: &str) -> String {
+    pub(crate) async fn speaking_id(&self, name: &str) -> String {
         let slug = crate::model::slug_name(name);
         if slug.is_empty() {
             return crate::model::unique_id("task");
@@ -409,7 +409,7 @@ impl<S: StorageBackend> WorkItemManager<S> {
 
 // helper on Document for seat-visibility of KB docs (extension trait)
 impl crate::model::Document {
-    fn is_kb_visible(&self, seat_id: &str) -> bool {
+    pub(crate) fn is_kb_visible(&self, seat_id: &str) -> bool {
         match &self.seat_id {
             None => true,
             Some(owner) => owner == seat_id,

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/slc-core", "crates/slc-mcp", "crates/slc-webui"]
+members = ["crates/slc-core", "crates/slc-mcp"]
 
 [workspace.package]
 edition = "2024"
@@ -28,6 +28,8 @@ dotenvy = "0.15"
 axum = { version = "0.8", features = ["json"] }
 futures = "0.3"
 async-stream = "0.3"
+jsonwebtoken = "9"
+bcrypt = "0.15"
 slc-core = { path = "crates/slc-core" }
 
 [profile.release]

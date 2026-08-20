@@ -50,7 +50,7 @@ Call when:
 When `consolidate_now` extracts facts, they become permanent KB documents. Good facts:
 - "The Rust server uses axum with tower-http middleware"
 - "Database migrations live in crates/slc-core/src/storage/"
-- "The client sends context_limit_chars during initialize"
+- "The deployment gives each MCP client an explicit context-token budget"
 
 Bad facts (too vague or ephemeral):
 - "There was a bug"
