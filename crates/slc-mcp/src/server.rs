@@ -65,7 +65,9 @@ pub async fn run(
         auth: std::sync::Arc::new(auth_state),
     });
     let app = Router::new()
-        .route("/mcp", post(mcp))
+        // Streamable-HTTP клиенты (go-sdk / Yandex AI Studio) открывают
+        // SSE-поток GET-ом на URL сервера — отдаём тот же стрим, что и /sse.
+        .route("/mcp", get(sse_endpoint).post(mcp))
         .route("/sse", get(sse_endpoint))
         .route("/messages", post(messages))
         .route("/health", get(health))
