@@ -1,94 +1,133 @@
 # SLC MCP
 
-SLC (Smart Layered Context) — движок памяти для кодинг-агентов: единая база
-документов (проекты, задачи, скилы, знания), эпизодическая история с
-прогрессивной суммаризацией, гибридный поиск (семантика + BM25), фокусы,
-напоминания. Работает как MCP-сервер (`tools` + `prompts`) и CLI.
+Rust MCP server for shared agent context: knowledge documents, projects,
+tasks, episodic history, focuses, reminders, hybrid semantic/BM25 search, and
+per-seat working context. Obsidian is the default storage backend.
 
-## Развертывание: `slc-mcp init`
-
-Модель эмбеддингов **никогда не скачивается автоматически** на первый
-запрос — её готовит консольный визард:
+## Local run
 
 ```bash
-slc-mcp init
+cp .env.example .env
+cargo run -p slc-mcp -- serve --port 3000
 ```
 
-Визард спрашивает:
+The service exposes:
 
-1. **Провайдер эмбеддингов**:
-   - `candle` — встроенный инференс (модель качается на эту машину);
-   - `ollama` / `lmstudio` — внешний GPU-сервер;
-   - `hash` — CPU-эмбеддинги без моделей (слабые машины, виртуалки).
-2. **Устройство** для candle (`auto` | `cuda` | `metal` | `cpu`; визард
-   показывает, что обнаружено).
-3. **Модель**: по умолчанию `BAAI/bge-m3` (1024-мер, мультиязычная, RU) на
-   GPU и `intfloat/multilingual-e5-small` (384-мер) на CPU; можно указать
-   любой HF repo id.
+- MCP: `POST /mcp`
+- health: `GET /health`
+- REST/UI: `GET /api/*` and `/`
 
-Затем визард **сразу скачивает модель** в кэш Hugging Face
-(`~/.cache/huggingface`), записывает `.env` (`SLC_LLM`, `SLC_EMBED_DEVICE`,
-`SLC_EMBED_MODEL`) и делает контрольный эмбеддинг. Неинтерактивно:
+Set `SLC_VAULT_PATH` to the Obsidian vault. Inference is configured with
+`SLC_LLM` and the matching provider variables; the development swarm uses the
+OpenAI-compatible LM Studio endpoint and models from `.env`.
+
+The MCP endpoint is standard Streamable HTTP and currently negotiates MCP
+`2025-03-26`. It returns an object result for legacy `ping` requests and
+accepts JSON-RPC notifications with HTTP 202 and an empty body. No Hermes
+patch is required: compatibility is verified with the official MCP SDK as an
+independent client. Newer protocol revisions that omit `ping` continue to use
+the same initialize/tools flow.
+
+`update_context` applies only the seat's configured context-token budget. It
+does not invoke an LLM merely to fit a Hermes- or vendor-specific output cap.
+Large list-shaped tool results can use SLC's advertised `get_page` extension;
+the extension is carried in ordinary MCP `TextContent` and needs no transport
+patch in the client. When more than one page exists, page one ends with an
+explicit instruction to retrieve every remaining page in order before acting
+on the result.
+
+Pagination is enabled by default. `SLC_PAGINATION_ENABLED` toggles it for the
+server and `SLC_PAGE_TOKEN_LIMIT` sets both the approximate page size and the
+threshold at which a list response is paginated (default `50000` tokens).
+`set_page_limit` persists the default when no environment override is present.
+An MCP client may override response shaping for only its own HTTP connection:
+
+- `X-SLC-Pagination: enabled|disabled`
+- `X-SLC-Page-Token-Limit: <tokens>`
+- `X-SLC-Context-Token-Limit: <tokens>` sets the `update_context` and
+  `save_context` budget for that connection without changing the seat-wide
+  value.
+
+`SLC_CONTEXT_LIMIT_TOKENS` is a fallback, not a maximum (default `100000`).
+Clients should choose their own budget explicitly through the connection
+header or persist a seat-specific value with `command {"input":"/limit N"}`.
+For example, deployments may choose 50K, 100K, or 300K for different model
+windows; these are configuration examples and are not model tiers built into
+SLC.
+
+These are optional HTTP transport headers; the JSON-RPC/MCP message format is
+unchanged, so clients using the official SDK remain fully compatible.
+
+The generic seat-scoped `state_get`, `state_put`, `state_list`, and
+`state_delete` tools expose optimistic-concurrency text objects for external
+memory, skills, or other clients. They are ordinary MCP tools, not a
+Hermes-specific transport. `expected_etag` prevents silent concurrent
+overwrites; SLC also isolates every object by the authenticated `X-Seat-ID`.
+
+## agent-dev-0 deployment
+
+The development swarm uses:
+
+- source: `/opt/demlabs-dev-swarm/slc-mcp`
+- container: `dev-swarm-slc-mcp`
+- vault: `/opt/demlabs-dev-swarm/slc-vault`
+- MCP from swarm containers: `http://slc-mcp:3000/mcp`
+- host MCP: `http://127.0.0.1:3000/mcp`
+- web UI: `http://agent-dev-0:2002`
+- private Forgejo repository: `devops/slc-vault`
+
+Deploy with:
 
 ```bash
-slc-mcp init --llm candle --device cpu --model intfloat/multilingual-e5-small
+docker compose -f docker-compose.agent-dev.yml up -d --build
 ```
 
-### Выбор провайдера по умолчанию
+The vault is an independent Git repository. Runtime Git access uses a
+write-enabled deploy key from `slc-mcp/secrets/`; secrets and the vault itself
+must never be committed to this source repository. With
+`OBSIDIAN_AUTO_GIT_COMMIT=true`, document and operational sidecar writes are
+committed and pushed automatically. Volatile seat access heartbeats are
+coalesced to avoid a push for every read-only MCP request.
 
-- Явный `SLC_LLM` (`hash` | `ollama` | `lmstudio` | `candle`) — всегда его;
-  если он отвалился, поиск честно деградирует в text-only (без тихого
-  переключения).
-- Ничего не задано: GPU есть и модель скачана → candle; иначе → hash.
+## Seats and lifecycle
 
-## Запуск
+The swarm authenticates with `SLC_MCP_AUTH=legacy_seat_id`. Every role sends
+its unique stable seat in the `X-Seat-ID` header. The manager has the
+`operator` role, but cross-seat access remains fail-closed: a target must also
+be listed explicitly in `SLC_SEAT_MANAGE_ACL`.
+
+Hermes hooks call `update_context` before every model iteration and
+`save_context` afterward. Cron runs and delegated subagents use the same
+hooks. Developer and junior DeepSeek Harness runners receive the SLC URL and
+seat header from their wrapper, which also records runner-start and runner-end
+lifecycle snapshots. Hermes' built-in memory and agent-created skill tree use
+the same seat through the generic external-state tools; the container-local
+writable tree is only a process cache.
+
+## Mongo migration
+
+Back up MongoDB first, then import into an empty vault:
 
 ```bash
-slc-mcp serve --port 3000          # MCP: POST /mcp, SSE /sse, /health
-# хранилище: Obsidian vault (default), --sqlite, --mongodb
+slc-mcp migrate \
+  --from-mongo mongodb://HOST:27017 \
+  --db slc_mcp \
+  --vault /path/to/slc-vault
 ```
 
-## Управление CLI
+Legacy document, task, and project IDs are preserved by default so active
+seat pointers and references remain valid. Use `--rename-with-ai` only for an
+explicit, reviewed rename migration. Disable automatic Git commits during a
+bulk import, reindex embeddings afterward, inspect the migration report, and
+create the initial vault commit only after validation.
 
-| Команда | Что делает |
-|---|---|
-| `slc-mcp init` | Визард развертывания: провайдер, модель, скачивание, `.env` |
-| `slc-mcp reindex-embeddings [--seat X]` | Пересобрать эмбеддинги после смены модели/настроек |
-| `slc-mcp search "<query>" [--seat X]` | Гибридный поиск |
-| `slc-mcp status` | Бэкенд и путь хранилища |
-| `slc-mcp remember/compress/consolidate` | Эпизодика и суммаризация |
-| `slc-mcp migrate --from <legacy>` | Миграция легаси-ваулта (id → слаги, папки) |
-| `slc-mcp migrate --from-mongo [URI] --db slc_mcp [--rename-with-ai]` | Миграция легаси-Mongo: БЗ + history → episodic + проекты/задачи (`docs/projects/<p>/`) + сиды; `--rename-with-ai` переименовывает id через LLM из `.env` и правит `auto_load`/`references` |
-
-Сменил модель в `init`? Пересобери эмбеддинги:
+Useful commands:
 
 ```bash
 slc-mcp reindex-embeddings
+slc-mcp search "query" --seat SEAT_ID
+slc-mcp status
 ```
 
-Поиск сам отфильтровывает записи от другой модели (по размерности) и при
-первом поиске лениво пересобирает устаревшие, так что даже без `reindex`
-ничего не сломается.
-
-## Инференс
-
-Каскад (в порядке приоритета): **внешний GPU-сервер → встроенный candle →
-CPU-hash**. Подробности в `crates/slc-core/src/candle_emb.rs`:
-
-- `SLC_LLM=hash` — детерминированные hash-эмбеддинги, без моделей;
-- `SLC_LLM=candle` — встроенный инференс (candle): GPU → `bge-m3`, CPU →
-  `e5-small`; модель грузится из кэша (автоскачивания нет);
-- `SLC_LLM=ollama` / `lmstudio` — внешние серверы (reasoning + embeddings);
-- `SLC_MCP_SAMPLING=true` — инференс через MCP-клиента (sampling), эмбеддинги
-  недоступны → text-only поиск.
-
-GPU-бэкенды: **CUDA** (Linux/Windows, собери с `--features slc-core/cuda`,
-нужен CUDA toolkit) → `bge-m3` на GPU; на **macOS** candle работает на
-Accelerate-ускоренном CPU (Metal-бэкенд candle не поддерживает layer-norm —
-проверено e2e), поэтому `init` предложит `e5-small`; CPU-машины без моделей
-→ hash.
-
-## Хуки для харнеса
-
-Готовый hook-скрипт, который обвязка дёргает в конце каждого агент-лупа и
-который автоматически сохраняет контекст в SLC — см. [`hooks/README.md`](hooks/README.md).
+The migrated legacy Mongo data should be retained separately for rollback;
+the production service does not need Mongo after a successful cutover.
