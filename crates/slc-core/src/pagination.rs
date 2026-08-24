@@ -16,17 +16,46 @@ use serde_json::{json, Value};
 
 pub const COLLECTION: &str = "paginated_responses";
 
-/// Min / max page sizes in tokens (legacy constants).
-pub const MIN_PAGE_TOKEN_LIMIT: usize = 500;
-pub const MAX_PAGE_TOKEN_LIMIT: usize = 100_000;
-/// 5000 токенов ≈ 20K симв ≈ 20-40K байт: страница гарантированно влезает
-/// в типовой resultBudget харнеса (50K байт на вывод одного тула).
-pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 5_000;
+/// Default page size. Clients with a smaller result budget can override it
+/// per connection with `X-SLC-Page-Token-Limit`.
+pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 50_000;
 
-/// Rough chars-per-token estimate (legacy CHARS_PER_TOKEN=4).
-pub const CHARS_PER_TOKEN: usize = 4;
+/// Rough chars-per-token estimate (RU/EN смесь, как в движке).
+pub const CHARS_PER_TOKEN: usize = 3;
 /// Auto-delete responses after this long.
 pub const TTL_SECONDS: i64 = 600; // 10 min
+
+/// Global pagination default. Individual MCP connections may override this
+/// through transport metadata without mutating server-wide state.
+pub fn pagination_enabled_from_env() -> bool {
+    std::env::var("SLC_PAGINATION_ENABLED")
+        .ok()
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(true)
+}
+
+/// Parse and clamp the operator-provided page size. Returning `None` keeps
+/// persisted settings usable when the environment variable is absent.
+pub fn page_token_limit_from_env() -> Option<usize> {
+    std::env::var("SLC_PAGE_TOKEN_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(normalize_page_token_limit)
+}
+
+pub fn normalize_page_token_limit(tokens: usize) -> usize {
+    // The operator/client owns its transport budget. Only zero is invalid;
+    // do not impose a model-window policy or silently cap large contexts.
+    tokens.max(1)
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
 
 /// Page-splitting + retrieval, backed by the records store.
 #[derive(Clone)]
@@ -39,18 +68,53 @@ impl<S: StorageBackend> Paginator<S> {
         Paginator { store }
     }
 
-    fn page_token_limit(&self) -> usize {
-        std::env::var("SLC_PAGE_TOKEN_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .map(|v: usize| v.clamp(MIN_PAGE_TOKEN_LIMIT, MAX_PAGE_TOKEN_LIMIT))
-            .unwrap_or(DEFAULT_PAGE_TOKEN_LIMIT)
+    async fn stored_page_token_limit(&self) -> SlcResult<Option<usize>> {
+        for key in ["settings", "settings:prod"] {
+            let Some(settings) = self.store.get_record(COLLECTION, key).await? else {
+                continue;
+            };
+            let value = settings
+                .get("page_token_limit")
+                .or_else(|| settings.get("limit_tokens"))
+                .and_then(Value::as_u64)
+                .map(|tokens| normalize_page_token_limit(tokens as usize));
+            if value.is_some() {
+                return Ok(value);
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn page_token_limit(&self) -> SlcResult<usize> {
+        if let Some(tokens) = page_token_limit_from_env() {
+            return Ok(tokens);
+        }
+        Ok(self
+            .stored_page_token_limit()
+            .await?
+            .unwrap_or(DEFAULT_PAGE_TOKEN_LIMIT))
     }
 
     /// Cache a response, splitting it into pages. Returns the paginated
     /// result (with `_pagination`). If the payload fits one page, returns it
     /// directly with a single-page envelope.
     pub async fn paginate(&self, _seat_id: &str, response_id: &str, data: &Value) -> SlcResult<Value> {
+        let page_token_limit = self.page_token_limit().await?;
+        self.paginate_with_limit(_seat_id, response_id, data, page_token_limit)
+            .await
+    }
+
+    /// Paginate with an explicit per-connection page size. This is used by
+    /// MCP transport metadata and keeps one client from changing another
+    /// client's response shape.
+    pub async fn paginate_with_limit(
+        &self,
+        _seat_id: &str,
+        response_id: &str,
+        data: &Value,
+        page_token_limit: usize,
+    ) -> SlcResult<Value> {
+        let page_token_limit = normalize_page_token_limit(page_token_limit);
         // `data` is expected to be an object; if it is an array, wrap it.
         let result = if data.is_array() {
             json!({ "content": data })
@@ -58,7 +122,7 @@ impl<S: StorageBackend> Paginator<S> {
             data.clone()
         };
         let list_key = find_list_key(&result);
-        let char_limit = self.page_token_limit() * CHARS_PER_TOKEN;
+        let char_limit = page_token_limit * CHARS_PER_TOKEN;
 
         if list_key.is_none() {
             // Not a list — single page, still tagged.
@@ -113,7 +177,7 @@ impl<S: StorageBackend> Paginator<S> {
                 &json!({
                     "total_pages": total_pages,
                     "total_items": total_items,
-                    "page_token_limit": self.page_token_limit(),
+                    "page_token_limit": page_token_limit,
                     "created_at": Utc::now().to_rfc3339(),
                 }),
             )
@@ -160,11 +224,8 @@ impl<S: StorageBackend> Paginator<S> {
     }
 
     pub async fn set_page_limit(&self, tokens: usize) -> SlcResult<Value> {
-        if tokens < MIN_PAGE_TOKEN_LIMIT {
-            return Ok(json!({ "error": format!("Minimum page limit is {MIN_PAGE_TOKEN_LIMIT} tokens") }));
-        }
-        if tokens > MAX_PAGE_TOKEN_LIMIT {
-            return Ok(json!({ "error": format!("Maximum page limit is {MAX_PAGE_TOKEN_LIMIT} tokens") }));
+        if tokens == 0 {
+            return Ok(json!({ "error": "Page limit must be a positive token count" }));
         }
         // Persist under canonical + production-compat keys.
         let mut m = serde_json::Map::new();
@@ -176,8 +237,13 @@ impl<S: StorageBackend> Paginator<S> {
     }
 
     pub async fn get_settings(&self) -> SlcResult<Value> {
+        let environment_override = page_token_limit_from_env();
         Ok(json!({
-            "page_token_limit": self.page_token_limit(),
+            "enabled": pagination_enabled_from_env(),
+            "page_token_limit": self.page_token_limit().await?,
+            "page_token_limit_source": if environment_override.is_some() { "environment" } else { "stored_or_default" },
+            "minimum_page_token_limit": 1,
+            "maximum_page_token_limit": null,
             "chars_per_token": CHARS_PER_TOKEN,
             "ttl_seconds": TTL_SECONDS,
         }))
@@ -241,9 +307,11 @@ mod tests {
     #[tokio::test]
     async fn paginates_a_list() {
         let (p, _) = paginator();
-        unsafe { std::env::set_var("SLC_PAGE_TOKEN_LIMIT", "500") };
         let items: Vec<Value> = (0..100).map(|i| json!({"i": i, "text": "x".repeat(50)})).collect();
-        let result = p.paginate("seat_x", "resp_1", &json!({ "results": items })).await.unwrap();
+        let result = p
+            .paginate_with_limit("seat_x", "resp_1", &json!({ "results": items }), 500)
+            .await
+            .unwrap();
         let total_pages = result["_pagination"]["total_pages"].as_i64().unwrap();
         assert!(total_pages > 1, "expected multiple pages, got {total_pages}");
         assert_eq!(result["_pagination"]["page"], 1);
@@ -260,7 +328,10 @@ mod tests {
     async fn single_page_no_split() {
         let (p, _) = paginator();
         let small: Vec<Value> = (0..3).map(|i| json!({"i": i})).collect();
-        let result = p.paginate("seat_y", "resp_s", &json!({ "items": small })).await.unwrap();
+        let result = p
+            .paginate_with_limit("seat_y", "resp_s", &json!({ "items": small }), 500)
+            .await
+            .unwrap();
         assert_eq!(result["_pagination"]["total_pages"], 1);
     }
 
@@ -268,15 +339,33 @@ mod tests {
     async fn invalid_page_errors() {
         let (p, _) = paginator();
         let small: Vec<Value> = vec![json!(1), json!(2)];
-        p.paginate("seat_z", "resp_e", &json!({ "items": small })).await.unwrap();
+        p.paginate_with_limit("seat_z", "resp_e", &json!({ "items": small }), 500)
+            .await
+            .unwrap();
         let err = p.get_page("seat_z", "resp_e", 99).await.unwrap();
         assert!(err.get("error").is_some());
     }
 
     #[tokio::test]
-    async fn page_limit_bounds() {
-        let (p, _) = paginator();
-        assert!(p.set_page_limit(10).await.unwrap()["error"].is_string());
-        assert!(p.set_page_limit(500).await.unwrap()["success"].as_bool().unwrap());
+    async fn page_limit_accepts_any_positive_value() {
+        let (p, store) = paginator();
+        assert!(p.set_page_limit(0).await.unwrap()["error"].is_string());
+        assert!(p
+            .set_page_limit(350_000)
+            .await
+            .unwrap()["success"]
+            .as_bool()
+            .unwrap());
+        let settings = store
+            .get_record(COLLECTION, "settings")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settings["page_token_limit"], 350_000);
+    }
+
+    #[test]
+    fn default_page_is_fifty_thousand_tokens() {
+        assert_eq!(DEFAULT_PAGE_TOKEN_LIMIT, 50_000);
     }
 }

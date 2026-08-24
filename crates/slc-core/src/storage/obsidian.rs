@@ -102,6 +102,15 @@ pub struct IndexEntry {
     pub updated_at: String,
     pub version: i64,
     pub deleted_at: Option<String>,
+    /// True when `id` came from SLC frontmatter, false when derived from the
+    /// file name. Not persisted; used to resolve id collisions at scan time.
+    #[serde(skip)]
+    pub explicit_id: bool,
+    /// Actual note file stem (without `.md`). Set for Obsidian notes whose
+    /// `id` was derived from the file name, so reads/writes hit the real file
+    /// even when the name contains characters `safe_file_name` would mangle.
+    #[serde(default)]
+    pub file_name: Option<String>,
 }
 
 impl IndexEntry {
@@ -121,6 +130,8 @@ impl IndexEntry {
             updated_at: doc.updated_at.to_rfc3339(),
             version: doc.version,
             deleted_at: doc.deleted_at.map(|d| d.to_rfc3339()),
+            explicit_id: true,
+            file_name: None,
         }
     }
 
@@ -269,71 +280,104 @@ impl ObsidianVaultStore {
                 } else if path.extension().is_some_and(|x| x == "md") {
                     let text = std::fs::read_to_string(&path).unwrap_or_default();
                     let (meta, _) = frontmatter_parse(&text);
-                    if let Some(meta) = meta {
-                        if let Some(id) = meta.get("id").and_then(|v| v.as_str()) {
-                            let rel = path
-                                .strip_prefix(&self.root)
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            let entry = IndexEntry {
-                                id: id.to_string(),
-                                folder: Path::new(&rel)
-                                    .parent()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_default(),
-                                category: meta
-                                    .get("category")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("custom")
-                                    .to_string(),
-                                seat_id: meta.get("seat_id").and_then(|v| v.as_str()).map(String::from),
-                                doc_level: meta
-                                    .get("metadata")
-                                    .and_then(|m| m.get("doc_level"))
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                                doc_type: meta
-                                    .get("metadata")
-                                    .and_then(|m| m.get("doc_type"))
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                                archived: meta
-                                    .get("metadata")
-                                    .and_then(|m| m.get("archived"))
-                                    .and_then(|v| v.as_bool()),
-                                consolidated: meta
-                                    .get("metadata")
-                                    .and_then(|m| m.get("consolidated"))
-                                    .and_then(|v| v.as_bool()),
-                                compression_batch_id: meta
-                                    .get("metadata")
-                                    .and_then(|m| m.get("compression_batch_id"))
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                                tags: meta
-                                    .get("tags")
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| {
-                                        a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-                                    })
-                                    .unwrap_or_default(),
-                                created_at: meta
-                                    .get("created_at")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                updated_at: meta
-                                    .get("updated_at")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                version: meta.get("version").and_then(|v| v.as_i64()).unwrap_or(1),
-                                deleted_at: meta
-                                    .get("deleted_at")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                            };
-                            index.insert(id.to_string(), entry);
+                    let meta = meta.unwrap_or_default();
+                    let explicit_id = meta
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string);
+                    let rel = path
+                        .strip_prefix(&self.root)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    // Obsidian-заметки без SLC-frontmatter (нет `id`) получают
+                    // document_id из имени файла, чтобы весь волт был в индексе.
+                    let derived_name = explicit_id.is_none().then(|| {
+                        path.file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    });
+                    let id = explicit_id
+                        .clone()
+                        .unwrap_or_else(|| derived_name.clone().unwrap_or_default());
+                    if id.is_empty() {
+                        continue;
+                    }
+                    let entry = IndexEntry {
+                        id: id.clone(),
+                        folder: Path::new(&rel)
+                            .parent()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        category: meta
+                            .get("category")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("custom")
+                            .to_string(),
+                        seat_id: meta.get("seat_id").and_then(|v| v.as_str()).map(String::from),
+                        doc_level: meta
+                            .get("metadata")
+                            .and_then(|m| m.get("doc_level"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        doc_type: meta
+                            .get("metadata")
+                            .and_then(|m| m.get("doc_type"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        archived: meta
+                            .get("metadata")
+                            .and_then(|m| m.get("archived"))
+                            .and_then(|v| v.as_bool()),
+                        consolidated: meta
+                            .get("metadata")
+                            .and_then(|m| m.get("consolidated"))
+                            .and_then(|v| v.as_bool()),
+                        compression_batch_id: meta
+                            .get("metadata")
+                            .and_then(|m| m.get("compression_batch_id"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        tags: meta
+                            .get("tags")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                            })
+                            .unwrap_or_default(),
+                        created_at: meta
+                            .get("created_at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        updated_at: meta
+                            .get("updated_at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        version: meta.get("version").and_then(|v| v.as_i64()).unwrap_or(1),
+                        deleted_at: meta
+                            .get("deleted_at")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        explicit_id: explicit_id.is_some(),
+                        file_name: derived_name,
+                    };
+                    match index.entry(id.clone()) {
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(entry);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut slot) => {
+                            if explicit_id.is_some() && !slot.get().explicit_id {
+                                // явный id (SLC-документ) перекрывает производный
+                                slot.insert(entry);
+                            } else if explicit_id.is_some() && slot.get().explicit_id {
+                                return Err(SlcError::Storage(format!(
+                                    "duplicate document id {id} in vault folders {:?} and {:?}",
+                                    slot.get().folder, entry.folder
+                                )));
+                            }
+                            // производный id уже занят: оставляем первый файл
                         }
                     }
                 }
@@ -428,9 +472,29 @@ impl ObsidianVaultStore {
         let folder = sanitize_folder(&folder)?;
         let dir = self.root.join(&folder);
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.md", safe_file_name(&doc.document_id)));
+        let previous = self.index.lock().unwrap().get(&doc.document_id).cloned();
+        let file_name = previous
+            .as_ref()
+            .and_then(|e| e.file_name.clone())
+            .unwrap_or_else(|| safe_file_name(&doc.document_id));
+        let path = dir.join(format!("{file_name}.md"));
         let text = render_doc(doc)?;
         std::fs::write(path, text)?;
+
+        // A full replacement may change category or project binding, which
+        // changes the canonical folder. Leaving the old note behind creates
+        // duplicate IDs and makes the next index rebuild nondeterministic.
+        if let Some(previous) = previous {
+            if previous.folder != folder {
+                let old_path = self
+                    .root
+                    .join(sanitize_folder(&previous.folder)?)
+                    .join(format!("{file_name}.md"));
+                if old_path.exists() {
+                    std::fs::remove_file(old_path)?;
+                }
+            }
+        }
         self.index.lock().unwrap().insert(doc.document_id.clone(), IndexEntry::from_doc(doc));
         self.persist_index()?;
         Ok(())
@@ -438,8 +502,14 @@ impl ObsidianVaultStore {
 
     /// Read + parse a note into a Document (files are the source of truth).
     fn read_note(&self, entry: &IndexEntry) -> SlcResult<Document> {
-        let path = self.root.join(&sanitize_folder(&entry.folder)?)
-            .join(format!("{}.md", safe_file_name(&entry.id)));
+        let file_name = entry
+            .file_name
+            .clone()
+            .unwrap_or_else(|| safe_file_name(&entry.id));
+        let path = self
+            .root
+            .join(&sanitize_folder(&entry.folder)?)
+            .join(format!("{file_name}.md"));
         let text = std::fs::read_to_string(&path)?;
         let (meta, body) = frontmatter_parse(&text);
         let meta = meta.unwrap_or_default();
@@ -522,13 +592,25 @@ impl ObsidianVaultStore {
         let git_lock = self.git_lock.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let Ok(_guard) = git_lock.lock() else { return }; // serialize git index.lock
-            let author_name = author.split('<').next().unwrap_or("slc-mcp").trim().to_string();
+            let author_name = author
+                .split('<')
+                .next()
+                .unwrap_or("slc-mcp")
+                .trim()
+                .to_string();
+            let author_email = author
+                .split_once('<')
+                .and_then(|(_, email)| email.strip_suffix('>'))
+                .map(str::trim)
+                .filter(|email| !email.is_empty())
+                .unwrap_or("slc-mcp@local")
+                .to_string();
             let run = |args: Vec<&str>| {
                 std::process::Command::new("git")
                     .args(&args)
                     .current_dir(&root)
                     .env("GIT_AUTHOR_NAME", &author_name)
-                    .env("GIT_AUTHOR_EMAIL", &author)
+                    .env("GIT_AUTHOR_EMAIL", &author_email)
                     .output()
             };
             let failed = |out: &std::process::Output| {
@@ -539,7 +621,22 @@ impl ObsidianVaultStore {
             };
             match run(vec!["add", "-A"]) {
                 Ok(out) if out.status.success() => {
-                    let commit = run(vec!["commit", "-m", "slc: vault update", "--allow-empty"]);
+                    // A read-only lifecycle call may still persist operational
+                    // metadata. Avoid manufacturing empty commits when the
+                    // vault representation did not actually change.
+                    match run(vec!["diff", "--cached", "--quiet"]) {
+                        Ok(diff) if diff.status.success() => return,
+                        Ok(diff) if diff.status.code() == Some(1) => {}
+                        Ok(diff) => {
+                            failed(&diff);
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!("vault git diff error: {e}");
+                            return;
+                        }
+                    }
+                    let commit = run(vec!["commit", "-m", "slc: vault update"]);
                     match &commit {
                         Ok(c) if c.status.success() => {
                             // Push the vault to its upstream (best-effort) —
@@ -650,7 +747,7 @@ impl StorageBackend for ObsidianVaultStore {
     async fn kb_upsert(&self, doc: &Document) -> SlcResult<bool> {
         let exists = self.index.lock().unwrap().contains_key(&doc.document_id);
         if exists {
-            self.kb_update_content(&doc.document_id, &doc.content).await?;
+            self.kb_replace(doc).await?;
             return Ok(true);
         }
         self.kb_insert(doc).await?;
@@ -835,8 +932,12 @@ impl StorageBackend for ObsidianVaultStore {
     }
 
     async fn episodic_upsert(&self, doc: &Document) -> SlcResult<bool> {
+        if doc.category != DocumentCategory::History {
+            return Err(SlcError::Storage("only history docs go to the episodic store".into()));
+        }
         if self.index.lock().unwrap().contains_key(&doc.document_id) {
-            self.kb_update_content(&doc.document_id, &doc.content).await?;
+            self.write_note(doc)?;
+            self.git_commit().await;
             return Ok(true);
         }
         self.episodic_insert(doc).await?;
@@ -894,12 +995,15 @@ impl StorageBackend for ObsidianVaultStore {
     // ── embeddings ──────────────────────────────────────────────
 
     async fn insert_embeddings(&self, records: &[EmbeddingRecord]) -> SlcResult<()> {
-        let mut map = self.embeddings.lock().unwrap();
-        for r in records {
-            map.entry(r.document_id.clone()).or_default().push(r.clone());
+        {
+            let mut map = self.embeddings.lock().unwrap();
+            for r in records {
+                map.entry(r.document_id.clone()).or_default().push(r.clone());
+            }
         }
-        drop(map);
-        self.persist_embeddings()
+        self.persist_embeddings()?;
+        self.git_commit().await;
+        Ok(())
     }
 
     async fn get_embedding(&self, document_id: &str) -> SlcResult<Option<Vec<f32>>> {
@@ -933,14 +1037,18 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn delete_embeddings(&self, document_id: &str) -> SlcResult<()> {
         self.embeddings.lock().unwrap().remove(document_id);
-        self.persist_embeddings()
+        self.persist_embeddings()?;
+        self.git_commit().await;
+        Ok(())
     }
 
     // ── seats ───────────────────────────────────────────────────
 
     async fn insert_seat(&self, seat: &Seat) -> SlcResult<()> {
         self.seats.lock().unwrap().insert(seat.seat_id.clone(), seat.clone());
-        self.persist_seat(seat)
+        self.persist_seat(seat)?;
+        self.git_commit().await;
+        Ok(())
     }
 
     async fn get_seat(&self, seat_id: &str) -> SlcResult<Option<Seat>> {
@@ -962,44 +1070,59 @@ impl StorageBackend for ObsidianVaultStore {
     }
 
     async fn touch_seat(&self, seat_id: &str) -> SlcResult<bool> {
-        let mut seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
-        seat.last_accessed = Utc::now();
-        let seat = seat.clone();
-        drop(seats);
+        let seat = {
+            let mut seats = self.seats.lock().unwrap();
+            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            let now = Utc::now();
+            // Authentication touches every tool call. Persisting and pushing
+            // each one makes a read-only request unexpectedly expensive, so
+            // retain a useful heartbeat while coalescing that volatile field.
+            if now.signed_duration_since(seat.last_accessed) < chrono::Duration::minutes(1) {
+                return Ok(true);
+            }
+            seat.last_accessed = now;
+            seat.clone()
+        };
         self.persist_seat(&seat)?;
+        self.git_commit().await;
         Ok(true)
     }
 
     async fn set_seat_status(&self, seat_id: &str, status: SeatStatus) -> SlcResult<bool> {
-        let mut seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
-        seat.status = status;
-        let seat = seat.clone();
-        drop(seats);
+        let seat = {
+            let mut seats = self.seats.lock().unwrap();
+            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            seat.status = status;
+            seat.clone()
+        };
         self.persist_seat(&seat)?;
+        self.git_commit().await;
         Ok(true)
     }
 
     async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
-        let mut seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
-        seat.active_task_id = Some(task_id.into());
-        // Task activation is document activation too (unified anchor).
-        seat.active_document_id = Some(task_id.into());
-        let seat = seat.clone();
-        drop(seats);
+        let seat = {
+            let mut seats = self.seats.lock().unwrap();
+            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            seat.active_task_id = Some(task_id.into());
+            // Task activation is document activation too (unified anchor).
+            seat.active_document_id = Some(task_id.into());
+            seat.clone()
+        };
         self.persist_seat(&seat)?;
+        self.git_commit().await;
         Ok(true)
     }
 
     async fn set_seat_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool> {
-        let mut seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
-        seat.active_document_id = document_id.map(String::from);
-        let seat = seat.clone();
-        drop(seats);
+        let seat = {
+            let mut seats = self.seats.lock().unwrap();
+            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            seat.active_document_id = document_id.map(String::from);
+            seat.clone()
+        };
         self.persist_seat(&seat)?;
+        self.git_commit().await;
         Ok(true)
     }
 
@@ -1011,16 +1134,18 @@ impl StorageBackend for ObsidianVaultStore {
     }
 
     async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool> {
-        let mut seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
-        seat.usage_stats.total_requests += 1;
-        seat.usage_stats.total_tokens += tokens_used;
-        let count = seat.usage_stats.tools_used.get(tool_name).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
-        seat.usage_stats.tools_used.insert(tool_name.into(), json!(count));
-        seat.last_accessed = Utc::now();
-        let seat = seat.clone();
-        drop(seats);
+        let seat = {
+            let mut seats = self.seats.lock().unwrap();
+            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            seat.usage_stats.total_requests += 1;
+            seat.usage_stats.total_tokens += tokens_used;
+            let count = seat.usage_stats.tools_used.get(tool_name).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+            seat.usage_stats.tools_used.insert(tool_name.into(), json!(count));
+            seat.last_accessed = Utc::now();
+            seat.clone()
+        };
         self.persist_seat(&seat)?;
+        self.git_commit().await;
         Ok(true)
     }
 
@@ -1028,7 +1153,9 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn insert_timer(&self, timer: &PersistedTimer) -> SlcResult<()> {
         self.timers.lock().unwrap().insert(timer.timer_id.clone(), timer.clone());
-        self.persist_timers()
+        self.persist_timers()?;
+        self.git_commit().await;
+        Ok(())
     }
 
     async fn get_timer(&self, timer_id: &str) -> SlcResult<Option<PersistedTimer>> {
@@ -1047,19 +1174,24 @@ impl StorageBackend for ObsidianVaultStore {
     }
 
     async fn set_timer_fired(&self, timer_id: &str, now: DateTime<Utc>) -> SlcResult<()> {
-        let mut timers = self.timers.lock().unwrap();
-        if let Some(t) = timers.get_mut(timer_id) {
-            t.last_fired_at = Some(now);
+        {
+            let mut timers = self.timers.lock().unwrap();
+            if let Some(t) = timers.get_mut(timer_id) {
+                t.last_fired_at = Some(now);
+            }
         }
-        drop(timers);
-        self.persist_timers()
+        self.persist_timers()?;
+        self.git_commit().await;
+        Ok(())
     }
 
     // ── records ─────────────────────────────────────────────────
 
     async fn put_record(&self, collection: &str, key: &str, value: &Value) -> SlcResult<()> {
         self.records.lock().unwrap().insert((collection.to_string(), key.to_string()), value.clone());
-        self.persist_records()
+        self.persist_records()?;
+        self.git_commit().await;
+        Ok(())
     }
 
     async fn get_record(&self, collection: &str, key: &str) -> SlcResult<Option<Value>> {
@@ -1070,6 +1202,7 @@ impl StorageBackend for ObsidianVaultStore {
         let existed = self.records.lock().unwrap().remove(&(collection.to_string(), key.to_string())).is_some();
         if existed {
             self.persist_records()?;
+            self.git_commit().await;
         }
         Ok(existed)
     }
@@ -1165,6 +1298,45 @@ mod tests {
         let ep_count = store2.episodic_count(&DocFilter::default()).await.unwrap();
         assert_eq!(ep_count, 1);
         assert!(store2.kb_insert(&evt).await.is_err(), "history rejected by kb_insert");
+    }
+
+    #[tokio::test]
+    async fn upsert_replaces_metadata_and_removes_the_old_note_path() {
+        let root = tmp_vault("upsert-move");
+        let store = ObsidianVaultStore::open(&root, false).unwrap();
+        let original = Document::with_folder(
+            "same-id",
+            DocumentCategory::Documentation,
+            Some("docs/legacy".into()),
+            "old content",
+            DocMeta::default(),
+            vec!["old".into()],
+            None,
+        );
+        store.kb_insert(&original).await.unwrap();
+
+        let mut metadata = DocMeta::default();
+        metadata.extra.insert("status".into(), json!("IN_WORK"));
+        let replacement = Document::with_folder(
+            "same-id",
+            DocumentCategory::Task,
+            Some("docs/projects/demo/tasks".into()),
+            "new content",
+            metadata,
+            vec!["new".into()],
+            Some("seat-a".into()),
+        );
+        assert!(store.kb_upsert(&replacement).await.unwrap());
+        assert!(!root.join("docs/legacy/same-id.md").exists());
+        assert!(root.join("docs/projects/demo/tasks/same-id.md").exists());
+
+        let reopened = ObsidianVaultStore::open(&root, false).unwrap();
+        let loaded = reopened.kb_get("same-id").await.unwrap().unwrap();
+        assert_eq!(loaded.category, DocumentCategory::Task);
+        assert_eq!(loaded.content, "new content");
+        assert_eq!(loaded.tags, vec!["new"]);
+        assert_eq!(loaded.seat_id.as_deref(), Some("seat-a"));
+        assert_eq!(loaded.metadata.extra["status"], "IN_WORK");
     }
 
     #[tokio::test]

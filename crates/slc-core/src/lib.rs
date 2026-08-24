@@ -169,9 +169,9 @@ pub struct SlcConfig {
     pub text_weight: f32,
     pub seat_ttl_seconds: i64,
     /// Total context budget in TOKENS handed to the model per
-    /// `update_context` call. Per-seat override: `/limit N` (tokens) or the
-    /// client's window from `initialize` (tokens). The compression counts
-    /// usage in tokens too (~3 chars per token via CHARS_PER_TOKEN).
+    /// `update_context` call. A connection header or per-seat `/limit N`
+    /// value may override this fallback. The compression counts usage in
+    /// tokens too (~3 chars per token via CHARS_PER_TOKEN).
     pub context_limit_tokens: usize,
     /// MongoDB connection URI (used when `storage = MongoDB`).
     pub mongodb_uri: Option<String>,
@@ -188,6 +188,13 @@ pub struct SlcConfig {
     /// ("seat_a=operator,seat_b=operator") или программно через
     /// [`SlcConfig::with_seat_role`] (staticlib: параметр инициализации).
     pub seat_roles: std::collections::HashMap<String, Vec<roles::SeatRole>>,
+    /// Explicit cross-seat scope for operator seats.  From env
+    /// `SLC_SEAT_MANAGE_ACL` (`manager=developer|designer,root=*`).
+    /// An operator without an ACL entry remains restricted to its own seat.
+    pub seat_manage_acl: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    >,
 }
 
 impl SlcConfig {
@@ -198,6 +205,19 @@ impl SlcConfig {
         role: roles::SeatRole,
     ) -> Self {
         self.seat_roles.entry(seat_id.into()).or_default().push(role);
+        self
+    }
+
+    /// Grant an operator access to one explicit target seat.
+    pub fn with_seat_manage_target(
+        mut self,
+        actor: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
+        self.seat_manage_acl
+            .entry(actor.into())
+            .or_default()
+            .insert(target.into());
         self
     }
 }
@@ -236,6 +256,7 @@ impl Default for SlcConfig {
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
             seat_roles: roles::parse_roles_env(),
+            seat_manage_acl: roles::parse_manage_acl_env(),
         }
     }
 }
@@ -334,7 +355,7 @@ pub struct SlcEngine {
     consolidator:
         MemoryConsolidator<std::sync::Arc<dyn StorageBackend>, std::sync::Arc<dyn LlmClient>>,
     pub config: SlcConfig,
-    scheduler: std::sync::Mutex<Option<timer::TimerRegistry>>,
+    scheduler: tokio::sync::Mutex<Option<timer::TimerRegistry>>,
 }
 impl SlcEngine {
     /// Synchronous open for the embedded backends (Obsidian vault, SQLite).
@@ -476,7 +497,7 @@ impl SlcEngine {
             compressor,
             consolidator,
             config,
-            scheduler: std::sync::Mutex::new(None),
+            scheduler: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -520,9 +541,10 @@ impl SlcEngine {
         }
     }
 
-    /// Effective context budget for a seat (TOKENS): per-seat override
-    /// (`context_limit_tokens` from /limit or initialize) wins over the
-    /// config default. Legacy `context_limit_chars` values are converted.
+    /// Effective context budget for a seat (TOKENS): the per-seat
+    /// `context_limit_tokens` written by `/limit` wins over the config
+    /// default. A connection header is applied by the MCP server above this
+    /// layer. Legacy `context_limit_chars` values are converted.
     pub async fn context_limit_for(&self, seat_id: &str) -> SlcResult<usize> {
         if let Ok(Some(seat)) = self.seats.get_seat(seat_id).await {
             if let Some(v) = seat
@@ -760,6 +782,7 @@ impl SlcEngine {
     ) -> SlcResult<model::Reminder> {
         let registry = self
             .scheduler()
+            .await
             .unwrap_or_else(|| timer::TimerRegistry::new(self.store.clone()));
         let manager = ReminderManager::new(self.store.clone(), registry);
         manager
@@ -776,6 +799,7 @@ impl SlcEngine {
     pub async fn reminder_cancel(&self, seat_id: &str, reminder_id: &str) -> SlcResult<bool> {
         let registry = self
             .scheduler()
+            .await
             .unwrap_or_else(|| timer::TimerRegistry::new(self.store.clone()));
         let manager = ReminderManager::new(self.store.clone(), registry);
         manager.cancel(reminder_id, Some(seat_id)).await
@@ -818,6 +842,18 @@ impl SlcEngine {
         p.paginate(seat_id, response_id, data).await
     }
 
+    pub async fn paginate_with_limit(
+        &self,
+        seat_id: &str,
+        response_id: &str,
+        data: &serde_json::Value,
+        page_token_limit: usize,
+    ) -> SlcResult<serde_json::Value> {
+        let p = Paginator::new(self.store.clone());
+        p.paginate_with_limit(seat_id, response_id, data, page_token_limit)
+            .await
+    }
+
     pub async fn get_page(
         &self,
         seat_id: &str,
@@ -841,6 +877,11 @@ impl SlcEngine {
     pub async fn page_settings(&self) -> SlcResult<serde_json::Value> {
         let p = Paginator::new(self.store.clone());
         p.get_settings().await
+    }
+
+    pub async fn page_token_limit(&self) -> SlcResult<usize> {
+        let p = Paginator::new(self.store.clone());
+        p.page_token_limit().await
     }
 
     // ── tasks + projects (unified Documents) ─────────────────────
@@ -950,26 +991,65 @@ impl SlcEngine {
         self.config.seat_roles.get(seat_id).cloned().unwrap_or_default()
     }
 
-    /// Имеет ли сид право управлять контекстом других сидов (operator).
+    /// Имеет ли operator хотя бы одну явно разрешённую cross-seat цель.
     pub fn can_manage_seats(&self, seat_id: &str) -> bool {
+        self.has_operator_role(seat_id)
+            && self
+                .config
+                .seat_manage_acl
+                .get(seat_id)
+                .is_some_and(|targets| !targets.is_empty())
+    }
+
+    fn has_operator_role(&self, seat_id: &str) -> bool {
         self.seat_roles(seat_id)
-            .iter()
-            .any(|r| *r == roles::SeatRole::Operator)
+            .contains(&roles::SeatRole::Operator)
+    }
+
+    /// Whether an operator is explicitly allowed to manage this target.
+    pub fn can_manage_target(&self, actor: &str, target_seat: &str) -> bool {
+        if actor == target_seat {
+            return true;
+        }
+        self.has_operator_role(actor)
+            && self
+                .config
+                .seat_manage_acl
+                .get(actor)
+                .is_some_and(|targets| {
+                    targets.contains(target_seat) || targets.contains("*")
+                })
+    }
+
+    /// Explicit cross-seat targets exposed to operator clients for discovery.
+    pub fn allowed_manage_targets(&self, actor: &str) -> Vec<String> {
+        let mut targets = self
+            .config
+            .seat_manage_acl
+            .get(actor)
+            .map(|targets| targets.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        targets.sort();
+        targets
     }
 
     /// Может ли сид читать/редактировать документ: свой/публичный
     /// (is_kb_visible) или оператор (управление контекстом других сидов).
     pub fn can_read_document(&self, seat_id: &str, doc: &Document) -> bool {
-        doc.is_kb_visible(seat_id) || self.can_manage_seats(seat_id)
+        doc.is_kb_visible(seat_id)
+            || doc
+                .seat_id
+                .as_deref()
+                .is_some_and(|owner| self.can_manage_target(seat_id, owner))
     }
 
     /// Проверка права: actor может управлять target_seat (свой сид — всегда).
     pub async fn require_seat_manage(&self, actor: &str, target_seat: &str) -> SlcResult<()> {
-        if actor == target_seat || self.can_manage_seats(actor) {
+        if self.can_manage_target(actor, target_seat) {
             return Ok(());
         }
         Err(SlcError::PermissionDenied(format!(
-            "seat {actor} has no right to manage seat {target_seat} (role operator required)"
+            "seat {actor} has no right to manage seat {target_seat} (operator role and explicit SLC_SEAT_MANAGE_ACL target required)"
         )))
     }
 
@@ -1056,7 +1136,7 @@ impl SlcEngine {
         if new_id == document_id {
             return Err(SlcError::InvalidInput("new id must differ".into()));
         }
-        let Some(mut doc) = self.get_document(document_id).await? else {
+        let Some(doc) = self.get_document(document_id).await? else {
             return Err(SlcError::NotFound(format!("document not found: {document_id}")));
         };
         if !doc.is_kb_visible(seat_id) {
@@ -1091,8 +1171,8 @@ impl SlcEngine {
                 }
                 c
             };
-            let mut c1 = fix(&mut d.auto_load);
-            let mut c2 = fix(&mut d.references);
+            let c1 = fix(&mut d.auto_load);
+            let c2 = fix(&mut d.references);
             // Проектные связи задач (metadata.project / project_id).
             let mut c3 = false;
             for key in ["project", "project_id"] {
@@ -1353,7 +1433,10 @@ impl SlcEngine {
     /// compression/consolidation handlers. Idempotent. The MCP server calls
     /// this on startup.
     pub async fn start_background(&self) -> SlcResult<()> {
-        let mut guard = self.scheduler.lock().unwrap();
+        // Initialization awaits storage and timer operations, so this must be
+        // an async-aware mutex. A std::sync::MutexGuard here used to be held
+        // across every await and could stall the whole executor.
+        let mut guard = self.scheduler.lock().await;
         if guard.is_some() {
             return Ok(());
         }
@@ -1456,8 +1539,8 @@ impl SlcEngine {
         Ok(())
     }
 
-    pub fn scheduler(&self) -> Option<timer::TimerRegistry> {
-        self.scheduler.lock().unwrap().clone()
+    pub async fn scheduler(&self) -> Option<timer::TimerRegistry> {
+        self.scheduler.lock().await.clone()
     }
 }
 
@@ -1634,7 +1717,9 @@ mod engine_tests {
             std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
         let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
         // Оператор — seat "boss"; рядовой — "worker".
-        let config = SlcConfig::default().with_seat_role("boss", SeatRole::Operator);
+        let config = SlcConfig::default()
+            .with_seat_role("boss", SeatRole::Operator)
+            .with_seat_manage_target("boss", "worker");
         let engine = SlcEngine::with(store.clone(), llm, config);
 
         engine.ensure_seat("boss").await.unwrap();
@@ -1712,6 +1797,8 @@ mod engine_tests {
         // seat_roles отдаёт конфигурацию.
         assert_eq!(engine.seat_roles("boss"), vec![SeatRole::Operator]);
         assert!(engine.can_manage_seats("boss"));
+        assert!(engine.can_manage_target("boss", "worker"));
+        assert!(!engine.can_manage_target("boss", "unrelated"));
         assert!(!engine.can_manage_seats("worker"));
     }
 

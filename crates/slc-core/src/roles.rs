@@ -5,7 +5,7 @@
 //! либо программно: `SlcConfig::default().with_seat_role("seat_a", SeatRole::Operator)`
 //! — единый механизм для сервера и статической библиотеки.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Роль сида. Модель расширяемая: добавляй варианты и проверки здесь.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,6 +62,42 @@ pub fn parse_roles_env() -> HashMap<String, Vec<SeatRole>> {
     map
 }
 
+/// Parse the cross-seat management ACL.
+///
+/// Format: `actor=target_a|target_b,another_operator=*`.  A role alone never
+/// grants cross-seat access: the actor must also have an explicit target in
+/// this ACL (or `*`).  This keeps an accidentally configured `operator` from
+/// becoming a global tenant administrator.
+pub fn parse_manage_acl(raw: &str) -> HashMap<String, HashSet<String>> {
+    let mut map = HashMap::new();
+    for rule in raw.split(',') {
+        let Some((actor, targets)) = rule.split_once('=') else {
+            continue;
+        };
+        let actor = actor.trim();
+        if actor.is_empty() {
+            continue;
+        }
+        let targets = targets
+            .split('|')
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .map(String::from)
+            .collect::<HashSet<_>>();
+        if !targets.is_empty() {
+            map.insert(actor.to_string(), targets);
+        }
+    }
+    map
+}
+
+/// Read [`parse_manage_acl`] input from `SLC_SEAT_MANAGE_ACL`.
+pub fn parse_manage_acl_env() -> HashMap<String, HashSet<String>> {
+    std::env::var("SLC_SEAT_MANAGE_ACL")
+        .map(|raw| parse_manage_acl(&raw))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,7 +110,7 @@ mod tests {
         assert!(map.get("boss").unwrap()[0] == SeatRole::Operator);
         assert_eq!(map.get("worker").map(|r| r.len()), Some(1));
         // ghost=admin — неизвестная роль, пропущена.
-        assert!(map.get("ghost").is_none());
+        assert!(!map.contains_key("ghost"));
         unsafe { std::env::remove_var("SLC_SEAT_ROLES") };
     }
 
@@ -83,5 +119,17 @@ mod tests {
         assert!(SeatRole::parse(SeatRole::Operator.as_str()) == Some(SeatRole::Operator));
         assert!(SeatRole::parse("OPERATOR") == Some(SeatRole::Operator));
         assert!(SeatRole::parse("nope").is_none());
+    }
+
+    #[test]
+    fn scoped_management_acl_is_explicit() {
+        let acl = parse_manage_acl(
+            "manager=developer|designer|tester,lead=developer|junior,root=*",
+        );
+        assert!(acl["manager"].contains("developer"));
+        assert!(acl["manager"].contains("designer"));
+        assert!(!acl["manager"].contains("devops"));
+        assert!(acl["lead"].contains("junior"));
+        assert!(acl["root"].contains("*"));
     }
 }

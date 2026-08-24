@@ -66,7 +66,10 @@ pub async fn ensure_core_documents(store: &dyn StorageBackend) -> SlcResult<usiz
             tags.iter().map(|t| t.to_string()).collect(),
             None,
         );
-        store.kb_insert(&doc).await?;
+        // A legacy or older seed with the same stable ID must be replaced in
+        // full. `kb_insert` rejects that perfectly valid upgrade path and can
+        // abort seeding of every remaining core document.
+        store.kb_replace(&doc).await?;
         inserted += 1;
     }
     // Уборка легаси v1-документов (мягко, в graveyard — восстановимы).
