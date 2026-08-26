@@ -305,6 +305,27 @@ impl<S: StorageBackend> Paginator<S> {
             "page": page,
             "total_pages": pages.len(),
         });
+        // Мета-инфо о том, КОГДА и ПРИ КАКОМ лимите создан кэш: клиент,
+        // получивший total_pages=1 из старого кэша, видит причину.
+        if let Ok(Some(meta)) = self
+            .store
+            .get_record(COLLECTION, &format!("{response_id}:meta"))
+            .await
+        {
+            if let Some(limit) = meta.get("page_token_limit") {
+                out["_pagination"]["response_page_token_limit"] = limit.clone();
+            }
+            if let Some(ts) = meta.get("created_at") {
+                out["_pagination"]["response_created_at"] = ts.clone();
+            }
+            let current = self.page_token_limit().await.unwrap_or(0);
+            let cached = meta.get("page_token_limit").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if pages.len() == 1 && cached != 0 && cached != current {
+                out["_pagination"]["hint"] = json!(format!(
+                    "этот ответ кэширован при лимите страницы {cached} токенов, текущий — {current}. Если клиент обрезает выхлоп: set_page_limit(<меньше>) и ПОВТОРНО вызови исходный тул (например get_document) — кэш обновится."
+                ));
+            }
+        }
         Ok(out)
     }
 
@@ -462,6 +483,32 @@ mod tests {
             }
         }
         assert_eq!(combined, big + "мелкий", "склейка частей = полный контент");
+    }
+
+    #[tokio::test]
+    async fn get_page_reports_cached_limit_and_hint() {
+        // Кэш создан при лимите 2000; текущий лимит (default 5000) другой —
+        // get_page должен сообщить, при каком лимите создан кэш, и
+        // подсказать, что при обрезке нужно перевызвать исходный тул.
+        let (p, _) = paginator();
+        // List-кэш создан при БОЛЬШОМ лимите → одна страница (сценарий
+        // агента: update_context/list_documents при 300000 токенов).
+        let data = json!({"results": [
+            {"document_id": "a", "content": "маленький"},
+            {"document_id": "b", "content": "тоже"},
+        ]});
+        let first = p
+            .paginate_with_limit("s", "resp_hint", &data, 300_000)
+            .await
+            .unwrap();
+        assert_eq!(first["_pagination"]["total_pages"], 1);
+        let page1 = p.get_page("s", "resp_hint", 1).await.unwrap();
+        let pag = &page1["_pagination"];
+        assert_eq!(pag["response_page_token_limit"], 300_000);
+        assert!(pag.get("response_created_at").is_some());
+        // cached(300000) != current(default 5000) → hint про перевызов.
+        let hint = pag.get("hint").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(hint.contains("set_page_limit"), "hint: {hint}");
     }
 
     #[tokio::test]

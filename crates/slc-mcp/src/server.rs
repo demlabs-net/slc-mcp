@@ -2772,11 +2772,11 @@ async fn call_tool(
         name,
         "get_page" | "delete_response" | "set_page_limit" | "get_page_settings"
     );
+    let effective_page_token_limit = match pagination.page_token_limit {
+        Some(limit) => limit,
+        None => engine.page_token_limit().await.map_err(json_err)?,
+    };
     if pagination.enabled && pagination_candidate {
-        let effective_page_token_limit = match pagination.page_token_limit {
-            Some(limit) => limit,
-            None => engine.page_token_limit().await.map_err(json_err)?,
-        };
         let pagination_threshold = effective_page_token_limit
             .saturating_mul(slc_core::pagination::CHARS_PER_TOKEN);
         if tool_text.chars().count() > pagination_threshold {
@@ -2824,6 +2824,18 @@ async fn call_tool(
                     }
                 }
             }
+        } else if tool_text.chars().count() > 16_000 {
+                // Ответ большой, но пагинация не сработала (лимит страницы
+                // велик или пагинация выключена) — клиент, скорее всего,
+                // обрежет выхлоп. Явно подсказываем, что делать.
+                text.push_str(&format!(
+                    "\n\n⚠️ Ответ большой ({} символов) и НЕ пагинирован (лимит страницы {} токенов ≈ {} символов). Если клиент обрезает выхлоп: set_page_limit(<{}>) и повтори вызов тула.",
+                    tool_text.chars().count(),
+                    effective_page_token_limit,
+                    effective_page_token_limit.saturating_mul(slc_core::pagination::CHARS_PER_TOKEN),
+                    (tool_text.chars().count() / slc_core::pagination::CHARS_PER_TOKEN).max(1),
+                ));
+                result["content"][0]["text"] = json!(text);
         }
     }
     Ok(result)
