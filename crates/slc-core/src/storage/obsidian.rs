@@ -102,6 +102,15 @@ pub struct IndexEntry {
     pub updated_at: String,
     pub version: i64,
     pub deleted_at: Option<String>,
+    /// True when `id` came from SLC frontmatter, false when derived from the
+    /// file name. Not persisted; used to resolve id collisions at scan time.
+    #[serde(skip)]
+    pub explicit_id: bool,
+    /// Actual note file stem (without `.md`). Set for Obsidian notes whose
+    /// `id` was derived from the file name, so reads/writes hit the real file
+    /// even when the name contains characters `safe_file_name` would mangle.
+    #[serde(default)]
+    pub file_name: Option<String>,
 }
 
 impl IndexEntry {
@@ -121,6 +130,8 @@ impl IndexEntry {
             updated_at: doc.updated_at.to_rfc3339(),
             version: doc.version,
             deleted_at: doc.deleted_at.map(|d| d.to_rfc3339()),
+            explicit_id: true,
+            file_name: None,
         }
     }
 
@@ -269,76 +280,104 @@ impl ObsidianVaultStore {
                 } else if path.extension().is_some_and(|x| x == "md") {
                     let text = std::fs::read_to_string(&path).unwrap_or_default();
                     let (meta, _) = frontmatter_parse(&text);
-                    if let Some(meta) = meta {
-                        if let Some(id) = meta.get("id").and_then(|v| v.as_str()) {
-                            let rel = path
-                                .strip_prefix(&self.root)
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            let entry = IndexEntry {
-                                id: id.to_string(),
-                                folder: Path::new(&rel)
-                                    .parent()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_default(),
-                                category: meta
-                                    .get("category")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("custom")
-                                    .to_string(),
-                                seat_id: meta.get("seat_id").and_then(|v| v.as_str()).map(String::from),
-                                doc_level: meta
-                                    .get("metadata")
-                                    .and_then(|m| m.get("doc_level"))
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                                doc_type: meta
-                                    .get("metadata")
-                                    .and_then(|m| m.get("doc_type"))
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                                archived: meta
-                                    .get("metadata")
-                                    .and_then(|m| m.get("archived"))
-                                    .and_then(|v| v.as_bool()),
-                                consolidated: meta
-                                    .get("metadata")
-                                    .and_then(|m| m.get("consolidated"))
-                                    .and_then(|v| v.as_bool()),
-                                compression_batch_id: meta
-                                    .get("metadata")
-                                    .and_then(|m| m.get("compression_batch_id"))
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                                tags: meta
-                                    .get("tags")
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| {
-                                        a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-                                    })
-                                    .unwrap_or_default(),
-                                created_at: meta
-                                    .get("created_at")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                updated_at: meta
-                                    .get("updated_at")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                version: meta.get("version").and_then(|v| v.as_i64()).unwrap_or(1),
-                                deleted_at: meta
-                                    .get("deleted_at")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                            };
-                            if let Some(previous) = index.insert(id.to_string(), entry.clone()) {
+                    let meta = meta.unwrap_or_default();
+                    let explicit_id = meta
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string);
+                    let rel = path
+                        .strip_prefix(&self.root)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    // Obsidian-заметки без SLC-frontmatter (нет `id`) получают
+                    // document_id из имени файла, чтобы весь волт был в индексе.
+                    let derived_name = explicit_id.is_none().then(|| {
+                        path.file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    });
+                    let id = explicit_id
+                        .clone()
+                        .unwrap_or_else(|| derived_name.clone().unwrap_or_default());
+                    if id.is_empty() {
+                        continue;
+                    }
+                    let entry = IndexEntry {
+                        id: id.clone(),
+                        folder: Path::new(&rel)
+                            .parent()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        category: meta
+                            .get("category")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("custom")
+                            .to_string(),
+                        seat_id: meta.get("seat_id").and_then(|v| v.as_str()).map(String::from),
+                        doc_level: meta
+                            .get("metadata")
+                            .and_then(|m| m.get("doc_level"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        doc_type: meta
+                            .get("metadata")
+                            .and_then(|m| m.get("doc_type"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        archived: meta
+                            .get("metadata")
+                            .and_then(|m| m.get("archived"))
+                            .and_then(|v| v.as_bool()),
+                        consolidated: meta
+                            .get("metadata")
+                            .and_then(|m| m.get("consolidated"))
+                            .and_then(|v| v.as_bool()),
+                        compression_batch_id: meta
+                            .get("metadata")
+                            .and_then(|m| m.get("compression_batch_id"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        tags: meta
+                            .get("tags")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                            })
+                            .unwrap_or_default(),
+                        created_at: meta
+                            .get("created_at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        updated_at: meta
+                            .get("updated_at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        version: meta.get("version").and_then(|v| v.as_i64()).unwrap_or(1),
+                        deleted_at: meta
+                            .get("deleted_at")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        explicit_id: explicit_id.is_some(),
+                        file_name: derived_name,
+                    };
+                    match index.entry(id.clone()) {
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(entry);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut slot) => {
+                            if explicit_id.is_some() && !slot.get().explicit_id {
+                                // явный id (SLC-документ) перекрывает производный
+                                slot.insert(entry);
+                            } else if explicit_id.is_some() && slot.get().explicit_id {
                                 return Err(SlcError::Storage(format!(
                                     "duplicate document id {id} in vault folders {:?} and {:?}",
-                                    previous.folder, entry.folder
+                                    slot.get().folder, entry.folder
                                 )));
                             }
+                            // производный id уже занят: оставляем первый файл
                         }
                     }
                 }
@@ -433,8 +472,12 @@ impl ObsidianVaultStore {
         let folder = sanitize_folder(&folder)?;
         let dir = self.root.join(&folder);
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.md", safe_file_name(&doc.document_id)));
         let previous = self.index.lock().unwrap().get(&doc.document_id).cloned();
+        let file_name = previous
+            .as_ref()
+            .and_then(|e| e.file_name.clone())
+            .unwrap_or_else(|| safe_file_name(&doc.document_id));
+        let path = dir.join(format!("{file_name}.md"));
         let text = render_doc(doc)?;
         std::fs::write(path, text)?;
 
@@ -446,7 +489,7 @@ impl ObsidianVaultStore {
                 let old_path = self
                     .root
                     .join(sanitize_folder(&previous.folder)?)
-                    .join(format!("{}.md", safe_file_name(&doc.document_id)));
+                    .join(format!("{file_name}.md"));
                 if old_path.exists() {
                     std::fs::remove_file(old_path)?;
                 }
@@ -459,8 +502,14 @@ impl ObsidianVaultStore {
 
     /// Read + parse a note into a Document (files are the source of truth).
     fn read_note(&self, entry: &IndexEntry) -> SlcResult<Document> {
-        let path = self.root.join(&sanitize_folder(&entry.folder)?)
-            .join(format!("{}.md", safe_file_name(&entry.id)));
+        let file_name = entry
+            .file_name
+            .clone()
+            .unwrap_or_else(|| safe_file_name(&entry.id));
+        let path = self
+            .root
+            .join(&sanitize_folder(&entry.folder)?)
+            .join(format!("{file_name}.md"));
         let text = std::fs::read_to_string(&path)?;
         let (meta, body) = frontmatter_parse(&text);
         let meta = meta.unwrap_or_default();

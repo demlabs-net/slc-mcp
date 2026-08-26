@@ -5,6 +5,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[package.metadata.deb]
+maintainer = "DemLabs <dev@demlabs.net>"
+copyright = "2026 DemLabs"
+depends = "ca-certificates"
+section = "net"
+priority = "optional"
+extended-description = """SLC MCP: MCP (JSON-RPC /mcp, SSE /sse) + REST + SPA web UI in one process."""
+assets = [
+  ["target/release/slc-mcp", "usr/local/bin/", "755"],
+  ["webui/**/*", "usr/share/slc-mcp/webui/", "644"],
+]
+
 [[bin]]
 name = "slc-mcp"
 path = "src/main.rs"

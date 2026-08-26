@@ -5,4 +5,4 @@ Cargo.lock
 slc-mcp.legacy
 secrets/
 vault/
-docker-compose.*.yml
+dist/

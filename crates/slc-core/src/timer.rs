@@ -317,7 +317,7 @@ mod tests {
 
         // advance until the first fire (next_fire_at = now + 1s); keep
         // advancing while the spawned task may have registered its sleep late.
-        advance_until(4000, || fired.load(Ordering::Relaxed) >= 1).await;
+        advance_until(60_000, || fired.load(Ordering::Relaxed) >= 1).await;
         assert_eq!(fired.load(Ordering::Relaxed), 1, "first fire");
 
         // periodic → still active and rescheduled
@@ -326,8 +326,9 @@ mod tests {
         assert!(active[0].is_active);
         assert!(active[0].last_fired_at.is_some());
 
-        // advance until the second fire
-        advance_until(4000, || fired.load(Ordering::Relaxed) >= 2).await;
+        // advance until the second fire (window must cover a late first
+        // fire plus the full reschedule interval)
+        advance_until(60_000, || fired.load(Ordering::Relaxed) >= 2).await;
         assert!(fired.load(Ordering::Relaxed) >= 2, "rescheduled fire");
 
         assert!(registry.cancel(&tid).await.unwrap());
