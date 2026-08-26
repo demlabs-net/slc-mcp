@@ -161,6 +161,44 @@ impl<S: StorageBackend> Paginator<S> {
         let char_limit = page_token_limit * CHARS_PER_TOKEN;
 
         if list_key.is_none() {
+            // Одиночный объект (например, get_document): если у него
+            // большой строковый `content` — режем ПО СОДЕРЖИМОМУ на части
+            // (поле `part: "k/n"`), каждая часть — страница get_page;
+            // клиент склеивает по порядку part — полный контент доходит
+            // без потерь даже при жёстком бюджете обвязки клиента.
+            if let Some(content) = result.get("content").and_then(|v| v.as_str()) {
+                if content.chars().count() > char_limit {
+                    let parts = Self::split_item(&result, char_limit - 200);
+                    let total_pages = parts.len();
+                    self.store
+                        .put_record(
+                            COLLECTION,
+                            &format!("{response_id}:pages"),
+                            &json!(parts),
+                        )
+                        .await?;
+                    self.store
+                        .put_record(
+                            COLLECTION,
+                            &format!("{response_id}:meta"),
+                            &json!({
+                                "total_pages": total_pages,
+                                "total_items": 1,
+                                "page_token_limit": page_token_limit,
+                                "created_at": Utc::now().to_rfc3339(),
+                            }),
+                        )
+                        .await?;
+                    let mut first = parts.into_iter().next().unwrap_or_default();
+                    first["_pagination"] = json!({
+                        "response_id": response_id,
+                        "page": 1,
+                        "total_pages": total_pages,
+                        "total_items": 1,
+                    });
+                    return Ok(first);
+                }
+            }
             // Not a list — single page, still tagged.
             let mut out = result.clone();
             out["_pagination"] = json!({ "response_id": response_id, "page": 1, "total_pages": 1 });
@@ -332,15 +370,19 @@ fn estimate_chars(v: &Value) -> usize {
 /// First key whose value is a non-empty list.
 fn find_list_key(result: &Value) -> Option<String> {
     let obj = result.as_object()?;
+    // Только НЕПУСТЫЕ массивы считаются списками: пустые поля объекта
+    // (auto_load/references/tags у документа) иначе перехватывали бы
+    // пагинацию, и одиночный объект с большим content не резался бы.
+    let non_empty = |v: &Value| v.as_array().is_some_and(|a| !a.is_empty());
     for key in ["results", "content", "items", "focuses", "reminders", "notifications", "tasks", "projects", "docs", "events"] {
         if let Some(v) = obj.get(key) {
-            if v.is_array() {
+            if non_empty(v) {
                 return Some(key.to_string());
             }
         }
     }
     for (k, v) in obj {
-        if v.is_array() {
+        if non_empty(v) {
             return Some(k.clone());
         }
     }
@@ -416,6 +458,51 @@ mod tests {
             }
         }
         assert_eq!(combined, big + "мелкий", "склейка частей = полный контент");
+    }
+
+    #[tokio::test]
+    async fn object_with_empty_arrays_still_splits_content() {
+        // get_document-ответ содержит пустые массивы (auto_load/
+        // references/tags) — они не должны перехватывать пагинацию.
+        let (p, _) = paginator();
+        let big = "абвгд ".repeat(3000);
+        let data = json!({"document_id": "doc_x", "category": "custom",
+                          "auto_load": [], "references": [], "tags": [],
+                          "content": big});
+        let result = p
+            .paginate_with_limit("s", "resp_doc2", &data, 2000)
+            .await
+            .unwrap();
+        let total = result["_pagination"]["total_pages"].as_u64().unwrap();
+        assert!(total >= 3, "контент должен разбиться, total={total}");
+        let mut combined = String::new();
+        for page in 1..=total {
+            let pg = p.get_page("s", "resp_doc2", page as usize).await.unwrap();
+            combined.push_str(pg["content"].as_str().unwrap());
+        }
+        assert_eq!(combined, big, "склейка = полный контент");
+    }
+
+    #[tokio::test]
+    async fn single_object_content_splits_into_parts() {
+        // get_document-подобный ответ (объект, не список) с большим
+        // content — режется по содержимому; склейка = полный контент.
+        let (p, _) = paginator();
+        let big = "абвгд ".repeat(3000); // ~18K символов
+        let data = json!({"document_id": "doc_x", "category": "custom", "content": big});
+        let result = p
+            .paginate_with_limit("s", "resp_doc", &data, 2000)
+            .await
+            .unwrap();
+        let total = result["_pagination"]["total_pages"].as_u64().unwrap();
+        assert!(total >= 3, "контент объекта должен разбиться, total={total}");
+        assert!(result.get("part").is_some(), "первая часть помечена part");
+        let mut combined = String::new();
+        for page in 1..=total {
+            let pg = p.get_page("s", "resp_doc", page as usize).await.unwrap();
+            combined.push_str(pg["content"].as_str().unwrap());
+        }
+        assert_eq!(combined, big, "склейка частей = полный контент документа");
     }
 
     async fn invalid_page_errors() {
