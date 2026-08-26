@@ -18,7 +18,11 @@ pub const COLLECTION: &str = "paginated_responses";
 
 /// Default page size. Clients with a smaller result budget can override it
 /// per connection with `X-SLC-Page-Token-Limit`.
-pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 50_000;
+/// 5000 токенов × 3 симв/токен = 15K символов ≈ 45K байт UTF-8 (RU) —
+/// страница гарантированно влезает в типовой resultBudget харнеса
+/// (50K байт на вывод одного тула). Клиенты с большим бюджетом
+/// настраивают X-SLC-Page-Token-Limit / SLC_PAGE_TOKEN_LIMIT.
+pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 5_000;
 
 /// Rough chars-per-token estimate (RU/EN смесь, как в движке).
 pub const CHARS_PER_TOKEN: usize = 3;
@@ -95,6 +99,38 @@ impl<S: StorageBackend> Paginator<S> {
             .unwrap_or(DEFAULT_PAGE_TOKEN_LIMIT))
     }
 
+    /// Разбить item по содержимому (`content`) на части ≤ `char_limit`
+    /// символов. Каждая часть помечается `part: "k/n"`; клиент склеивает
+    /// их по порядку. Не обрезка — все части отдаются через `get_page`.
+    fn split_item(item: &Value, char_limit: usize) -> Vec<Value> {
+        let Some(content) = item.get("content").and_then(|v| v.as_str()) else {
+            return vec![item.clone()];
+        };
+        let total = content.chars().count();
+        if total <= char_limit {
+            return vec![item.clone()];
+        }
+        let mut base = item.clone();
+        if let Some(obj) = base.as_object_mut() {
+            obj.remove("content");
+        }
+        let n_parts = total.div_ceil(char_limit);
+        let mut parts = Vec::new();
+        let mut rest = content;
+        let mut part = 1;
+        while !rest.is_empty() {
+            let take: String = rest.chars().take(char_limit).collect();
+            let taken_bytes = take.len();
+            let mut p = base.clone();
+            p["content"] = json!(take);
+            p["part"] = json!(format!("{part}/{n_parts}"));
+            parts.push(p);
+            rest = &rest[taken_bytes..];
+            part += 1;
+        }
+        parts
+    }
+
     /// Cache a response, splitting it into pages. Returns the paginated
     /// result (with `_pagination`). If the payload fits one page, returns it
     /// directly with a single-page envelope.
@@ -143,23 +179,40 @@ impl<S: StorageBackend> Paginator<S> {
         let mut pages: Vec<Value> = Vec::new();
         let mut current: Vec<Value> = Vec::new();
         let mut current_chars = 0usize;
+        let mut flush = |pages: &mut Vec<Value>,
+                         current: &mut Vec<Value>,
+                         current_chars: &mut usize| {
+            if !current.is_empty() {
+                let mut page = envelope.clone();
+                page[list_key.as_ref().unwrap()] = json!(*current);
+                pages.push(page);
+                *current = Vec::new();
+                *current_chars = 0;
+            }
+        };
         for item in items {
             let item_chars = estimate_chars(&item);
+            if item_chars > char_limit {
+                // Один документ не влезает в страницу — режем ПО
+                // СОДЕРЖИМОМУ на части (не обрезка: каждая часть — своя
+                // страница, клиент забирает все через get_page и склеивает
+                // по `part k/n`).
+                flush(&mut pages, &mut current, &mut current_chars);
+                for part in Self::split_item(&item, char_limit - 200) {
+                    flush(&mut pages, &mut current, &mut current_chars);
+                    current.push(part);
+                    current_chars = estimate_chars(current.last().unwrap());
+                }
+                flush(&mut pages, &mut current, &mut current_chars);
+                continue;
+            }
             if !current.is_empty() && current_chars + item_chars > char_limit {
-                let mut page = envelope.clone();
-                page[list_key.as_ref().unwrap()] = json!(current);
-                pages.push(page);
-                current = Vec::new();
-                current_chars = 0;
+                flush(&mut pages, &mut current, &mut current_chars);
             }
             current.push(item);
             current_chars += item_chars;
         }
-        if !current.is_empty() {
-            let mut page = envelope.clone();
-            page[list_key.as_ref().unwrap()] = json!(current);
-            pages.push(page);
-        }
+        flush(&mut pages, &mut current, &mut current_chars);
         if pages.is_empty() {
             let mut page = envelope.clone();
             page[list_key.as_ref().unwrap()] = json!([]);
@@ -336,6 +389,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn big_item_splits_by_content() {
+        // Один документ больше лимита страницы — режется ПО СОДЕРЖИМОМУ
+        // на части с `part: "k/n"`; все части отдаются через get_page.
+        let (p, _) = paginator();
+        let big = "абвгд ".repeat(4000); // ~24K символов
+        let data = json!({"results": [
+            {"document_id": "big", "content": big},
+            {"document_id": "small", "content": "мелкий"},
+        ]});
+        let result = p
+            .paginate_with_limit("s", "resp_big", &data, 2000) // 2000 ток × 3 = 6000 симв
+            .await
+            .unwrap();
+        let total = result["_pagination"]["total_pages"].as_u64().unwrap();
+        assert!(total >= 5, "big doc должен разбиться на части, total={total}");
+        // первая часть — chunk с part
+        let first = result["results"][0].clone();
+        assert!(first.get("part").is_some(), "часть должна быть помечена part");
+        // все части склеиваются в полный контент
+        let mut combined = String::new();
+        for page in 1..=total {
+            let pg = p.get_page("s", "resp_big", page as usize).await.unwrap();
+            for item in pg["results"].as_array().unwrap() {
+                combined.push_str(item["content"].as_str().unwrap());
+            }
+        }
+        assert_eq!(combined, big + "мелкий", "склейка частей = полный контент");
+    }
+
     async fn invalid_page_errors() {
         let (p, _) = paginator();
         let small: Vec<Value> = vec![json!(1), json!(2)];
@@ -365,7 +447,9 @@ mod tests {
     }
 
     #[test]
-    fn default_page_is_fifty_thousand_tokens() {
-        assert_eq!(DEFAULT_PAGE_TOKEN_LIMIT, 50_000);
+    fn default_page_is_five_thousand_tokens() {
+        // 5K токенов × 3 симв = 15K символов ≈ 45K байт RU — страница
+        // влезает в типовой resultBudget харнеса (50K байт).
+        assert_eq!(DEFAULT_PAGE_TOKEN_LIMIT, 5_000);
     }
 }

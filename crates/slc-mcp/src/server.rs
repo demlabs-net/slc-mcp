@@ -1133,8 +1133,10 @@ name and generate the new slug.
 When any tool response contains `_pagination` with
 `response_id`/`page`/`total_pages`, or says that the client budget truncated
 the response, retrieve every remaining page in order through
-`get_page(response_id=..., page=2..N)` and combine the content. Do not finish
-processing the response until all pages have been read.
+`get_page(response_id=..., page=2..N)` and combine the content. A large
+document may be split into parts (field `part: "k/n"` on the items) —
+concatenate the parts in k order to reconstruct the full content. Do not
+finish processing the response until all pages have been read.
 
 ## Seat roles
 
@@ -2786,6 +2788,7 @@ async fn call_tool(
                                 text.push_str(&format!(
                                     "Retrieve every remaining page in order with get_page(response_id={pid}, page=2..{total}), one page per call, and combine the items.\n"
                                 ));
+                                text.push_str("Pages may contain PARTS of one large document (field `part: \"k/n\"`) — concatenate them in part order to get the full content.\n");
                                 text.push_str("Do not finish processing the response until all pages have been retrieved.");
                             }
                         }
