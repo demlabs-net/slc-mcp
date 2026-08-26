@@ -159,6 +159,10 @@ impl<S: StorageBackend> Paginator<S> {
         };
         let list_key = find_list_key(&result);
         let char_limit = page_token_limit * CHARS_PER_TOKEN;
+        // Часть контента никогда не меньше 200 символов: защита от
+        // underflow (char_limit < 200) и от тысяч микро-страниц при
+        // экстремально малых лимитах.
+        let chunk_limit = char_limit.saturating_sub(200).max(200);
 
         if list_key.is_none() {
             // Одиночный объект (например, get_document): если у него
@@ -168,7 +172,7 @@ impl<S: StorageBackend> Paginator<S> {
             // без потерь даже при жёстком бюджете обвязки клиента.
             if let Some(content) = result.get("content").and_then(|v| v.as_str()) {
                 if content.chars().count() > char_limit {
-                    let parts = Self::split_item(&result, char_limit - 200);
+                    let parts = Self::split_item(&result, chunk_limit);
                     let total_pages = parts.len();
                     self.store
                         .put_record(
@@ -236,7 +240,7 @@ impl<S: StorageBackend> Paginator<S> {
                 // страница, клиент забирает все через get_page и склеивает
                 // по `part k/n`).
                 flush(&mut pages, &mut current, &mut current_chars);
-                for part in Self::split_item(&item, char_limit - 200) {
+                for part in Self::split_item(&item, chunk_limit) {
                     flush(&mut pages, &mut current, &mut current_chars);
                     current.push(part);
                     current_chars = estimate_chars(current.last().unwrap());
@@ -458,6 +462,23 @@ mod tests {
             }
         }
         assert_eq!(combined, big + "мелкий", "склейка частей = полный контент");
+    }
+
+    #[tokio::test]
+    async fn tiny_page_limit_does_not_panic_and_chunks() {
+        // page_token_limit=1 → char_limit=3; без защиты был underflow
+        // (char_limit - 200) и паника в debug / мусор в release.
+        let (p, _) = paginator();
+        let big = "абвгд ".repeat(1000);
+        let data = json!({"document_id": "doc_x", "content": big});
+        let result = p
+            .paginate_with_limit("s", "resp_tiny", &data, 1)
+            .await
+            .unwrap();
+        let total = result["_pagination"]["total_pages"].as_u64().unwrap();
+        assert!(total >= 2, "должны быть части, total={total}");
+        let first_len = result["content"].as_str().unwrap().chars().count();
+        assert!(first_len >= 200, "часть ≥ 200 символов, got {first_len}");
     }
 
     #[tokio::test]
