@@ -525,7 +525,7 @@ fn tools() -> Vec<Value> {
     vec![
         json!({
             "name": "search",
-            "description": "Hybrid search over the knowledge base (semantic + BM25)",
+            "description": "Hybrid search over the knowledge base (semantic + BM25). ВЫХОД ПАГИНИРУЕТСЯ — при _pagination дочитай все страницы.",
             "inputSchema": {"type":"object","properties":{
                 "query": {"type":"string","description":"search query"},
                 "limit": {"type":"number","default":10}
@@ -533,7 +533,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_document",
-            "description": "Load a document by its unique name id",
+            "description": "Load a document by its unique name id. ВЫХОД ПАГИНИРУЕТСЯ для больших документов: при _pagination дочитай ВСЕ страницы/части (part k/n) — только так получишь полный контент.",
             "inputSchema": {"type":"object","properties":{
                 "document_id": {"type":"string"}
             },"required":["document_id"]}
@@ -866,7 +866,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "list_documents",
-            "description": "List knowledge documents (id/category/folder/tags, no content) with optional filters",
+            "description": "List knowledge documents (id/category/folder/tags, no content) with optional filters. ВЫХОД ПАГИНИРУЕТСЯ — при _pagination дочитай все страницы get_page.",
             "inputSchema": {"type":"object","properties":{
                 "category": {"type":"string","description":"core|module|task|project|code_snippet|documentation|skill|custom|system"},
                 "folder": {"type":"string","description":"relative vault folder, e.g. docs/projects/slc"},
@@ -989,7 +989,7 @@ fn tools() -> Vec<Value> {
         // context
         json!({
             "name": "update_context",
-            "description": "Load (and optionally save) project context: base docs + active task + profiles + focuses",
+            "description": "Load (and optionally save) project context: base docs + active task + profiles + focuses. ВЫХОД ПАГИНИРУЕТСЯ при превышении лимита страницы (см. _pagination/get_page) — дочитай все страницы, особенно перед сохранением (summary), чтобы не потерять контент.",
             "inputSchema": {"type":"object","properties":{
                 "summary": {"type":"string","description":"persists a context snapshot when provided"},
                 "changes": {"type":"array","items":{"type":"string"}},
@@ -1000,7 +1000,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "save_context",
-            "description": "Persist the completed iteration as episodic history, then return the refreshed context. Use once at the end of every agent iteration, including cron, subagent and runner iterations.",
+            "description": "Persist the completed iteration as episodic history, then return the refreshed context. Use once at the end of every agent iteration, including cron, subagent and runner iterations. ВЫХОД ПАГИНИРУЕТСЯ — дочитай все страницы (get_page) до конца итерации.",
             "inputSchema": {"type":"object","properties":{
                 "summary": {"type":"string"},
                 "changes": {"type":"array","items":{"type":"string"}},
@@ -1130,13 +1130,40 @@ name and generate the new slug.
 
 ## Paginating large responses
 
-When any tool response contains `_pagination` with
-`response_id`/`page`/`total_pages`, or says that the client budget truncated
-the response, retrieve every remaining page in order through
-`get_page(response_id=..., page=2..N)` and combine the content. A large
-document may be split into parts (field `part: "k/n"` on the items) —
-concatenate the parts in k order to reconstruct the full content. Do not
-finish processing the response until all pages have been read.
+## Пагинация больших ответов (ОБЯЗАТЕЛЬНО к исполнению)
+
+Следующие функции отдают ПАГИНИРОВАННЫЙ выхлоп, когда ответ превышает
+лимит страницы (по умолчанию 5000 токенов ≈ 15K символов ≈ 45K байт RU):
+`update_context`, `save_context`, `get_document`, `list_documents`,
+`search`, `recall`, `list_tasks`, `list_projects`, `list_seats`,
+`notification_list`, `focus_list`, `reminder_list`, `document_stats` —
+любой ответ с `_pagination` (`response_id`/`page`/`total_pages`) или
+текстом «ОТВЕТ ОБРЕЗАН БЮДЖЕТОМ КЛИЕНТА».
+
+Правила:
+1. **Считывай ВСЕ страницы до конца**: получив `_pagination`, по очереди
+   вызови `get_page(response_id=..., page=2..N)`, по одной странице за
+   вызов, и сложи содержимое. Большой документ может быть разбит на
+   части (поле `part: "k/n"` у элементов) — склеивай части в порядке k,
+   они образуют ПОЛНЫЙ контент. Не завершай обработку, пока не
+   прочитаны все страницы.
+2. **Перед `update_context` / `save_context`** — если активный документ
+   пагинирован, обязательно дочитай его целиком (все страницы/части),
+   иначе последующее сохранение/обновление контекста потеряет часть
+   содержимого.
+3. **Перед обновлением любого большого документа** (`update_task` /
+   `update_project` / `update_document`) — сначала прочитай документ
+   ПОСТРАНИЧНО ПОЛНОСТЬЮ (get_document + все страницы `get_page`), и
+   только потом применяй diff-операции: дифф поверх неполной копии
+   затрёт потерянные секции.
+4. **Если клиент обрезает первую страницу** (обрезка на уровне обвязки:
+   сообщение «truncated by resultBudget»/«maxModelBytes») — уменьши размер
+   страницы: `set_page_limit(<токены>)` (persisted per-seat) или заголовок
+   `X-SLC-Page-Token-Limit: <токены>` на соединении (env сервера
+   `SLC_PAGE_TOKEN_LIMIT`). Формула: страница ≈ токены×3 символов ≈
+   токены×9 байт (RU); для бюджета 50K байт бери не больше 5000 токенов.
+   После уменьшения повтори чтение — страницы станут меньше и влезут в
+   бюджет обвязки целиком.
 
 ## Seat roles
 
