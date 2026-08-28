@@ -614,7 +614,15 @@ impl ObsidianVaultStore {
                 .unwrap_or("slc-mcp@local")
                 .to_string();
             let run = |args: Vec<&str>| {
-                std::process::Command::new("git")
+                // `git add -A` on a big vault can hang for a long time; the
+                // spawn_blocking thread then blocks tokio's shutdown after
+                // the reindex main completes (observed: process parked in
+                // futex_wait forever, "reindex complete" never printed).
+                // An external `timeout` bounds every git call — the process
+                // gets killed and the caller returns.
+                let mut cmd = std::process::Command::new("timeout");
+                cmd.arg("20")
+                    .arg("git")
                     .args(&args)
                     .current_dir(&root)
                     .env("GIT_AUTHOR_NAME", &author_name)
