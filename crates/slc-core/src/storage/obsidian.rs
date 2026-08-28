@@ -583,14 +583,22 @@ impl ObsidianVaultStore {
         out.into_iter().cloned().collect()
     }
 
-    async fn git_commit(&self) {
+    /// Fire-and-forget vault commit. The write path must NEVER block on git:
+    /// a stuck index.lock, a hung push or a slow `git add -A` on a big vault
+    /// used to stall the calling MCP request (the write itself had already
+    /// landed on disk — only the versioning lagged). Runs detached with a
+    /// bounded timeout; a failure only logs.
+    fn git_commit(&self) {
         if !self.auto_git_commit {
             return;
         }
         let root = self.root.clone();
         let author = self.git_author.clone();
         let git_lock = self.git_lock.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = tokio::task::spawn(async move {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                tokio::task::spawn_blocking(move || {
             let Ok(_guard) = git_lock.lock() else { return }; // serialize git index.lock
             let author_name = author
                 .split('<')
@@ -657,8 +665,9 @@ impl ObsidianVaultStore {
                 Ok(out) => failed(&out),
                 Err(e) => tracing::warn!("vault git add error: {e}"),
             }
-        })
-        .await;
+                }),
+            ).await;
+        });
     }
 }
 
@@ -718,7 +727,7 @@ impl StorageBackend for ObsidianVaultStore {
         }
         let doc = doc.clone();
         self.write_note(&doc)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -740,7 +749,7 @@ impl StorageBackend for ObsidianVaultStore {
         doc.version += 1;
         doc.updated_at = Utc::now();
         self.write_note(&doc)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -761,7 +770,7 @@ impl StorageBackend for ObsidianVaultStore {
         let exists = self.index.lock().unwrap().contains_key(&doc.document_id);
         let doc = doc.clone();
         self.write_note(&doc)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(exists)
     }
 
@@ -798,7 +807,7 @@ impl StorageBackend for ObsidianVaultStore {
             self.write_note(&doc)?;
             changed += 1;
         }
-        self.git_commit().await;
+        self.git_commit();
         Ok(changed)
     }
 
@@ -813,7 +822,7 @@ impl StorageBackend for ObsidianVaultStore {
         doc.deleted_at = Some(Utc::now());
         doc.version += 1;
         self.write_note(&doc)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -828,7 +837,7 @@ impl StorageBackend for ObsidianVaultStore {
         doc.deleted_at = None;
         doc.version += 1;
         self.write_note(&doc)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -842,7 +851,7 @@ impl StorageBackend for ObsidianVaultStore {
             let doc = doc.clone();
             self.write_note(&doc)?;
         }
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -872,7 +881,7 @@ impl StorageBackend for ObsidianVaultStore {
             true
         };
         self.persist_index()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(renamed)
     }
 
@@ -884,7 +893,7 @@ impl StorageBackend for ObsidianVaultStore {
         let _ = tokio::fs::remove_file(path).await;
         self.delete_embeddings(document_id).await?;
         self.persist_index()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -927,7 +936,7 @@ impl StorageBackend for ObsidianVaultStore {
         }
         let doc = doc.clone();
         self.write_note(&doc)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -937,7 +946,7 @@ impl StorageBackend for ObsidianVaultStore {
         }
         if self.index.lock().unwrap().contains_key(&doc.document_id) {
             self.write_note(doc)?;
-            self.git_commit().await;
+            self.git_commit();
             return Ok(true);
         }
         self.episodic_insert(doc).await?;
@@ -977,7 +986,7 @@ impl StorageBackend for ObsidianVaultStore {
             self.write_note(&doc)?;
             changed += 1;
         }
-        self.git_commit().await;
+        self.git_commit();
         Ok(changed)
     }
 
@@ -988,7 +997,7 @@ impl StorageBackend for ObsidianVaultStore {
             .join(format!("{}.md", safe_file_name(&e.id)));
         let _ = tokio::fs::remove_file(path).await;
         self.persist_index()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -1002,7 +1011,7 @@ impl StorageBackend for ObsidianVaultStore {
             }
         }
         self.persist_embeddings()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -1038,7 +1047,7 @@ impl StorageBackend for ObsidianVaultStore {
     async fn delete_embeddings(&self, document_id: &str) -> SlcResult<()> {
         self.embeddings.lock().unwrap().remove(document_id);
         self.persist_embeddings()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -1047,7 +1056,7 @@ impl StorageBackend for ObsidianVaultStore {
     async fn insert_seat(&self, seat: &Seat) -> SlcResult<()> {
         self.seats.lock().unwrap().insert(seat.seat_id.clone(), seat.clone());
         self.persist_seat(seat)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -1084,7 +1093,7 @@ impl StorageBackend for ObsidianVaultStore {
             seat.clone()
         };
         self.persist_seat(&seat)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -1096,7 +1105,7 @@ impl StorageBackend for ObsidianVaultStore {
             seat.clone()
         };
         self.persist_seat(&seat)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -1110,7 +1119,7 @@ impl StorageBackend for ObsidianVaultStore {
             seat.clone()
         };
         self.persist_seat(&seat)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -1122,7 +1131,7 @@ impl StorageBackend for ObsidianVaultStore {
             seat.clone()
         };
         self.persist_seat(&seat)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -1145,7 +1154,7 @@ impl StorageBackend for ObsidianVaultStore {
             seat.clone()
         };
         self.persist_seat(&seat)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -1154,7 +1163,7 @@ impl StorageBackend for ObsidianVaultStore {
     async fn insert_timer(&self, timer: &PersistedTimer) -> SlcResult<()> {
         self.timers.lock().unwrap().insert(timer.timer_id.clone(), timer.clone());
         self.persist_timers()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -1181,7 +1190,7 @@ impl StorageBackend for ObsidianVaultStore {
             }
         }
         self.persist_timers()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -1190,7 +1199,7 @@ impl StorageBackend for ObsidianVaultStore {
     async fn put_record(&self, collection: &str, key: &str, value: &Value) -> SlcResult<()> {
         self.records.lock().unwrap().insert((collection.to_string(), key.to_string()), value.clone());
         self.persist_records()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -1202,7 +1211,7 @@ impl StorageBackend for ObsidianVaultStore {
         let existed = self.records.lock().unwrap().remove(&(collection.to_string(), key.to_string())).is_some();
         if existed {
             self.persist_records()?;
-            self.git_commit().await;
+            self.git_commit();
         }
         Ok(existed)
     }
