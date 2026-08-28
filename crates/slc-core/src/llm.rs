@@ -119,7 +119,14 @@ impl LmStudioClient {
         embed_model: impl Into<String>,
     ) -> Self {
         LmStudioClient {
-            http: reqwest::Client::new(),
+            // A hung LM Studio (or a wedged connection) must not stall the
+            // caller forever: reindex-embeddings used to block on a batch
+            // embedding request with no timeout (observed: 0% CPU, process
+            // in futex_wait, embeddings.json frozen). 60s bounds every call.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
             embed_model: embed_model.into(),
