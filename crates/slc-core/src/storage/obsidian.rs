@@ -40,14 +40,13 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GIT_INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
+const GIT_ADD_TIMEOUT_SECONDS: u64 = 120;
+const GIT_COMMAND_TIMEOUT_SECONDS: u64 = 30;
 
-/// Preserve an abandoned Git index lock once it is old enough that it cannot
-/// belong to this store's bounded Git worker. The in-process `git_lock`
-/// serializes our own workers; the age guard avoids disrupting a short-lived
-/// external Git command operating on the same vault.
-fn quarantine_stale_git_index_lock(
+fn quarantine_git_index_lock(
     root: &Path,
     now: SystemTime,
+    minimum_age: Duration,
 ) -> std::io::Result<Option<PathBuf>> {
     let lock = root.join(".git/index.lock");
     let metadata = match std::fs::symlink_metadata(&lock) {
@@ -60,7 +59,7 @@ fn quarantine_stale_git_index_lock(
     }
     let modified = metadata.modified()?;
     let age = now.duration_since(modified).unwrap_or_default();
-    if age < GIT_INDEX_LOCK_STALE_AFTER {
+    if age < minimum_age {
         return Ok(None);
     }
 
@@ -69,10 +68,29 @@ fn quarantine_stale_git_index_lock(
     let timestamp = now
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_nanos();
     let quarantined = quarantine_dir.join(format!("index.lock.{timestamp}"));
     std::fs::rename(&lock, &quarantined)?;
     Ok(Some(quarantined))
+}
+
+/// Preserve an abandoned Git index lock once it is old enough that it cannot
+/// belong to this store's bounded Git worker. The in-process `git_lock`
+/// serializes our own workers; the age guard avoids disrupting a short-lived
+/// external Git command operating on the same vault.
+fn quarantine_stale_git_index_lock(
+    root: &Path,
+    now: SystemTime,
+) -> std::io::Result<Option<PathBuf>> {
+    quarantine_git_index_lock(root, now, GIT_INDEX_LOCK_STALE_AFTER)
+}
+
+fn git_command_timeout_seconds(args: &[&str]) -> u64 {
+    if args.first() == Some(&"add") {
+        GIT_ADD_TIMEOUT_SECONDS
+    } else {
+        GIT_COMMAND_TIMEOUT_SECONDS
+    }
 }
 
 /// Human-readable file name from a unique document id.
@@ -659,14 +677,13 @@ impl ObsidianVaultStore {
                 Err(error) => tracing::warn!("vault git lock recovery error: {error}"),
             }
             let run = |args: Vec<&str>| {
-                // `git add -A` on a big vault can hang for a long time; the
-                // spawn_blocking thread then blocks tokio's shutdown after
-                // the reindex main completes (observed: process parked in
-                // futex_wait forever, "reindex complete" never printed).
-                // An external `timeout` bounds every git call — the process
-                // gets killed and the caller returns.
+                // A cold `git add -A` on the production vault can legitimately
+                // exceed 20 seconds during a write burst, while push and the
+                // metadata-only commands should remain short. Bound both
+                // classes without turning a normal add into a stale lock.
                 let mut cmd = std::process::Command::new("timeout");
-                cmd.arg("20")
+                cmd.arg("--signal=KILL")
+                    .arg(git_command_timeout_seconds(&args).to_string())
                     .arg("git")
                     .args(&args)
                     .current_dir(&root)
@@ -715,7 +732,28 @@ impl ObsidianVaultStore {
                         Err(e) => tracing::warn!("vault git commit error: {e}"),
                     }
                 }
-                Ok(out) => failed(&out),
+                Ok(out) => {
+                    if matches!(out.status.code(), Some(124) | Some(137)) {
+                        // This worker owns the only in-process Git command and
+                        // has just killed it. Quarantine its lock immediately;
+                        // the age-based recovery remains for unrelated crashes.
+                        match quarantine_git_index_lock(
+                            &root,
+                            SystemTime::now(),
+                            Duration::ZERO,
+                        ) {
+                            Ok(Some(path)) => tracing::warn!(
+                                path = %path.display(),
+                                "vault git: quarantined index lock left by timeout"
+                            ),
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::warn!("vault git timeout recovery error: {error}")
+                            }
+                        }
+                    }
+                    failed(&out)
+                }
                 Err(e) => tracing::warn!("vault git add error: {e}"),
             }
                 }),
@@ -1515,5 +1553,12 @@ mod tests {
         assert_eq!(std::fs::read(quarantined).unwrap(), b"stale evidence");
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_add_gets_a_longer_timeout_than_metadata_commands() {
+        assert_eq!(git_command_timeout_seconds(&["add", "-A"]), 120);
+        assert_eq!(git_command_timeout_seconds(&["diff", "--cached"]), 30);
+        assert_eq!(git_command_timeout_seconds(&["push", "-q"]), 30);
     }
 }
