@@ -6,7 +6,7 @@
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderName, HeaderValue, StatusCode},
     response::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
@@ -67,7 +67,10 @@ pub async fn run(
     let app = Router::new()
         // Streamable-HTTP клиенты (go-sdk / Yandex AI Studio) открывают
         // SSE-поток GET-ом на URL сервера — отдаём тот же стрим, что и /sse.
-        .route("/mcp", get(sse_endpoint).post(mcp))
+        .route(
+            "/mcp",
+            get(sse_endpoint).post(mcp).delete(mcp_session_delete),
+        )
         .route("/sse", get(sse_endpoint))
         .route("/messages", post(messages))
         .route("/health", get(health))
@@ -380,8 +383,30 @@ async fn mcp(
         return StatusCode::ACCEPTED.into_response();
     }
 
+    let initialize = is_initialize_request(&req);
     let response = mcp_request(State(state), headers, Json(req)).await;
-    response.into_response()
+    let mut response = response.into_response();
+    if initialize && response.status().is_success() {
+        // Streamable HTTP clients only open their long-lived GET channel for
+        // server-initiated requests after the initialization response assigns
+        // a session. Without this header tools/call still works, but MCP
+        // sampling deadlocks: SLC waits for createMessage while the client has
+        // no receive stream. The server remains otherwise stateless; auth and
+        // seat isolation are enforced independently on every GET/POST.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        response.headers_mut().insert(
+            HeaderName::from_static("mcp-session-id"),
+            HeaderValue::from_str(&session_id).expect("UUID is a valid header value"),
+        );
+    }
+    response
+}
+
+/// SLC keeps no transport session state, so termination is an idempotent
+/// acknowledgement. Supporting DELETE prevents conforming clients from
+/// reporting a spurious 405 when their Streamable HTTP session closes.
+async fn mcp_session_delete() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 async fn mcp_request(
@@ -509,6 +534,10 @@ fn is_jsonrpc_notification(req: &Value) -> bool {
             .get("method")
             .and_then(Value::as_str)
             .is_some()
+}
+
+fn is_initialize_request(req: &Value) -> bool {
+    req.get("method").and_then(Value::as_str) == Some("initialize") && req.get("id").is_some()
 }
 
 /// Extract text from a standard MCP `CreateMessageResult`. Current MCP uses a
@@ -2980,6 +3009,26 @@ mod seat_filter_tests {
     fn ping_result_is_an_mcp_response_object() {
         assert_eq!(ping_result(), json!({}));
         assert!(ping_result().is_object());
+    }
+
+    #[test]
+    fn only_initialize_requests_create_streamable_http_sessions() {
+        assert!(is_initialize_request(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        })));
+        assert!(!is_initialize_request(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "params": {}
+        })));
+        assert!(!is_initialize_request(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        })));
     }
 
     #[test]
