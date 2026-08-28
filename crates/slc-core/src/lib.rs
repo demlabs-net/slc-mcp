@@ -565,7 +565,7 @@ impl SlcEngine {
         Ok(self.config.context_limit_tokens)
     }
 
-    /// The active LLM provider (LM Studio or Ollama).
+    /// The active reasoning provider (including MCP sampling or local hash).
     pub fn llm(&self) -> &dyn LlmClient {
         self.llm.as_ref()
     }

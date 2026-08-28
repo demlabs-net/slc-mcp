@@ -232,15 +232,13 @@ async fn sse_endpoint(
                     // see seat_matches_event).
                     let seat_matches = seat_matches_event(&evt, &seat);
                     if seat_matches {
-                        // JSON-RPC replies (legacy SSE protocol) → `message`
-                        // event with the response as data; everything else is
-                        // a server notification.
-                        if evt.get("type").and_then(|v| v.as_str()) == Some("rpc_response") {
-                            if let Some(resp) = evt.get("response") {
-                                yield Ok(Event::default().event("message").data(resp.to_string()));
-                            }
-                        } else {
-                            yield Ok(Event::default().event("notification").data(evt.to_string()));
+                        // Standard JSON-RPC traffic (legacy replies and
+                        // server-initiated sampling requests) uses an MCP
+                        // `message` event with the raw JSON-RPC envelope.
+                        // Internal lifecycle events retain the custom
+                        // `notification` event and wrapper metadata.
+                        if let Some((event_name, payload)) = sse_delivery(&evt) {
+                            yield Ok(Event::default().event(event_name).data(payload.to_string()));
                         }
                     }
                 }
@@ -401,15 +399,7 @@ async fn mcp_request(
     if method.is_empty() && id.is_some() {
         if let Some(rid) = id.as_ref().and_then(|v| v.as_str()) {
             if let Some(tx) = state.sampling.lock().unwrap().remove(rid) {
-                let text = req
-                    .get("result")
-                    .and_then(|r| r.get("content"))
-                    .and_then(|c| c.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|m| m.get("text"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let text = sampling_response_text(&req).unwrap_or_default();
                 let _ = tx.try_send(text);
                 return (StatusCode::OK, Json(json!({})));
             }
@@ -519,6 +509,22 @@ fn is_jsonrpc_notification(req: &Value) -> bool {
             .get("method")
             .and_then(Value::as_str)
             .is_some()
+}
+
+/// Extract text from a standard MCP `CreateMessageResult`. Current MCP uses a
+/// single content block; accept the older array representation as well so a
+/// rolling client upgrade cannot turn successful sampling into an empty
+/// summary.
+fn sampling_response_text(response: &Value) -> Option<String> {
+    let content = response.pointer("/result/content")?;
+    if let Some(text) = content.get("text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    content
+        .as_array()?
+        .iter()
+        .find_map(|block| block.get("text").and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 fn tools() -> Vec<Value> {
@@ -2878,6 +2884,24 @@ fn seat_matches_event(evt: &serde_json::Value, seat: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Convert an internally routed event into the SSE shape consumed by MCP
+/// clients. Sampling must leave the server as a raw JSON-RPC request; wrapping
+/// it in `{type, seat_id, message}` makes standard SDKs treat it as an unknown
+/// notification and the reasoning call times out.
+fn sse_delivery(evt: &Value) -> Option<(&'static str, Value)> {
+    match evt.get("type").and_then(Value::as_str) {
+        Some("rpc_response") => evt
+            .get("response")
+            .cloned()
+            .map(|payload| ("message", payload)),
+        Some("sampling_request") => evt
+            .get("message")
+            .cloned()
+            .map(|payload| ("message", payload)),
+        _ => Some(("notification", evt.clone())),
+    }
+}
+
 fn ping_result() -> Value {
     json!({})
 }
@@ -2910,6 +2934,46 @@ mod seat_filter_tests {
             &json!({"type": "x", "seat_id": 42}),
             "cursor-1"
         ));
+    }
+
+    #[test]
+    fn sampling_is_delivered_as_raw_jsonrpc_message() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "smp-1",
+            "method": "sampling/createMessage",
+            "params": {"messages": [], "maxTokens": 2000}
+        });
+        let routed = json!({
+            "type": "sampling_request",
+            "seat_id": "junior-1",
+            "message": request,
+        });
+        let (event_name, payload) = sse_delivery(&routed).unwrap();
+        assert_eq!(event_name, "message");
+        assert_eq!(payload, request);
+        assert!(payload.get("seat_id").is_none());
+    }
+
+    #[test]
+    fn sampling_response_accepts_current_and_legacy_content_shapes() {
+        let current = json!({
+            "jsonrpc": "2.0",
+            "id": "smp-1",
+            "result": {
+                "role": "assistant",
+                "content": {"type": "text", "text": "project-a"},
+                "model": "test"
+            }
+        });
+        assert_eq!(sampling_response_text(&current).as_deref(), Some("project-a"));
+
+        let legacy = json!({
+            "jsonrpc": "2.0",
+            "id": "smp-2",
+            "result": {"content": [{"type": "text", "text": "project-b"}]}
+        });
+        assert_eq!(sampling_response_text(&legacy).as_deref(), Some("project-b"));
     }
 
     #[test]

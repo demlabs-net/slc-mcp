@@ -17,9 +17,14 @@ The service exposes:
 - health: `GET /health`
 - REST/UI: `GET /api/*` and `/`
 
-Set `SLC_VAULT_PATH` to the Obsidian vault. Inference is configured with
-`SLC_LLM` and the matching provider variables; the development swarm uses the
-OpenAI-compatible LM Studio endpoint and models from `.env`.
+Set `SLC_VAULT_PATH` to the Obsidian vault. The development swarm enables
+`SLC_MCP_SAMPLING=true`: seat-scoped reasoning is delegated to the model of the
+connected MCP client with `sampling/createMessage`, so SLC has no dedicated
+generative endpoint. `SLC_LLM=hash` is the fail-closed provider for CLI paths
+that run without a connected client. Search itself remains available through
+BM25; agents perform multi-hop retrieval by iterating the search and read tools.
+Standalone installations may instead configure `SLC_LLM` and the matching
+LM Studio, Ollama, or Candle provider variables.
 
 The MCP endpoint is standard Streamable HTTP and currently negotiates MCP
 `2025-03-26`. It returns an object result for legacy `ping` requests and
@@ -75,12 +80,17 @@ The development swarm uses:
 - host MCP: `http://127.0.0.1:3000/mcp`
 - web UI: `http://agent-dev-0:2002`
 - private Forgejo repository: `devops/slc-vault`
+- inference: seat-scoped MCP sampling; no dedicated LM Studio/Ollama model
 
 Deploy with:
 
 ```bash
+./scripts/build-deb.sh
 docker compose -f docker-compose.agent-dev.yml up -d --build
 ```
+
+The build script runs the Rust workspace tests and packages the exact checkout
+into the ignored `dist/` directory consumed by the runtime image.
 
 The vault is an independent Git repository. Runtime Git access uses a
 write-enabled deploy key from `slc-mcp/secrets/`; secrets and the vault itself
@@ -98,11 +108,12 @@ be listed explicitly in `SLC_SEAT_MANAGE_ACL`.
 
 Hermes hooks call `update_context` before every model iteration and
 `save_context` afterward. Cron runs and delegated subagents use the same
-hooks. Developer and junior DeepSeek Harness runners receive the SLC URL and
-seat header from their wrapper, which also records runner-start and runner-end
-lifecycle snapshots. Hermes' built-in memory and agent-created skill tree use
-the same seat through the generic external-state tools; the container-local
-writable tree is only a process cache.
+hooks. The Developer harness receives the SLC URL and seat header from its
+wrapper, which also records runner-start and runner-end lifecycle snapshots.
+Junior roles work directly through Hermes and share the same lifecycle hooks.
+Hermes' built-in memory and agent-created skill tree use the same seat through
+the generic external-state tools; the container-local writable tree is only a
+process cache.
 
 ## Mongo migration
 

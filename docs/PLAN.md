@@ -77,8 +77,9 @@
 - [ ] observability: ActivityRecorder + MemoryMetrics (легковесные)
 - [ ] External sync (Obsidian ↔ git-remote) — по возможности
 - [ ] **агентская система — УБРАТЬ** (субагенты/многошаговые runs вне скоупа);
-      остаётся только **агентский поиск** (agentic search на gemma-4-e4b:
-      multi-hop retrieve → answer, в рамках `search`/RAG).
+      остаётся только **агентский поиск**: клиент сам выполняет multi-hop
+      retrieve → read → refine через MCP, а seat-scoped reasoning при
+      необходимости идёт через MCP sampling без отдельной модели SLC.
 
 ## P6 — Web UI (Rust, standalone)
 - [ ] **Web UI портируем на Rust** как отдельный standalone-сервер

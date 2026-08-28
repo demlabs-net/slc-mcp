@@ -1,11 +1,10 @@
 //! LLM client abstraction — summarization/reasoning + embeddings.
 //!
-//! Two HTTP providers (auto-selected, same as the Python legacy):
-//! - [`LmStudioClient`] — **LM Studio** (OpenAI-compatible `/v1/…`), chosen
-//!   when `LMSTUDIO_URL` is set. `google/gemma-4-e4b` for reasoning/agentic
-//!   work, `text-embedding-nomic-embed-text-v1.5` for embeddings (defaults,
-//!   overridable via `LMSTUDIO_MODEL` / `LMSTUDIO_EMBED_MODEL`).
-//! - [`OllamaClient`] — Ollama HTTP API, used otherwise.
+//! Production can use [`McpSamplingLlm`] for seat-scoped reasoning through the
+//! already connected MCP client's model. It needs no dedicated model server;
+//! embeddings are unavailable in this mode and search falls back to BM25.
+//! Standalone deployments can instead select LM Studio, Ollama, Candle, or the
+//! deterministic CPU-hash provider.
 //!
 //! Any other provider can implement [`LlmClient`] (e.g. the core Vassista
 //! `LlmProvider` when embedded via the static lib).
@@ -152,7 +151,7 @@ pub fn lmstudio_chat_body(model: &str, prompt: &str) -> serde_json::Value {
         "messages": [{"role": "user", "content": prompt}],
         "stream": false,
     });
-    // Reasoning-модели (nemotron и др.) по умолчанию генерируют длинную
+    // Reasoning-модели по умолчанию могут генерировать длинную
     // цепочку рассуждений, оставляя `content` пустым до её завершения.
     // Для коротких задач (нейминг id при миграции) можно отключить:
     // LMSTUDIO_REASONING_EFFORT=none.
@@ -363,9 +362,9 @@ impl LlmClient for MockLlm {
     }
 }
 
-/// LlmClient, который запрашивает инференс у MCP-КЛИЕНТА через sampling —
-/// фоллбэк для машин без локального GPU/LLM-сервера (слабые компы,
-/// виртуалки). Модель-клиента делает вызов за сервер; эмбеддинги через
+/// LlmClient, который запрашивает инференс у MCP-КЛИЕНТА через sampling.
+/// Модель клиента делает вызов за сервер; отдельный GPU/LLM-сервер самому
+/// SLC не нужен. Эмбеддинги через
 /// sampling невозможны — `generate_embedding` возвращает ошибку, и поиск
 /// честно деградирует в text-only (BM25).
 pub struct McpSamplingLlm {

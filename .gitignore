@@ -1,6 +1,6 @@
 target/
+.cargo/
 .env
-Cargo.lock
 .zcode
 slc-mcp.legacy
 secrets/
