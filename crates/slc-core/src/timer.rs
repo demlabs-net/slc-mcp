@@ -270,31 +270,13 @@ where
 mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteStore;
+    use tokio::sync::Notify;
 
-    /// Yield repeatedly so spawned tasks can reach their await points, then
-    /// advance the paused clock deterministically.
+    /// Yield repeatedly so a timer task can finish its storage update after
+    /// notifying the test handler.
     async fn yield_a_bit() {
         for _ in 0..16 {
             tokio::task::yield_now().await;
-        }
-    }
-
-    /// Advance the paused clock in small steps until `cond` holds (or the
-    /// budget is exhausted), yielding in between. Unlike a single fixed
-    /// advance, this is race-free against a spawned task that registers its
-    /// `sleep` late (after some steps already passed): a later step still
-    /// advances past its deadline.
-    async fn advance_until(total_ms: u64, cond: impl Fn() -> bool) {
-        // Let the task spawned by `register` reach `tokio::time::sleep`
-        // before the first clock advance. Advancing first made the short
-        // one-shot test scheduler-dependent under a busy parallel test run.
-        yield_a_bit().await;
-        for _ in 0..40 {
-            if cond() {
-                return;
-            }
-            tokio::time::advance(StdDuration::from_millis(total_ms / 40)).await;
-            yield_a_bit().await;
         }
     }
 
@@ -304,25 +286,35 @@ mod tests {
         let registry = TimerRegistry::new(store.clone());
         let fired = Arc::new(AtomicUsize::new(0));
         let fired2 = fired.clone();
+        let signal = Arc::new(Notify::new());
+        let signal2 = signal.clone();
         registry.set_handler(
             TimerType::HistoryCompression,
             Arc::new(FnHandler::new(move |_t| {
                 fired2.fetch_add(1, Ordering::Relaxed);
+                signal2.notify_one();
                 Ok(())
             })),
         );
 
         let tid = registry
-            .register(TimerType::HistoryCompression, "seat_t", Some(1), None, Value::Null)
+            .register(
+                TimerType::HistoryCompression,
+                "seat_t",
+                Some(1),
+                Some(Utc::now() - chrono::Duration::seconds(1)),
+                Value::Null,
+            )
             .await
             .unwrap();
         let _ = registry.start().await;
         assert_eq!(registry.spawned_count(), 1);
 
-        // advance until the first fire (next_fire_at = now + 1s); keep
-        // advancing while the spawned task may have registered its sleep late.
-        advance_until(60_000, || fired.load(Ordering::Relaxed) >= 1).await;
+        // Start overdue so awaiting the handler itself is the readiness
+        // barrier; this avoids racing a forced clock advance against spawn.
+        signal.notified().await;
         assert_eq!(fired.load(Ordering::Relaxed), 1, "first fire");
+        yield_a_bit().await;
 
         // periodic → still active and rescheduled
         let active = registry.list(Some("seat_t")).await.unwrap();
@@ -330,9 +322,10 @@ mod tests {
         assert!(active[0].is_active);
         assert!(active[0].last_fired_at.is_some());
 
-        // advance until the second fire (window must cover a late first
-        // fire plus the full reschedule interval)
-        advance_until(60_000, || fired.load(Ordering::Relaxed) >= 2).await;
+        // The first handler has completed and the periodic task has installed
+        // its next sleep, so advancing now exercises the reschedule path.
+        tokio::time::advance(StdDuration::from_secs(2)).await;
+        signal.notified().await;
         assert!(fired.load(Ordering::Relaxed) >= 2, "rescheduled fire");
 
         assert!(registry.cancel(&tid).await.unwrap());
@@ -345,19 +338,23 @@ mod tests {
         let registry = TimerRegistry::new(store.clone());
         let fired = Arc::new(AtomicUsize::new(0));
         let fired2 = fired.clone();
+        let signal = Arc::new(Notify::new());
+        let signal2 = signal.clone();
         registry.set_handler(
             TimerType::Reminder,
             Arc::new(FnHandler::new(move |_t| {
                 fired2.fetch_add(1, Ordering::Relaxed);
+                signal2.notify_one();
                 Ok(())
             })),
         );
         let _ = registry
-            .register(TimerType::Reminder, "seat_o", None, Some(Utc::now() + chrono::Duration::seconds(1)), Value::Null)
+            .register(TimerType::Reminder, "seat_o", None, Some(Utc::now() - chrono::Duration::seconds(1)), Value::Null)
             .await
             .unwrap();
         let _ = registry.start().await;
-        advance_until(4000, || fired.load(Ordering::Relaxed) >= 1).await;
+        signal.notified().await;
+        yield_a_bit().await;
         assert_eq!(fired.load(Ordering::Relaxed), 1);
         assert!(registry.list(Some("seat_o")).await.unwrap().is_empty(), "one-shot done → inactive");
     }
