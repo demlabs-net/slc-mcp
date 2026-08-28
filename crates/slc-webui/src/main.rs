@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     let dist = std::env::var("SLC_WEBUI_DIST")
         .unwrap_or_else(|_| "./web-ui/dist".into());
 
-    // Конфиг полностью из env (SLC_VAULT_PATH, LMSTUDIO_URL/OLLAMA,
+    // Конфиг полностью из env (SLC_VAULT_PATH, SLC_LLM/provider settings,
     // SLC_CONTEXT_LIMIT_TOKENS, OBSIDIAN_AUTO_GIT_COMMIT, SLC_AI_ORGANIZE…).
     let config = SlcConfig::default();
     if config.storage != StorageKind::ObsidianVault {

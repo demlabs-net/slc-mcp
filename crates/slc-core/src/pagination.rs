@@ -18,7 +18,11 @@ pub const COLLECTION: &str = "paginated_responses";
 
 /// Default page size. Clients with a smaller result budget can override it
 /// per connection with `X-SLC-Page-Token-Limit`.
-pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 50_000;
+/// 5000 токенов × 3 симв/токен = 15K символов ≈ 45K байт UTF-8 (RU) —
+/// страница гарантированно влезает в типовой resultBudget харнеса
+/// (50K байт на вывод одного тула). Клиенты с большим бюджетом
+/// настраивают X-SLC-Page-Token-Limit / SLC_PAGE_TOKEN_LIMIT.
+pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 5_000;
 
 /// Rough chars-per-token estimate (RU/EN смесь, как в движке).
 pub const CHARS_PER_TOKEN: usize = 3;
@@ -95,6 +99,38 @@ impl<S: StorageBackend> Paginator<S> {
             .unwrap_or(DEFAULT_PAGE_TOKEN_LIMIT))
     }
 
+    /// Разбить item по содержимому (`content`) на части ≤ `char_limit`
+    /// символов. Каждая часть помечается `part: "k/n"`; клиент склеивает
+    /// их по порядку. Не обрезка — все части отдаются через `get_page`.
+    fn split_item(item: &Value, char_limit: usize) -> Vec<Value> {
+        let Some(content) = item.get("content").and_then(|v| v.as_str()) else {
+            return vec![item.clone()];
+        };
+        let total = content.chars().count();
+        if total <= char_limit {
+            return vec![item.clone()];
+        }
+        let mut base = item.clone();
+        if let Some(obj) = base.as_object_mut() {
+            obj.remove("content");
+        }
+        let n_parts = total.div_ceil(char_limit);
+        let mut parts = Vec::new();
+        let mut rest = content;
+        let mut part = 1;
+        while !rest.is_empty() {
+            let take: String = rest.chars().take(char_limit).collect();
+            let taken_bytes = take.len();
+            let mut p = base.clone();
+            p["content"] = json!(take);
+            p["part"] = json!(format!("{part}/{n_parts}"));
+            parts.push(p);
+            rest = &rest[taken_bytes..];
+            part += 1;
+        }
+        parts
+    }
+
     /// Cache a response, splitting it into pages. Returns the paginated
     /// result (with `_pagination`). If the payload fits one page, returns it
     /// directly with a single-page envelope.
@@ -123,8 +159,50 @@ impl<S: StorageBackend> Paginator<S> {
         };
         let list_key = find_list_key(&result);
         let char_limit = page_token_limit * CHARS_PER_TOKEN;
+        // Часть контента никогда не меньше 200 символов: защита от
+        // underflow (char_limit < 200) и от тысяч микро-страниц при
+        // экстремально малых лимитах.
+        let chunk_limit = char_limit.saturating_sub(200).max(200);
 
         if list_key.is_none() {
+            // Одиночный объект (например, get_document): если у него
+            // большой строковый `content` — режем ПО СОДЕРЖИМОМУ на части
+            // (поле `part: "k/n"`), каждая часть — страница get_page;
+            // клиент склеивает по порядку part — полный контент доходит
+            // без потерь даже при жёстком бюджете обвязки клиента.
+            if let Some(content) = result.get("content").and_then(|v| v.as_str()) {
+                if content.chars().count() > char_limit {
+                    let parts = Self::split_item(&result, chunk_limit);
+                    let total_pages = parts.len();
+                    self.store
+                        .put_record(
+                            COLLECTION,
+                            &format!("{response_id}:pages"),
+                            &json!(parts),
+                        )
+                        .await?;
+                    self.store
+                        .put_record(
+                            COLLECTION,
+                            &format!("{response_id}:meta"),
+                            &json!({
+                                "total_pages": total_pages,
+                                "total_items": 1,
+                                "page_token_limit": page_token_limit,
+                                "created_at": Utc::now().to_rfc3339(),
+                            }),
+                        )
+                        .await?;
+                    let mut first = parts.into_iter().next().unwrap_or_default();
+                    first["_pagination"] = json!({
+                        "response_id": response_id,
+                        "page": 1,
+                        "total_pages": total_pages,
+                        "total_items": 1,
+                    });
+                    return Ok(first);
+                }
+            }
             // Not a list — single page, still tagged.
             let mut out = result.clone();
             out["_pagination"] = json!({ "response_id": response_id, "page": 1, "total_pages": 1 });
@@ -143,23 +221,40 @@ impl<S: StorageBackend> Paginator<S> {
         let mut pages: Vec<Value> = Vec::new();
         let mut current: Vec<Value> = Vec::new();
         let mut current_chars = 0usize;
+        let mut flush = |pages: &mut Vec<Value>,
+                         current: &mut Vec<Value>,
+                         current_chars: &mut usize| {
+            if !current.is_empty() {
+                let mut page = envelope.clone();
+                page[list_key.as_ref().unwrap()] = json!(*current);
+                pages.push(page);
+                *current = Vec::new();
+                *current_chars = 0;
+            }
+        };
         for item in items {
             let item_chars = estimate_chars(&item);
+            if item_chars > char_limit {
+                // Один документ не влезает в страницу — режем ПО
+                // СОДЕРЖИМОМУ на части (не обрезка: каждая часть — своя
+                // страница, клиент забирает все через get_page и склеивает
+                // по `part k/n`).
+                flush(&mut pages, &mut current, &mut current_chars);
+                for part in Self::split_item(&item, chunk_limit) {
+                    flush(&mut pages, &mut current, &mut current_chars);
+                    current.push(part);
+                    current_chars = estimate_chars(current.last().unwrap());
+                }
+                flush(&mut pages, &mut current, &mut current_chars);
+                continue;
+            }
             if !current.is_empty() && current_chars + item_chars > char_limit {
-                let mut page = envelope.clone();
-                page[list_key.as_ref().unwrap()] = json!(current);
-                pages.push(page);
-                current = Vec::new();
-                current_chars = 0;
+                flush(&mut pages, &mut current, &mut current_chars);
             }
             current.push(item);
             current_chars += item_chars;
         }
-        if !current.is_empty() {
-            let mut page = envelope.clone();
-            page[list_key.as_ref().unwrap()] = json!(current);
-            pages.push(page);
-        }
+        flush(&mut pages, &mut current, &mut current_chars);
         if pages.is_empty() {
             let mut page = envelope.clone();
             page[list_key.as_ref().unwrap()] = json!([]);
@@ -210,6 +305,27 @@ impl<S: StorageBackend> Paginator<S> {
             "page": page,
             "total_pages": pages.len(),
         });
+        // Мета-инфо о том, КОГДА и ПРИ КАКОМ лимите создан кэш: клиент,
+        // получивший total_pages=1 из старого кэша, видит причину.
+        if let Ok(Some(meta)) = self
+            .store
+            .get_record(COLLECTION, &format!("{response_id}:meta"))
+            .await
+        {
+            if let Some(limit) = meta.get("page_token_limit") {
+                out["_pagination"]["response_page_token_limit"] = limit.clone();
+            }
+            if let Some(ts) = meta.get("created_at") {
+                out["_pagination"]["response_created_at"] = ts.clone();
+            }
+            let current = self.page_token_limit().await.unwrap_or(0);
+            let cached = meta.get("page_token_limit").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if pages.len() == 1 && cached != 0 && cached != current {
+                out["_pagination"]["hint"] = json!(format!(
+                    "этот ответ кэширован при лимите страницы {cached} токенов, текущий — {current}. Если клиент обрезает выхлоп: set_page_limit(<меньше>) и ПОВТОРНО вызови исходный тул (например get_document) — кэш обновится."
+                ));
+            }
+        }
         Ok(out)
     }
 
@@ -279,15 +395,19 @@ fn estimate_chars(v: &Value) -> usize {
 /// First key whose value is a non-empty list.
 fn find_list_key(result: &Value) -> Option<String> {
     let obj = result.as_object()?;
+    // Только НЕПУСТЫЕ массивы считаются списками: пустые поля объекта
+    // (auto_load/references/tags у документа) иначе перехватывали бы
+    // пагинацию, и одиночный объект с большим content не резался бы.
+    let non_empty = |v: &Value| v.as_array().is_some_and(|a| !a.is_empty());
     for key in ["results", "content", "items", "focuses", "reminders", "notifications", "tasks", "projects", "docs", "events"] {
         if let Some(v) = obj.get(key) {
-            if v.is_array() {
+            if non_empty(v) {
                 return Some(key.to_string());
             }
         }
     }
     for (k, v) in obj {
-        if v.is_array() {
+        if non_empty(v) {
             return Some(k.clone());
         }
     }
@@ -336,6 +456,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn big_item_splits_by_content() {
+        // Один документ больше лимита страницы — режется ПО СОДЕРЖИМОМУ
+        // на части с `part: "k/n"`; все части отдаются через get_page.
+        let (p, _) = paginator();
+        let big = "абвгд ".repeat(4000); // ~24K символов
+        let data = json!({"results": [
+            {"document_id": "big", "content": big},
+            {"document_id": "small", "content": "мелкий"},
+        ]});
+        let result = p
+            .paginate_with_limit("s", "resp_big", &data, 2000) // 2000 ток × 3 = 6000 симв
+            .await
+            .unwrap();
+        let total = result["_pagination"]["total_pages"].as_u64().unwrap();
+        assert!(total >= 5, "big doc должен разбиться на части, total={total}");
+        // первая часть — chunk с part
+        let first = result["results"][0].clone();
+        assert!(first.get("part").is_some(), "часть должна быть помечена part");
+        // все части склеиваются в полный контент
+        let mut combined = String::new();
+        for page in 1..=total {
+            let pg = p.get_page("s", "resp_big", page as usize).await.unwrap();
+            for item in pg["results"].as_array().unwrap() {
+                combined.push_str(item["content"].as_str().unwrap());
+            }
+        }
+        assert_eq!(combined, big + "мелкий", "склейка частей = полный контент");
+    }
+
+    #[tokio::test]
+    async fn get_page_reports_cached_limit_and_hint() {
+        // Кэш создан при лимите 2000; текущий лимит (default 5000) другой —
+        // get_page должен сообщить, при каком лимите создан кэш, и
+        // подсказать, что при обрезке нужно перевызвать исходный тул.
+        let (p, _) = paginator();
+        // List-кэш создан при БОЛЬШОМ лимите → одна страница (сценарий
+        // агента: update_context/list_documents при 300000 токенов).
+        let data = json!({"results": [
+            {"document_id": "a", "content": "маленький"},
+            {"document_id": "b", "content": "тоже"},
+        ]});
+        let first = p
+            .paginate_with_limit("s", "resp_hint", &data, 300_000)
+            .await
+            .unwrap();
+        assert_eq!(first["_pagination"]["total_pages"], 1);
+        let page1 = p.get_page("s", "resp_hint", 1).await.unwrap();
+        let pag = &page1["_pagination"];
+        assert_eq!(pag["response_page_token_limit"], 300_000);
+        assert!(pag.get("response_created_at").is_some());
+        // cached(300000) != current(default 5000) → hint про перевызов.
+        let hint = pag.get("hint").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(hint.contains("set_page_limit"), "hint: {hint}");
+    }
+
+    #[tokio::test]
+    async fn tiny_page_limit_does_not_panic_and_chunks() {
+        // page_token_limit=1 → char_limit=3; без защиты был underflow
+        // (char_limit - 200) и паника в debug / мусор в release.
+        let (p, _) = paginator();
+        let big = "абвгд ".repeat(1000);
+        let data = json!({"document_id": "doc_x", "content": big});
+        let result = p
+            .paginate_with_limit("s", "resp_tiny", &data, 1)
+            .await
+            .unwrap();
+        let total = result["_pagination"]["total_pages"].as_u64().unwrap();
+        assert!(total >= 2, "должны быть части, total={total}");
+        let first_len = result["content"].as_str().unwrap().chars().count();
+        assert!(first_len >= 200, "часть ≥ 200 символов, got {first_len}");
+    }
+
+    #[tokio::test]
+    async fn object_with_empty_arrays_still_splits_content() {
+        // get_document-ответ содержит пустые массивы (auto_load/
+        // references/tags) — они не должны перехватывать пагинацию.
+        let (p, _) = paginator();
+        let big = "абвгд ".repeat(3000);
+        let data = json!({"document_id": "doc_x", "category": "custom",
+                          "auto_load": [], "references": [], "tags": [],
+                          "content": big});
+        let result = p
+            .paginate_with_limit("s", "resp_doc2", &data, 2000)
+            .await
+            .unwrap();
+        let total = result["_pagination"]["total_pages"].as_u64().unwrap();
+        assert!(total >= 3, "контент должен разбиться, total={total}");
+        let mut combined = String::new();
+        for page in 1..=total {
+            let pg = p.get_page("s", "resp_doc2", page as usize).await.unwrap();
+            combined.push_str(pg["content"].as_str().unwrap());
+        }
+        assert_eq!(combined, big, "склейка = полный контент");
+    }
+
+    #[tokio::test]
+    async fn single_object_content_splits_into_parts() {
+        // get_document-подобный ответ (объект, не список) с большим
+        // content — режется по содержимому; склейка = полный контент.
+        let (p, _) = paginator();
+        let big = "абвгд ".repeat(3000); // ~18K символов
+        let data = json!({"document_id": "doc_x", "category": "custom", "content": big});
+        let result = p
+            .paginate_with_limit("s", "resp_doc", &data, 2000)
+            .await
+            .unwrap();
+        let total = result["_pagination"]["total_pages"].as_u64().unwrap();
+        assert!(total >= 3, "контент объекта должен разбиться, total={total}");
+        assert!(result.get("part").is_some(), "первая часть помечена part");
+        let mut combined = String::new();
+        for page in 1..=total {
+            let pg = p.get_page("s", "resp_doc", page as usize).await.unwrap();
+            combined.push_str(pg["content"].as_str().unwrap());
+        }
+        assert_eq!(combined, big, "склейка частей = полный контент документа");
+    }
+
     async fn invalid_page_errors() {
         let (p, _) = paginator();
         let small: Vec<Value> = vec![json!(1), json!(2)];
@@ -365,7 +602,9 @@ mod tests {
     }
 
     #[test]
-    fn default_page_is_fifty_thousand_tokens() {
-        assert_eq!(DEFAULT_PAGE_TOKEN_LIMIT, 50_000);
+    fn default_page_is_five_thousand_tokens() {
+        // 5K токенов × 3 симв = 15K символов ≈ 45K байт RU — страница
+        // влезает в типовой resultBudget харнеса (50K байт).
+        assert_eq!(DEFAULT_PAGE_TOKEN_LIMIT, 5_000);
     }
 }

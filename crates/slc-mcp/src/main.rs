@@ -94,9 +94,11 @@ enum Cmd {
         /// Legacy MongoDB database (default: slc_mcp).
         #[arg(long, default_value = "slc_mcp")]
         db: String,
-        /// Переименовать id документов БЗ в осмысленные с помощью reasoning-LLM
-        /// из .env (SLC_LLM/LMSTUDIO_URL/OLLAMA) и переписать auto_load/
-        /// references под новые id. History-доки (дневник) получают
+        /// Переименовать id документов БЗ в осмысленные с помощью standalone
+        /// reasoning-провайдера из .env (`SLC_LLM` и его provider settings) и
+        /// переписать auto_load/references под новые id. MCP sampling здесь
+        /// недоступен, так как CLI не имеет подключённого MCP-клиента.
+        /// History-доки (дневник) получают
         /// детерминированные id (дата + хвост старого id).
         #[arg(long)]
         rename_with_ai: bool,

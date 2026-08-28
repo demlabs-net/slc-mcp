@@ -163,11 +163,11 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 | `SLC_CONTEXT_LIMIT_TOKENS` | `100000` | Fallback context budget when neither the connection nor seat specifies one |
 | `SLC_PAGINATION_ENABLED` | `true` | Enable pagination for large list-shaped MCP tool results |
 | `SLC_PAGE_TOKEN_LIMIT` | `50000` | Approximate page size and pagination threshold in tokens |
-| `SLC_LLM` | auto | Provider: hash/ollama/lmstudio/candle |
+| `SLC_LLM` | auto | Provider for non-sampling paths: hash/ollama/lmstudio/candle |
 | `LMSTUDIO_URL` | — | LM Studio URL |
 | `LMSTUDIO_MODEL` | `google/gemma-4-e4b` | Reasoning model |
 | `LMSTUDIO_EMBED_MODEL` | `text-embedding-nomic-embed-text-v1.5` | Embedding model |
-| `SLC_MCP_SAMPLING` | `false` | Fallback to MCP client inference |
+| `SLC_MCP_SAMPLING` | `false` | Use the authenticated seat's MCP client for reasoning; no dedicated generative endpoint |
 | `SLC_AI_ORGANIZE` | `true` | AI folder determination on add_document |
 | `SLC_SEAT_TTL_SECONDS` | `86400` | Seat TTL (0 = never expire) |
 | `SLC_SEARCH_MIN_SCORE` | `0.20` | Minimum search score |
