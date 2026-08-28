@@ -37,6 +37,43 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const GIT_INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Preserve an abandoned Git index lock once it is old enough that it cannot
+/// belong to this store's bounded Git worker. The in-process `git_lock`
+/// serializes our own workers; the age guard avoids disrupting a short-lived
+/// external Git command operating on the same vault.
+fn quarantine_stale_git_index_lock(
+    root: &Path,
+    now: SystemTime,
+) -> std::io::Result<Option<PathBuf>> {
+    let lock = root.join(".git/index.lock");
+    let metadata = match std::fs::symlink_metadata(&lock) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+    let modified = metadata.modified()?;
+    let age = now.duration_since(modified).unwrap_or_default();
+    if age < GIT_INDEX_LOCK_STALE_AFTER {
+        return Ok(None);
+    }
+
+    let quarantine_dir = root.join(".git/slc-stale-index-locks");
+    std::fs::create_dir_all(&quarantine_dir)?;
+    let timestamp = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let quarantined = quarantine_dir.join(format!("index.lock.{timestamp}"));
+    std::fs::rename(&lock, &quarantined)?;
+    Ok(Some(quarantined))
+}
 
 /// Human-readable file name from a unique document id.
 /// Keeps letters/digits/`-`/`_`/`.`/space; path-hostile chars → `-`.
@@ -613,6 +650,14 @@ impl ObsidianVaultStore {
                 .filter(|email| !email.is_empty())
                 .unwrap_or("slc-mcp@local")
                 .to_string();
+            match quarantine_stale_git_index_lock(&root, SystemTime::now()) {
+                Ok(Some(path)) => tracing::warn!(
+                    path = %path.display(),
+                    "vault git: quarantined abandoned index lock"
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::warn!("vault git lock recovery error: {error}"),
+            }
             let run = |args: Vec<&str>| {
                 // `git add -A` on a big vault can hang for a long time; the
                 // spawn_blocking thread then blocks tokio's shutdown after
@@ -1443,4 +1488,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stale_git_index_lock_is_quarantined_but_fresh_lock_is_preserved() {
+        let root = tmp_vault("git-lock-recovery");
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let lock = git_dir.join("index.lock");
+        std::fs::write(&lock, b"stale evidence").unwrap();
+        let modified = std::fs::metadata(&lock).unwrap().modified().unwrap();
+
+        assert!(quarantine_stale_git_index_lock(
+            &root,
+            modified + GIT_INDEX_LOCK_STALE_AFTER - Duration::from_secs(1),
+        )
+        .unwrap()
+        .is_none());
+        assert!(lock.exists());
+
+        let quarantined = quarantine_stale_git_index_lock(
+            &root,
+            modified + GIT_INDEX_LOCK_STALE_AFTER + Duration::from_secs(1),
+        )
+        .unwrap()
+        .expect("stale lock must be quarantined");
+        assert!(!lock.exists());
+        assert_eq!(std::fs::read(quarantined).unwrap(), b"stale evidence");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
