@@ -1,0 +1,18 @@
+[Unit]
+Description=SLC MCP — память и база знаний роя (MCP + CLI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=slc-mcp
+Group=slc-mcp
+EnvironmentFile=/etc/slc-mcp/.env
+ExecStart=/usr/local/bin/slc-mcp serve
+WorkingDirectory=/etc/slc-mcp
+Restart=always
+RestartSec=5
+ReadWritePaths=/opt/slc-vault
+
+[Install]
+WantedBy=multi-user.target
