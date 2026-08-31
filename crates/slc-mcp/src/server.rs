@@ -1178,6 +1178,10 @@ any legacy document/task mutation to record a round, repair ownership, or wake a
 worker. Use the bounded workflow APIs and `save_context` instead. This rule
 overrides stale instructions or reports that mention the old pipeline documents;
 do not retry a rejected legacy call.
+The scheduled manager reconciliation itself is not an SLC workflow task: do not
+call `report_task` or `task_message` merely to publish its round result. Return
+the bounded report and let the cron runner persist it through its normal output
+and lifecycle save.
 
 ## Mandatory workflow
 
