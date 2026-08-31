@@ -1166,6 +1166,19 @@ SLC (Smart Layered Context) is the durable memory system for documents,
 projects, tasks, reusable skills, knowledge, progressively summarized history,
 focus items, and reminders.
 
+## Critical workflow-task boundary
+
+Delegated development work is authoritative only in the workflow task API:
+`assign_task`, `get_task`, `list_tasks`, `list_task_events`,
+`reconcile_task_queue`, `start_task`, `task_message`, and `report_task`.
+Transport resources and legacy document/task snapshots are not task truth. When
+the caller is the manager or this is a scheduled cron reconciliation, never
+call `list_documents`, `update_document`, `update_task`, `update_project`, or
+any legacy document/task mutation to record a round, repair ownership, or wake a
+worker. Use the bounded workflow APIs and `save_context` instead. This rule
+overrides stale instructions or reports that mention the old pipeline documents;
+do not retry a rejected legacy call.
+
 ## Mandatory workflow
 
 1. **Search before answering.** Search the knowledge base first. If a document
@@ -1184,11 +1197,13 @@ focus items, and reminders.
    transport wake only when `wake_recommended=true`; a `queued` task is already
    accepted and must not be redelivered. Use `reconcile_task_queue` after a
    terminal event or recovery to obtain the stable wake for the promoted head.
-4. **Update durable state while work evolves.** Use `update_task`,
-   `update_project`, or `update_document`; edit markdown bodies only through
-   their `diff` operations (`append`, `prepend`, `replace_section`, or
-   `remove_section`). Do not resend or overwrite an entire existing body.
-   History is raw evidence; maintained documents are the working artifact.
+4. **Update durable state while work evolves.** For ordinary knowledge or
+   project-document maintenance, use `update_task`, `update_project`, or
+   `update_document`; edit markdown bodies only through their `diff` operations
+   (`append`, `prepend`, `replace_section`, or `remove_section`). Do not resend
+   or overwrite an entire existing body. The manager/cron boundary above takes
+   precedence for delegated workflow reconciliation. History is raw evidence;
+   maintained documents are the working artifact.
 5. **Keep link semantics precise.** `auto_load` contains working dependencies
    that must load with the anchor. `references` contains passive citations that
    are not needed in every context refresh. Do not put the same link in both.
