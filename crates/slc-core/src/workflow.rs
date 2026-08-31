@@ -671,17 +671,12 @@ impl SlcEngine {
                     .ok_or_else(|| {
                         SlcError::Storage("task assignment idempotency record is corrupt".into())
                     })?;
-                let queue = self.reconcile_task_queue_locked(&assignee).await?;
-                return queue
-                    .entries
-                    .into_iter()
-                    .find(|entry| entry.task.task_id == task_id)
-                    .map(|entry| entry.task)
-                    .ok_or_else(|| {
-                        SlcError::Storage(
-                            "idempotent task assignment is missing from its assignee queue".into(),
-                        )
-                    });
+                // Idempotency survives terminal closure. Terminal tasks are no
+                // longer present in the runnable FIFO, but replaying the
+                // original assignment must still return the original task
+                // projection instead of manufacturing a replacement.
+                let task = self.workflow_task_document(seat_id, task_id).await?;
+                return Ok(doc_to_task(&task));
             }
         }
 
@@ -1311,6 +1306,66 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("text-only principal"));
+    }
+
+    #[tokio::test]
+    async fn assignment_idempotency_survives_terminal_queue_removal() {
+        let engine = engine();
+        let first = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Terminal replay",
+                "One bounded change",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("terminal-assignment"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-junior",
+                &first.task_id,
+                "Starting",
+                Some("terminal-start"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_report_task(
+                "seat-junior",
+                &first.task_id,
+                "completed",
+                "Machine checks passed; visual review remains with the senior",
+                json!({}),
+                Some("terminal-report"),
+            )
+            .await
+            .unwrap();
+
+        let replay = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Terminal replay",
+                "One bounded change",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("terminal-assignment"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.task_id, first.task_id);
+        assert_eq!(replay.status, STATUS_COMPLETED);
+        assert_eq!(
+            replay.queue_state.as_deref(),
+            Some(QUEUE_STATE_TERMINAL)
+        );
     }
 
     #[tokio::test]

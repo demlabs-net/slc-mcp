@@ -126,6 +126,14 @@ retries safe; workflow mutations are serialized so concurrent retries cannot
 create duplicate events. Caller-owned assignment metadata is isolated from
 SLC projection fields and returned as `task.metadata`.
 
+Every assignee has a durable FIFO with capacity one. A new assignment is
+`ready` only when it owns the lane; later work remains `queued`. `start_task`
+rejects queued work, a terminal `report_task` releases the lane and atomically
+promotes the oldest queued task, and `reconcile_task_queue` repairs/reads that
+projection after recovery. The queue is per agent profile, independently of
+how many global parallel slots its inference backend exposes. Assignment
+idempotency remains replayable after terminal tasks leave the runnable FIFO.
+
 Configure `SLC_PRINCIPAL_SEATS` to map transport-neutral participant names to
 the existing SLC seats, and configure delegation independently with
 `SLC_TASK_ASSIGN_ACL`. A global coordinator requires an explicit `"*"` grant.
@@ -133,12 +141,15 @@ the existing SLC seats, and configure delegation independently with
 acceptance while still allowing them to report hashes, dimensions, and other
 machine evidence.
 
-A delivery adapter is optional. Assignment, start, message, and report results
-include an event, a sibling `wake_recommended` flag, and a four-field
+A delivery adapter is optional. Assignment, reconciliation, message, and
+report results include a sibling `wake_recommended` flag and, when applicable,
+a four-field
 `delivery` envelope: recipient, opaque task correlation ID, stable
 event-derived idempotency key, and a content-free instruction to read SLC.
 When a wake is recommended, a caller may pass `delivery` unchanged through
-Swarm MCP, Matrix, or another adapter. The task description, message, and
+Swarm MCP, Matrix, or another adapter. A queued assignment returns
+`wake_recommended=false` and must not be delivered until reconciliation exposes
+it as the single ready head. The task description, message, and
 report body remain only in SLC. Replacing the adapter therefore does not
 migrate task state or conversation history.
 
