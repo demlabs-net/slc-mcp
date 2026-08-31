@@ -698,7 +698,7 @@ fn tools() -> Vec<Value> {
         // tasks
         json!({
             "name": "assign_task",
-            "description": "Create and assign a durable transport-neutral task. SLC owns its issuer, assignee, parent/root lineage, status, reports, and event stream; the result includes a content-free delivery envelope for an optional message adapter.",
+            "description": "Append a durable task to the assignee's SLC-owned FIFO. Exactly one task per assignee can be ready/running; only a ready assignment includes a content-free wake envelope. Queued tasks must not be dispatched until reconcile_task_queue promotes them.",
             "inputSchema": {"type":"object","properties":{
                 "assignee": {"type":"string","description":"stable workflow principal, for example dev-junior-0"},
                 "name": {"type":"string","minLength":1},
@@ -730,7 +730,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "start_task",
-            "description": "Accept/start an assigned task and append a durable started event. Only the assignee may call it.",
+            "description": "Atomically start the ready FIFO head. Only the assignee may call it; queued tasks are rejected with their position instead of creating a parallel writer.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "message": {"type":"string","default":"Started"},
@@ -739,7 +739,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "report_task",
-            "description": "Append a durable task progress/terminal report and update the SLC-owned status. The result includes a content-free wake envelope; transports must not copy the report body or infer task state.",
+            "description": "Append a durable task progress/terminal report and update SLC state. A terminal report releases the assignee lane and atomically promotes the oldest queued task; transports must not copy report content or infer task state.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "status": {"type":"string","enum":["in_progress","completed","blocked","failed"]},
@@ -766,6 +766,13 @@ fn tools() -> Vec<Value> {
                 "task_id": {"type":"string"},
                 "limit": {"type":"number","default":100,"minimum":1,"maximum":500}
             },"required":["task_id"]}
+        }),
+        json!({
+            "name": "reconcile_task_queue",
+            "description": "Atomically inspect/repair one assignee FIFO. If the lane has no ready/running task, promote the oldest queued task and return its stable content-free delivery envelope. Use this for refill or recovery; never create a duplicate task to wake a busy role.",
+            "inputSchema": {"type":"object","properties":{
+                "assignee": {"type":"string","description":"stable workflow principal"}
+            },"required":["assignee"]}
         }),
         json!({
             "name": "update_task",
@@ -1172,6 +1179,11 @@ focus items, and reminders.
    Generated IDs are slugs without redundant `task_` or `project_` prefixes.
    Canonical task statuses are `PENDING`, `IN_WORK`, `COMPLETED`, and
    `CANCELLED`. Supply `project_id` when a task belongs to a project.
+   Delegated work uses `assign_task`: SLC appends it to the assignee's FIFO and
+   allows exactly one `ready`/`running` task for that role profile. Send a
+   transport wake only when `wake_recommended=true`; a `queued` task is already
+   accepted and must not be redelivered. Use `reconcile_task_queue` after a
+   terminal event or recovery to obtain the stable wake for the promoted head.
 4. **Update durable state while work evolves.** Use `update_task`,
    `update_project`, or `update_document`; edit markdown bodies only through
    their `diff` operations (`append`, `prepend`, `replace_section`, or
@@ -1642,9 +1654,9 @@ fn workflow_delivery(
     event_id: Option<&str>,
     event_kind: &str,
 ) -> Value {
-    let message = if event_kind == "created" {
+    let message = if matches!(event_kind, "created" | "ready") {
         format!(
-            "SLC task {task_id} has a new created event. Read it with get_task and call start_task before editing."
+            "SLC task {task_id} is ready at the head of your FIFO. Read it with get_task and call start_task before editing."
         )
     } else {
         format!(
@@ -2050,6 +2062,21 @@ async fn call_tool(
                 )
                 .await
                 .map_err(json_err)?;
+            let queue = engine
+                .workflow_reconcile_task_queue(seat_id, assignee)
+                .await
+                .map_err(json_err)?;
+            let wake_recommended = task.queue_state.as_deref()
+                == Some(slc_core::workflow::QUEUE_STATE_READY)
+                && queue.ready_task_id.as_deref() == Some(task.task_id.as_str());
+            let delivery = wake_recommended.then(|| {
+                workflow_delivery(
+                    Some(assignee),
+                    &task.task_id,
+                    task.queue_ready_event_id.as_deref(),
+                    "ready",
+                )
+            });
             if let Some(target_seat) = engine.workflow_seat(assignee) {
                 let _ = events.send(json!({
                     "type": "task_assigned",
@@ -2057,18 +2084,15 @@ async fn call_tool(
                     "task_id": task.task_id,
                     "issuer": task.issuer,
                     "assignee": task.assignee,
+                    "queue_state": task.queue_state,
                 }));
             }
             json!({
                 "success": true,
                 "task": task,
-                "delivery": workflow_delivery(
-                    Some(assignee),
-                    &task.task_id,
-                    task.last_event_id.as_deref(),
-                    "created",
-                ),
-                "wake_recommended": true,
+                "queue": queue,
+                "delivery": delivery,
+                "wake_recommended": wake_recommended,
             })
         }
         "create_task" => {
@@ -2141,7 +2165,7 @@ async fn call_tool(
             let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
             let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
             let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
-            let (task, event) = engine
+            let (task, event, next_ready_task) = engine
                 .workflow_report_task(seat_id, task_id, status, summary, metadata, idempotency_key)
                 .await
                 .map_err(json_err)?;
@@ -2158,6 +2182,14 @@ async fn call_tool(
                 }));
             }
             let terminal = matches!(task.status.as_str(), "COMPLETED" | "BLOCKED" | "FAILED");
+            let next_delivery = next_ready_task.as_ref().map(|next| {
+                workflow_delivery(
+                    next.assignee.as_deref(),
+                    &next.task_id,
+                    next.queue_ready_event_id.as_deref(),
+                    "ready",
+                )
+            });
             json!({
                 "success": true,
                 "task": task,
@@ -2169,6 +2201,8 @@ async fn call_tool(
                     event.kind.as_str(),
                 ),
                 "wake_recommended": terminal,
+                "next_ready_task": next_ready_task,
+                "next_delivery": next_delivery,
             })
         }
         "task_message" => {
@@ -2217,6 +2251,29 @@ async fn call_tool(
                 .await
                 .map_err(json_err)?;
             json!({"success": true, "task_id": task_id, "events": task_events})
+        }
+        "reconcile_task_queue" => {
+            let assignee = args.get("assignee").and_then(Value::as_str).unwrap_or("");
+            let queue = engine
+                .workflow_reconcile_task_queue(seat_id, assignee)
+                .await
+                .map_err(json_err)?;
+            let ready_task = queue.ready_task();
+            let delivery = ready_task.as_ref().map(|task| {
+                workflow_delivery(
+                    task.assignee.as_deref(),
+                    &task.task_id,
+                    task.queue_ready_event_id.as_deref(),
+                    "ready",
+                )
+            });
+            json!({
+                "success": true,
+                "queue": queue,
+                "ready_task": ready_task,
+                "delivery": delivery,
+                "wake_recommended": delivery.is_some(),
+            })
         }
         "update_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");

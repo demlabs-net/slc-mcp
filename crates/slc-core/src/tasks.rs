@@ -71,6 +71,13 @@ pub struct TaskInfo {
     pub last_event_id: Option<String>,
     pub last_event_at: Option<String>,
     pub terminal_summary: Option<String>,
+    /// Durable per-assignee execution lane state. Workflow tasks are queued
+    /// FIFO and at most one task may be `ready` or `running` for a principal.
+    pub queue_state: Option<String>,
+    /// Stable FIFO key assigned once when the workflow task is created.
+    pub queue_order: Option<String>,
+    /// Event used as the idempotency key for the current runnable wake.
+    pub queue_ready_event_id: Option<String>,
     /// Caller-owned structured task data, isolated from SLC projection fields.
     pub metadata: Value,
 }
@@ -126,6 +133,9 @@ pub(crate) fn doc_to_task(doc: &Document) -> TaskInfo {
         last_event_id: extra_field(doc, "last_event_id"),
         last_event_at: extra_field(doc, "last_event_at"),
         terminal_summary: extra_field(doc, "terminal_summary"),
+        queue_state: extra_field(doc, "queue_state"),
+        queue_order: extra_field(doc, "queue_order"),
+        queue_ready_event_id: extra_field(doc, "queue_ready_event_id"),
         metadata: doc
             .metadata
             .extra
