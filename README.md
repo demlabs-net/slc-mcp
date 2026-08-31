@@ -115,6 +115,33 @@ Hermes' built-in memory and agent-created skill tree use the same seat through
 the generic external-state tools; the container-local writable tree is only a
 process cache.
 
+## Durable task workflow
+
+SLC is the source of truth for delegated work. `assign_task` creates the task
+with stable issuer/assignee principals and parent/root lineage; `start_task`,
+`report_task`, and `task_message` append immutable events and update the task
+projection. `get_task`, workflow-aware `list_tasks`, and `list_task_events`
+work without any message bus. Idempotency keys make assignment and event
+retries safe; workflow mutations are serialized so concurrent retries cannot
+create duplicate events. Caller-owned assignment metadata is isolated from
+SLC projection fields and returned as `task.metadata`.
+
+Configure `SLC_PRINCIPAL_SEATS` to map transport-neutral participant names to
+the existing SLC seats, and configure delegation independently with
+`SLC_TASK_ASSIGN_ACL`. A global coordinator requires an explicit `"*"` grant.
+`SLC_TEXT_ONLY_PRINCIPALS` prevents non-vision models from claiming visual
+acceptance while still allowing them to report hashes, dimensions, and other
+machine evidence.
+
+A delivery adapter is optional. Assignment, start, message, and report results
+include an event, a sibling `wake_recommended` flag, and a four-field
+`delivery` envelope: recipient, opaque task correlation ID, stable
+event-derived idempotency key, and a content-free instruction to read SLC.
+When a wake is recommended, a caller may pass `delivery` unchanged through
+Swarm MCP, Matrix, or another adapter. The task description, message, and
+report body remain only in SLC. Replacing the adapter therefore does not
+migrate task state or conversation history.
+
 ## Mongo migration
 
 Back up MongoDB first, then import into an empty vault:

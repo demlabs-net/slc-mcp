@@ -14,7 +14,9 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use serde_json::{Value, json};
-use slc_core::{DocFilter, DocMeta, DocSort, Document, DocumentCategory, SlcEngine, SortDir};
+use slc_core::{
+    DocFilter, DocMeta, DocSort, Document, DocumentCategory, SlcEngine, SortDir, TaskListScope,
+};
 use std::sync::Arc;
 
 use crate::{auth, webui};
@@ -89,7 +91,10 @@ pub async fn run(
                 .delete(webui::api::delete_document),
         )
         .route("/api/search", get(webui::api::search))
-        .route("/api/tasks", get(webui::api::list_tasks).post(webui::api::create_task))
+        .route(
+            "/api/tasks",
+            get(webui::api::list_tasks).post(webui::api::create_task),
+        )
         .route(
             "/api/tasks/{id}",
             put(webui::api::update_task).delete(webui::api::delete_task),
@@ -112,7 +117,10 @@ pub async fn run(
             get(webui::api::reminder_list).post(webui::api::reminder_create),
         )
         .route("/api/reminders/{id}", delete(webui::api::reminder_cancel))
-        .route("/api/focuses", get(webui::api::focus_list).post(webui::api::focus_add))
+        .route(
+            "/api/focuses",
+            get(webui::api::focus_list).post(webui::api::focus_add),
+        )
         .route(
             "/api/focuses/{id}",
             put(webui::api::focus_update).delete(webui::api::focus_remove),
@@ -128,19 +136,37 @@ pub async fn run(
             "/api/auth/oauth/yandex",
             get(auth::routes::oauth_yandex_redirect).post(auth::routes::oauth_yandex_code),
         )
-        .route("/api/auth/oauth/yandex/callback", get(auth::routes::oauth_yandex_callback))
-        .route("/api/auth/oauth/yandex/callback_uri", get(auth::routes::oauth_callback_uri))
+        .route(
+            "/api/auth/oauth/yandex/callback",
+            get(auth::routes::oauth_yandex_callback),
+        )
+        .route(
+            "/api/auth/oauth/yandex/callback_uri",
+            get(auth::routes::oauth_callback_uri),
+        )
         .route("/api/auth/exchange", post(auth::routes::exchange))
         .route("/api/auth/users", get(auth::routes::list_users))
-        .route("/api/auth/users/{user_id}/groups", put(auth::routes::update_user_groups))
-        .route("/api/auth/users/{user_id}/active", put(auth::routes::toggle_user_active))
+        .route(
+            "/api/auth/users/{user_id}/groups",
+            put(auth::routes::update_user_groups),
+        )
+        .route(
+            "/api/auth/users/{user_id}/active",
+            put(auth::routes::toggle_user_active),
+        )
         .route("/api/auth/groups", get(auth::routes::list_groups))
-        .route("/api/admin/oauth/rules", get(auth::routes::oauth_rules_list).post(auth::routes::oauth_rule_create))
+        .route(
+            "/api/admin/oauth/rules",
+            get(auth::routes::oauth_rules_list).post(auth::routes::oauth_rule_create),
+        )
         .route(
             "/api/admin/oauth/rules/{rule_id}",
             put(auth::routes::oauth_rule_update).delete(auth::routes::oauth_rule_delete),
         )
-        .route("/api/admin/oauth/ya360/status", get(auth::routes::ya360_status))
+        .route(
+            "/api/admin/oauth/ya360/status",
+            get(auth::routes::ya360_status),
+        )
         .fallback(webui::static_files::handler)
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(state);
@@ -466,13 +492,11 @@ async fn mcp_request(
     }
 
     let result = match method {
-        "initialize" => {
-            Ok(json!({
-                "protocolVersion": "2025-03-26",
-                "capabilities": { "tools": {}, "prompts": {} },
-                "serverInfo": { "name": "slc-mcp", "version": env!("CARGO_PKG_VERSION") },
-            }))
-        }
+        "initialize" => Ok(json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": { "tools": {}, "prompts": {} },
+            "serverInfo": { "name": "slc-mcp", "version": env!("CARGO_PKG_VERSION") },
+        })),
         // MCP ping responses must contain an object result.  Returning JSON
         // null is legal in generic JSON-RPC, but the MCP SDK models `result`
         // as an object and rejects null before the keepalive can complete.
@@ -503,15 +527,7 @@ async fn mcp_request(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let seat = seat_hdr.clone().unwrap_or_default();
-            call_tool(
-                engine,
-                &seat,
-                name,
-                &args,
-                &state.events,
-                pagination,
-            )
-            .await
+            call_tool(engine, &seat, name, &args, &state.events, pagination).await
         }
         _ => Err(json!({"code": -32601, "message": format!("method not found: {method}")})),
     };
@@ -529,11 +545,7 @@ async fn mcp_request(
 }
 
 fn is_jsonrpc_notification(req: &Value) -> bool {
-    req.get("id").is_none()
-        && req
-            .get("method")
-            .and_then(Value::as_str)
-            .is_some()
+    req.get("id").is_none() && req.get("method").and_then(Value::as_str).is_some()
 }
 
 fn is_initialize_request(req: &Value) -> bool {
@@ -685,8 +697,22 @@ fn tools() -> Vec<Value> {
         }),
         // tasks
         json!({
+            "name": "assign_task",
+            "description": "Create and assign a durable transport-neutral task. SLC owns its issuer, assignee, parent/root lineage, status, reports, and event stream; the result includes a content-free delivery envelope for an optional message adapter.",
+            "inputSchema": {"type":"object","properties":{
+                "assignee": {"type":"string","description":"stable workflow principal, for example dev-junior-0"},
+                "name": {"type":"string","minLength":1},
+                "description": {"type":"string","default":""},
+                "parent_task_id": {"type":"string"},
+                "project_id": {"type":"string"},
+                "auto_load": {"type":"array","items":{"type":"string"}},
+                "metadata": {"type":"object"},
+                "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
+            },"required":["assignee","name","idempotency_key"]}
+        }),
+        json!({
             "name": "create_task",
-            "description": "Create a new task (private to current seat)",
+            "description": "Create a private task for the current seat. Use assign_task for delegated/shared workflow work.",
             "inputSchema": {"type":"object","properties":{
                 "name": {"type":"string"},
                 "description": {"type":"string","default":""},
@@ -694,6 +720,52 @@ fn tools() -> Vec<Value> {
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "metadata": {"type":"object"}
             },"required":["name"]}
+        }),
+        json!({
+            "name": "get_task",
+            "description": "Read a workflow task visible to the caller as its issuer, assignee, or authorized coordinator.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"}
+            },"required":["task_id"]}
+        }),
+        json!({
+            "name": "start_task",
+            "description": "Accept/start an assigned task and append a durable started event. Only the assignee may call it.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"},
+                "message": {"type":"string","default":"Started"},
+                "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
+            },"required":["task_id","idempotency_key"]}
+        }),
+        json!({
+            "name": "report_task",
+            "description": "Append a durable task progress/terminal report and update the SLC-owned status. The result includes a content-free wake envelope; transports must not copy the report body or infer task state.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"},
+                "status": {"type":"string","enum":["in_progress","completed","blocked","failed"]},
+                "summary": {"type":"string","minLength":1},
+                "metadata": {"type":"object","description":"machine evidence, paths, hashes, metrics, and structured findings"},
+                "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
+            },"required":["task_id","status","summary","idempotency_key"]}
+        }),
+        json!({
+            "name": "task_message",
+            "description": "Append a durable message to a task conversation. Recipient must be that task's issuer or assignee. The result includes a content-free wake envelope for an optional transport; the message body remains canonical only here.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"},
+                "recipient": {"type":"string"},
+                "message": {"type":"string","minLength":1},
+                "metadata": {"type":"object"},
+                "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
+            },"required":["task_id","recipient","message","idempotency_key"]}
+        }),
+        json!({
+            "name": "list_task_events",
+            "description": "Read the immutable SLC event stream for a visible task: assignment, start, messages, progress, and terminal reports.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"},
+                "limit": {"type":"number","default":100,"minimum":1,"maximum":500}
+            },"required":["task_id"]}
         }),
         json!({
             "name": "update_task",
@@ -708,7 +780,7 @@ fn tools() -> Vec<Value> {
                 },"required":["op"]},"description":"The only supported body-edit mechanism. Operations run in order; resending the full body is forbidden."},
                 "project_id": {"type":"string"},
                 "auto_load": {"type":"array","items":{"type":"string"}},
-                "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","CANCELLED"]},
+                "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","BLOCKED","FAILED","CANCELLED"]},
                 "metadata": {"type":"object"}
             },"required":["task_id"]}
         }),
@@ -765,10 +837,13 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "list_tasks",
-            "description": "List tasks with optional filters. An operator may inspect an explicitly allowed subordinate with target_seat.",
+            "description": "List SLC-owned tasks visible to the caller, including delegated tasks by issuer/assignee. Legacy target_seat remains available for private-seat inspection by an operator.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
-                "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","CANCELLED"]},
+                "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","BLOCKED","FAILED","CANCELLED","pending","in_progress","completed","blocked","failed","cancelled"]},
+                "scope": {"type":"string","enum":["visible","assigned","issued"],"default":"visible"},
+                "assignee": {"type":"string"},
+                "issuer": {"type":"string"},
                 "limit": {"type":"number","default":50},
                 "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
             },"required":[]}
@@ -1506,10 +1581,7 @@ async fn task_list(engine: &SlcEngine, _seat_id: Option<&str>) -> Result<Vec<Val
 const STATE_MAX_CONTENT_CHARS: usize = 5 * 1024 * 1024;
 
 fn state_namespace(args: &Value) -> Result<&str, Value> {
-    let namespace = args
-        .get("namespace")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let namespace = args.get("namespace").and_then(Value::as_str).unwrap_or("");
     if namespace.is_empty()
         || namespace.len() > 64
         || !namespace
@@ -1562,6 +1634,29 @@ fn state_document_matches(doc: &Document, seat_id: &str, namespace: &str, key: &
             .get("external_state_key")
             .and_then(Value::as_str)
             == Some(key)
+}
+
+fn workflow_delivery(
+    recipient: Option<&str>,
+    task_id: &str,
+    event_id: Option<&str>,
+    event_kind: &str,
+) -> Value {
+    let message = if event_kind == "created" {
+        format!(
+            "SLC task {task_id} has a new created event. Read it with get_task and call start_task before editing."
+        )
+    } else {
+        format!(
+            "SLC task {task_id} has a new {event_kind} event. Read list_task_events for canonical content and state."
+        )
+    };
+    json!({
+        "recipient": recipient,
+        "correlation_id": task_id,
+        "idempotency_key": event_id,
+        "message": message,
+    })
 }
 
 async fn call_tool(
@@ -1923,6 +2018,59 @@ async fn call_tool(
             }
         }
         // tasks
+        "assign_task" => {
+            let assignee = args.get("assignee").and_then(Value::as_str).unwrap_or("");
+            let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+            let description = args
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let parent_task_id = args
+                .get("parent_task_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let project_id = args
+                .get("project_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let auto_load = str_array(args, "auto_load");
+            let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
+            let task = engine
+                .workflow_assign_task(
+                    seat_id,
+                    assignee,
+                    name,
+                    description,
+                    parent_task_id,
+                    project_id,
+                    &auto_load,
+                    &metadata,
+                    idempotency_key,
+                )
+                .await
+                .map_err(json_err)?;
+            if let Some(target_seat) = engine.workflow_seat(assignee) {
+                let _ = events.send(json!({
+                    "type": "task_assigned",
+                    "seat_id": target_seat,
+                    "task_id": task.task_id,
+                    "issuer": task.issuer,
+                    "assignee": task.assignee,
+                }));
+            }
+            json!({
+                "success": true,
+                "task": task,
+                "delivery": workflow_delivery(
+                    Some(assignee),
+                    &task.task_id,
+                    task.last_event_id.as_deref(),
+                    "created",
+                ),
+                "wake_recommended": true,
+            })
+        }
         "create_task" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let description = args
@@ -1945,6 +2093,131 @@ async fn call_tool(
                 .map_err(json_err)?;
             json!({"success": true, "task_id": t.task_id, "name": t.name, "project_id": t.project_id, "message": format!("Task '{}' created", t.name)})
         }
+        "get_task" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let task = engine
+                .workflow_get_task(seat_id, task_id)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "task": task})
+        }
+        "start_task" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let message = args
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Started");
+            let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
+            let (task, event) = engine
+                .workflow_start_task(seat_id, task_id, message, idempotency_key)
+                .await
+                .map_err(json_err)?;
+            if let Some(issuer) = task.issuer.as_deref()
+                && let Some(target_seat) = engine.workflow_seat(issuer)
+            {
+                let _ = events.send(json!({
+                    "type": "task_started",
+                    "seat_id": target_seat,
+                    "task_id": task.task_id,
+                    "assignee": task.assignee,
+                }));
+            }
+            json!({
+                "success": true,
+                "task": task,
+                "event": event,
+                "delivery": workflow_delivery(
+                    task.issuer.as_deref(),
+                    &task.task_id,
+                    Some(&event.event_id),
+                    "started",
+                ),
+                "wake_recommended": false,
+            })
+        }
+        "report_task" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let status = args.get("status").and_then(Value::as_str).unwrap_or("");
+            let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
+            let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
+            let (task, event) = engine
+                .workflow_report_task(seat_id, task_id, status, summary, metadata, idempotency_key)
+                .await
+                .map_err(json_err)?;
+            if let Some(issuer) = task.issuer.as_deref()
+                && let Some(target_seat) = engine.workflow_seat(issuer)
+            {
+                let _ = events.send(json!({
+                    "type": "task_reported",
+                    "seat_id": target_seat,
+                    "task_id": task.task_id,
+                    "event_id": event.event_id,
+                    "status": task.status,
+                    "assignee": task.assignee,
+                }));
+            }
+            let terminal = matches!(task.status.as_str(), "COMPLETED" | "BLOCKED" | "FAILED");
+            json!({
+                "success": true,
+                "task": task,
+                "event": event,
+                "delivery": workflow_delivery(
+                    task.issuer.as_deref(),
+                    &task.task_id,
+                    Some(&event.event_id),
+                    event.kind.as_str(),
+                ),
+                "wake_recommended": terminal,
+            })
+        }
+        "task_message" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let recipient = args.get("recipient").and_then(Value::as_str).unwrap_or("");
+            let message = args.get("message").and_then(Value::as_str).unwrap_or("");
+            let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
+            let event = engine
+                .workflow_task_message(
+                    seat_id,
+                    task_id,
+                    recipient,
+                    message,
+                    metadata,
+                    idempotency_key,
+                )
+                .await
+                .map_err(json_err)?;
+            if let Some(target_seat) = engine.workflow_seat(recipient) {
+                let _ = events.send(json!({
+                    "type": "task_message",
+                    "seat_id": target_seat,
+                    "task_id": task_id,
+                    "event_id": event.event_id,
+                    "actor": event.actor,
+                }));
+            }
+            json!({
+                "success": true,
+                "event": event,
+                "delivery": workflow_delivery(
+                    Some(recipient),
+                    task_id,
+                    Some(&event.event_id),
+                    "message",
+                ),
+                "wake_recommended": true,
+            })
+        }
+        "list_task_events" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+            let task_events = engine
+                .workflow_task_events(seat_id, task_id, limit)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "task_id": task_id, "events": task_events})
+        }
         "update_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
@@ -1956,7 +2229,9 @@ async fn call_tool(
                 .cloned()
                 .or_else(|| args.get("description_patch").cloned());
             if description.is_some() && description_patch.is_some() {
-                return Err(json!({"code": -32602, "message": "pass either full-replacement description or diff/description_patch, not both"}));
+                return Err(
+                    json!({"code": -32602, "message": "pass either full-replacement description or diff/description_patch, not both"}),
+                );
             }
             let project_id = args
                 .get("project_id")
@@ -2000,7 +2275,11 @@ async fn call_tool(
         }
         "activate_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
             let ok = engine
                 .task_activate_for(seat_id, target, task_id)
                 .await
@@ -2009,8 +2288,15 @@ async fn call_tool(
         }
         "deactivate_task" => {
             // clear the active task pointer
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
-            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
+            engine
+                .require_seat_manage(seat_id, target)
+                .await
+                .map_err(json_err)?;
             engine
                 .seats
                 .set_active_task(target, None, None)
@@ -2019,13 +2305,22 @@ async fn call_tool(
             json!({"success": true, "seat_id": target, "message": "Task deactivated"})
         }
         "get_active_task" => {
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
-            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
+            engine
+                .require_seat_manage(seat_id, target)
+                .await
+                .map_err(json_err)?;
             match engine.task_get_active(target).await.map_err(json_err)? {
                 Some(t) => {
                     json!({"success": true, "has_active_task": true, "target_seat": target, "task_id": t.task_id, "name": t.name, "description": t.description, "status": t.status, "project_id": t.project_id})
                 }
-                None => json!({"success": true, "has_active_task": false, "target_seat": target, "message": "No active task"}),
+                None => {
+                    json!({"success": true, "has_active_task": false, "target_seat": target, "message": "No active task"})
+                }
             }
         }
         "activate_document" => {
@@ -2033,7 +2328,11 @@ async fn call_tool(
                 .get("document_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
             let ok = engine
                 .document_activate_for(seat_id, target, document_id)
                 .await
@@ -2049,7 +2348,11 @@ async fn call_tool(
             }
         }
         "deactivate_document" => {
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
             engine
                 .document_deactivate_for(seat_id, target)
                 .await
@@ -2057,13 +2360,16 @@ async fn call_tool(
             json!({"success": true, "target_seat": target, "message": "Active document cleared"})
         }
         "get_active_document" => {
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
-            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
-            match engine
-                .document_get_active(target)
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
+            engine
+                .require_seat_manage(seat_id, target)
                 .await
-                .map_err(json_err)?
-            {
+                .map_err(json_err)?;
+            match engine.document_get_active(target).await.map_err(json_err)? {
                 Some(d) => {
                     json!({"success": true, "has_active_document": true, "target_seat": target, "document_id": d.document_id, "category": d.category.as_str(), "content": d.content, "tags": d.tags})
                 }
@@ -2073,22 +2379,43 @@ async fn call_tool(
             }
         }
         "list_tasks" => {
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
-            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
             let project_id = args
                 .get("project_id")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty());
             let status = args.get("status").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-            let tasks = engine
-                .task_list(target, project_id, status, limit)
-                .await
-                .map_err(json_err)?;
-            json!({"success": true, "tasks": tasks.iter().map(|t| json!({
-                "task_id": t.task_id, "name": t.name, "status": t.status,
-                "project_id": t.project_id, "auto_load_count": t.auto_load.len(),
-            })).collect::<Vec<_>>(), "count": tasks.len(), "target_seat": target})
+            if let Some(target) = args
+                .get("target_seat")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                engine
+                    .require_seat_manage(seat_id, target)
+                    .await
+                    .map_err(json_err)?;
+                let tasks = engine
+                    .task_list(target, project_id, status, limit)
+                    .await
+                    .map_err(json_err)?;
+                json!({"success": true, "tasks": tasks, "count": tasks.len(), "target_seat": target, "scope": "legacy-seat"})
+            } else {
+                let scope = match args.get("scope").and_then(Value::as_str) {
+                    Some(raw) => TaskListScope::parse(raw).ok_or_else(|| {
+                        json!({"code": -32602, "message": format!("unsupported task scope: {raw}")})
+                    })?,
+                    None => TaskListScope::Visible,
+                };
+                let assignee = args.get("assignee").and_then(Value::as_str);
+                let issuer = args.get("issuer").and_then(Value::as_str);
+                let tasks = engine
+                    .workflow_list_tasks(
+                        seat_id, scope, status, project_id, assignee, issuer, limit,
+                    )
+                    .await
+                    .map_err(json_err)?;
+                json!({"success": true, "tasks": tasks, "count": tasks.len(), "principal": engine.workflow_principal(seat_id)})
+            }
         }
         // projects
         "create_project" => {
@@ -2117,7 +2444,9 @@ async fn call_tool(
                 .cloned()
                 .or_else(|| args.get("description_patch").cloned());
             if description.is_some() && description_patch.is_some() {
-                return Err(json!({"code": -32602, "message": "pass either full-replacement description or diff/description_patch, not both"}));
+                return Err(
+                    json!({"code": -32602, "message": "pass either full-replacement description or diff/description_patch, not both"}),
+                );
             }
             let auto_load = args.get("auto_load").map(|_| str_array(args, "auto_load"));
             let status = args.get("status").and_then(|v| v.as_str());
@@ -2175,8 +2504,15 @@ async fn call_tool(
             }
         }
         "list_projects" => {
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
-            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
+            engine
+                .require_seat_manage(seat_id, target)
+                .await
+                .map_err(json_err)?;
             let status = args.get("status").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
             let projects = engine
@@ -2327,22 +2663,40 @@ async fn call_tool(
             }
         }
         "project_set_status" => {
-            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let project_id = args
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
             match engine
                 .project_set_status_for(seat_id, target, project_id, status)
                 .await
                 .map_err(json_err)?
             {
-                Some(p) => json!({"success": true, "project_id": p.project_id, "status": p.status, "target_seat": target, "message": format!("Project status set to {}", p.status)}),
-                None => json!({"success": false, "error": format!("project not found: {project_id}")}),
+                Some(p) => {
+                    json!({"success": true, "project_id": p.project_id, "status": p.status, "target_seat": target, "message": format!("Project status set to {}", p.status)})
+                }
+                None => {
+                    json!({"success": false, "error": format!("project not found: {project_id}")})
+                }
             }
         }
         "focus_set_archived" => {
             let focus_id = args.get("focus_id").and_then(|v| v.as_str()).unwrap_or("");
-            let archived = args.get("archived").and_then(|v| v.as_bool()).unwrap_or(false);
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let archived = args
+                .get("archived")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
             let ok = engine
                 .focus_set_archived_for(seat_id, target, focus_id, archived)
                 .await
@@ -2350,12 +2704,12 @@ async fn call_tool(
             json!({"success": ok, "focus_id": focus_id, "archived": archived, "target_seat": target, "message": if ok { "Focus updated" } else { "Focus not found" }})
         }
         "seat_roles" => {
-            let q = args.get("seat_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
-            let roles: Vec<&str> = engine
-                .seat_roles(q)
-                .iter()
-                .map(|r| r.as_str())
-                .collect();
+            let q = args
+                .get("seat_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
+            let roles: Vec<&str> = engine.seat_roles(q).iter().map(|r| r.as_str()).collect();
             json!({
                 "success": true,
                 "seat_id": q,
@@ -2365,8 +2719,14 @@ async fn call_tool(
             })
         }
         "rename_document" => {
-            let document_id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
-            let new_id = args.get("new_document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let document_id = args
+                .get("document_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let new_id = args
+                .get("new_document_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let report = engine
                 .rename_document(seat_id, document_id, new_id, None)
                 .await
@@ -2389,7 +2749,10 @@ async fn call_tool(
                    "message": format!("Task renamed: {} → {}", report.old_id, report.new_id)})
         }
         "rename_project" => {
-            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let project_id = args
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let new_name = args.get("new_name").and_then(|v| v.as_str()).unwrap_or("");
             let report = engine
                 .rename_project(seat_id, project_id, new_name)
@@ -2405,9 +2768,19 @@ async fn call_tool(
                 .get("category")
                 .and_then(|v| v.as_str())
                 .and_then(DocumentCategory::parse);
-            let folder = args.get("folder").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-            let query = args.get("query").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).min(500) as usize;
+            let folder = args
+                .get("folder")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100)
+                .min(500) as usize;
             let filter = DocFilter {
                 category,
                 visible_to: Some(seat_id.into()),
@@ -2444,10 +2817,21 @@ async fn call_tool(
             json!({"success": true, "documents": out, "count": out.len()})
         }
         "update_document" => {
-            let id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let id = args
+                .get("document_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let Some(mut doc) = engine.get_document(id).await.map_err(json_err)? else {
-                return Err(json!({"code": -32602, "message": format!("document not found: {id}")}));
+                return Err(
+                    json!({"code": -32602, "message": format!("document not found: {id}")}),
+                );
             };
+            if slc_core::tasks::is_workflow_task(&doc) {
+                return Err(json!({
+                    "code": -32602,
+                    "message": "workflow tasks are append-only; use task_message or report_task"
+                }));
+            }
             // Тело: content (legacy, полная замена) и/или diff — оба
             // принимаются (старые инструкции агентов).
             if let Some(c) = args.get("content").and_then(|v| v.as_str()) {
@@ -2460,13 +2844,22 @@ async fn call_tool(
                 doc.content_hash = slc_core::content_hash(&doc.content);
             }
             if let Some(t) = args.get("tags").and_then(|v| v.as_array()) {
-                doc.tags = t.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+                doc.tags = t
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect();
             }
             if let Some(al) = args.get("auto_load").and_then(|v| v.as_array()) {
-                doc.auto_load = al.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+                doc.auto_load = al
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect();
             }
             if let Some(r) = args.get("references").and_then(|v| v.as_array()) {
-                doc.references = r.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+                doc.references = r
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect();
             }
             if let Some(m) = args.get("metadata").and_then(|v| v.as_object()) {
                 for (k, v) in m {
@@ -2483,8 +2876,19 @@ async fn call_tool(
             json!({"success": true, "document_id": id})
         }
         "delete_document" => {
-            let id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let id = args
+                .get("document_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let purge = args.get("purge").and_then(|v| v.as_bool()).unwrap_or(false);
+            if let Some(doc) = engine.store().kb_get(id).await.map_err(json_err)?
+                && slc_core::tasks::is_workflow_task(&doc)
+            {
+                return Err(json!({
+                    "code": -32602,
+                    "message": "workflow tasks cannot be deleted; preserve their event history"
+                }));
+            }
             let ok = if purge {
                 engine.store().kb_purge(id).await.map_err(json_err)?
             } else {
@@ -2531,7 +2935,9 @@ async fn call_tool(
             let existing = engine.store().kb_get(&id).await.map_err(json_err)?;
             if let Some(ref doc) = existing {
                 if !state_document_matches(doc, seat_id, namespace, key) {
-                    return Err(json!({"code": -32009, "message": "external-state identity collision"}));
+                    return Err(
+                        json!({"code": -32009, "message": "external-state identity collision"}),
+                    );
                 }
             }
             let actual = existing.as_ref().map(|doc| state_etag(&doc.content));
@@ -2552,8 +2958,12 @@ async fn call_tool(
             }
 
             let mut metadata = DocMeta::default();
-            metadata.extra.insert("external_state_namespace".into(), json!(namespace));
-            metadata.extra.insert("external_state_key".into(), json!(key));
+            metadata
+                .extra
+                .insert("external_state_namespace".into(), json!(namespace));
+            metadata
+                .extra
+                .insert("external_state_key".into(), json!(key));
             metadata
                 .extra
                 .insert("external_state_content_type".into(), json!(content_type));
@@ -2589,7 +2999,9 @@ async fn call_tool(
             let namespace = state_namespace(args)?;
             let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("");
             if prefix.chars().count() > 512 || prefix.contains('\0') {
-                return Err(json!({"code": -32602, "message": "prefix exceeds 512 characters or contains NUL"}));
+                return Err(
+                    json!({"code": -32602, "message": "prefix exceeds 512 characters or contains NUL"}),
+                );
             }
             let limit = args
                 .get("limit")
@@ -2648,7 +3060,9 @@ async fn call_tool(
             let existing = engine.store().kb_get(&id).await.map_err(json_err)?;
             if let Some(doc) = existing {
                 if !state_document_matches(&doc, seat_id, namespace, key) {
-                    return Err(json!({"code": -32009, "message": "external-state identity collision"}));
+                    return Err(
+                        json!({"code": -32009, "message": "external-state identity collision"}),
+                    );
                 }
                 if let Some(expected) = args.get("expected_etag").and_then(Value::as_str) {
                     let actual = state_etag(&doc.content);
@@ -2715,7 +3129,12 @@ async fn call_tool(
                 .episodic_count(&DocFilter::default())
                 .await
                 .map_err(json_err)?;
-            let seats = engine.seats.list_active(1000).await.map_err(json_err)?.len();
+            let seats = engine
+                .seats
+                .list_active(1000)
+                .await
+                .map_err(json_err)?
+                .len();
             json!({
                 "total": total,
                 "by_category": by_cat,
@@ -2812,18 +3231,13 @@ async fn call_tool(
         None => engine.page_token_limit().await.map_err(json_err)?,
     };
     if pagination.enabled && pagination_candidate {
-        let pagination_threshold = effective_page_token_limit
-            .saturating_mul(slc_core::pagination::CHARS_PER_TOKEN);
+        let pagination_threshold =
+            effective_page_token_limit.saturating_mul(slc_core::pagination::CHARS_PER_TOKEN);
         if tool_text.chars().count() > pagination_threshold {
             if let Ok(parsed) = serde_json::from_str::<Value>(&tool_text) {
                 let response_id = uid("resp");
                 let paginated = engine
-                    .paginate_with_limit(
-                        seat_id,
-                        &response_id,
-                        &parsed,
-                        effective_page_token_limit,
-                    )
+                    .paginate_with_limit(seat_id, &response_id, &parsed, effective_page_token_limit)
                     .await
                     .map_err(json_err)?;
                 if let Some(page) = paginated.get("_pagination") {
@@ -2860,17 +3274,17 @@ async fn call_tool(
                 }
             }
         } else if tool_text.chars().count() > 16_000 {
-                // Ответ большой, но пагинация не сработала (лимит страницы
-                // велик или пагинация выключена) — клиент, скорее всего,
-                // обрежет выхлоп. Явно подсказываем, что делать.
-                text.push_str(&format!(
+            // Ответ большой, но пагинация не сработала (лимит страницы
+            // велик или пагинация выключена) — клиент, скорее всего,
+            // обрежет выхлоп. Явно подсказываем, что делать.
+            text.push_str(&format!(
                     "\n\n⚠️ Ответ большой ({} символов) и НЕ пагинирован (лимит страницы {} токенов ≈ {} символов). Если клиент обрезает выхлоп: set_page_limit(<{}>) и повтори вызов тула.",
                     tool_text.chars().count(),
                     effective_page_token_limit,
                     effective_page_token_limit.saturating_mul(slc_core::pagination::CHARS_PER_TOKEN),
                     (tool_text.chars().count() / slc_core::pagination::CHARS_PER_TOKEN).max(1),
                 ));
-                result["content"][0]["text"] = json!(text);
+            result["content"][0]["text"] = json!(text);
         }
     }
     Ok(result)
@@ -2995,14 +3409,20 @@ mod seat_filter_tests {
                 "model": "test"
             }
         });
-        assert_eq!(sampling_response_text(&current).as_deref(), Some("project-a"));
+        assert_eq!(
+            sampling_response_text(&current).as_deref(),
+            Some("project-a")
+        );
 
         let legacy = json!({
             "jsonrpc": "2.0",
             "id": "smp-2",
             "result": {"content": [{"type": "text", "text": "project-b"}]}
         });
-        assert_eq!(sampling_response_text(&legacy).as_deref(), Some("project-b"));
+        assert_eq!(
+            sampling_response_text(&legacy).as_deref(),
+            Some("project-b")
+        );
     }
 
     #[test]
@@ -3036,16 +3456,16 @@ mod seat_filter_tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-slc-pagination", "disabled".parse().unwrap());
         headers.insert("x-slc-page-token-limit", "25000".parse().unwrap());
-        headers.insert(
-            "x-slc-context-token-limit",
-            "100000".parse().unwrap(),
-        );
+        headers.insert("x-slc-context-token-limit", "100000".parse().unwrap());
         let policy = pagination_policy_from_request(&headers);
         assert!(!policy.enabled);
         assert_eq!(policy.page_token_limit, Some(25_000));
         assert_eq!(policy.context_token_limit, Some(100_000));
 
-        assert_eq!(effective_context_token_limit(Some(300_000), 100_000), 300_000);
+        assert_eq!(
+            effective_context_token_limit(Some(300_000), 100_000),
+            300_000
+        );
         assert_eq!(effective_context_token_limit(None, 100_000), 100_000);
 
         headers.insert("x-slc-pagination", "enabled".parse().unwrap());
@@ -3107,5 +3527,24 @@ mod seat_filter_tests {
         );
         assert!(state_namespace(&json!({"namespace": "../escape"})).is_err());
         assert!(state_namespace(&json!({"namespace": ""})).is_err());
+    }
+
+    #[test]
+    fn workflow_delivery_is_content_free_and_transport_neutral() {
+        let delivery = workflow_delivery(
+            Some("dev-junior-0"),
+            "task_example",
+            Some("event_example"),
+            "message",
+        );
+
+        assert_eq!(delivery["recipient"], "dev-junior-0");
+        assert_eq!(delivery["correlation_id"], "task_example");
+        assert_eq!(delivery["idempotency_key"], "event_example");
+        assert_eq!(delivery.as_object().unwrap().len(), 4);
+        let serialized = delivery.to_string();
+        assert!(!serialized.contains("canonical task body"));
+        assert!(!serialized.contains("private report"));
+        assert!(serialized.contains("list_task_events"));
     }
 }
