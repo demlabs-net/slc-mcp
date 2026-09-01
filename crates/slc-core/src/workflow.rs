@@ -809,18 +809,11 @@ impl SlcEngine {
             SlcError::InvalidInput(format!("unknown workflow principal: {assignee}"))
         })?;
         self.seats.ensure_seat(&target_seat).await?;
-        // Repair/validate the existing lane before creating anything so a
-        // legacy multi-writer conflict cannot leave a partially assigned task.
-        let existing_queue = self.reconcile_task_queue_locked(&assignee).await?;
-
-        let parent = if let Some(parent_id) = parent_task_id {
-            Some(self.workflow_task_document(seat_id, parent_id).await?)
-        } else {
-            None
-        };
-        let root_task_id = parent.as_ref().map(|doc| {
-            workflow_string(doc, "root_task_id").unwrap_or_else(|| doc.document_id.clone())
-        });
+        let clean_name = clean_required(name, "name", 500)?;
+        let caller_metadata = metadata
+            .as_object()
+            .cloned()
+            .ok_or_else(|| SlcError::InvalidInput("metadata must be a JSON object".into()))?;
 
         let fingerprint = content_hash(&serde_json::to_string(&json!({
             "issuer": actor,
@@ -955,16 +948,27 @@ impl SlcEngine {
                     });
             }
         }
+
+        // Idempotent replay above is independent of the assignee's current
+        // lane health. Once an assignment is durable, unrelated later queue
+        // corruption must not make the original request unreplayable. Only a
+        // genuinely new assignment validates lineage and repairs/reserves the
+        // live FIFO before creating its document.
+        let parent = if let Some(parent_id) = parent_task_id {
+            Some(self.workflow_task_document(seat_id, parent_id).await?)
+        } else {
+            None
+        };
+        let root_task_id = parent.as_ref().map(|doc| {
+            workflow_string(doc, "root_task_id").unwrap_or_else(|| doc.document_id.clone())
+        });
+        let existing_queue = self.reconcile_task_queue_locked(&assignee).await?;
         if existing_queue.entries.len() >= MAX_ASSIGNEE_QUEUE_DEPTH {
             return Err(SlcError::Limit(format!(
                 "task queue for {assignee} reached its supported depth of {MAX_ASSIGNEE_QUEUE_DEPTH}; close work before assigning more"
             )));
         }
 
-        let caller_metadata = metadata
-            .as_object()
-            .cloned()
-            .ok_or_else(|| SlcError::InvalidInput("metadata must be a JSON object".into()))?;
         let mut workflow_metadata = Map::new();
         workflow_metadata.insert("workflow_metadata".into(), Value::Object(caller_metadata));
         workflow_metadata.insert("workflow_version".into(), json!(1));
@@ -995,7 +999,7 @@ impl SlcEngine {
         let task = self
             .task_create(
                 &target_seat,
-                &clean_required(name, "name", 500)?,
+                &clean_name,
                 description,
                 project_id,
                 auto_load,
@@ -1939,6 +1943,105 @@ mod tests {
             replay.queue_state.as_deref(),
             Some(QUEUE_STATE_TERMINAL)
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_assignment_replay_isolated_from_later_queue_corruption() {
+        let engine = engine();
+        let terminal = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Replay independently",
+                "The original durable result must remain replayable",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("isolated-terminal-assignment"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-junior",
+                &terminal.task_id,
+                "Starting",
+                Some("isolated-terminal-start"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_report_task(
+                "seat-junior",
+                &terminal.task_id,
+                "completed",
+                "Machine checks passed",
+                json!({}),
+                Some("isolated-terminal-report"),
+            )
+            .await
+            .unwrap();
+
+        let later_head = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Later head",
+                "Independent later work",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("isolated-later-head"),
+            )
+            .await
+            .unwrap();
+        let later_tail = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Later tail",
+                "Independent later work",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("isolated-later-tail"),
+            )
+            .await
+            .unwrap();
+        engine
+            .set_task_queue_projection(&later_head.task_id, QUEUE_STATE_RUNNING, None)
+            .await
+            .unwrap();
+        engine
+            .set_task_queue_projection(&later_tail.task_id, QUEUE_STATE_RUNNING, None)
+            .await
+            .unwrap();
+
+        let replay = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Replay independently",
+                "The original durable result must remain replayable",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("isolated-terminal-assignment"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.task_id, terminal.task_id);
+        assert_eq!(replay.status, STATUS_COMPLETED);
+
+        let queue_error = engine
+            .workflow_reconcile_task_queue("seat-senior", "junior")
+            .await
+            .unwrap_err();
+        assert!(queue_error.to_string().contains("multiple running writers"));
     }
 
     #[tokio::test]
