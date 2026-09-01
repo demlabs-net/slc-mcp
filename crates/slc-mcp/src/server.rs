@@ -698,7 +698,7 @@ fn tools() -> Vec<Value> {
         // tasks
         json!({
             "name": "assign_task",
-            "description": "Append a durable task to the assignee's SLC-owned FIFO. Exactly one task per assignee can be ready/running; only a ready assignment includes a content-free wake envelope. Queued tasks must not be dispatched until reconcile_task_queue promotes them.",
+            "description": "Append a durable task to the assignee's bounded SLC-owned FIFO. Exactly one task per assignee can be ready/running; only a ready assignment includes a content-free wake envelope. Queued tasks must not be dispatched until reconcile_task_queue promotes them.",
             "inputSchema": {"type":"object","properties":{
                 "assignee": {"type":"string","description":"stable workflow principal, for example dev-junior-0"},
                 "name": {"type":"string","minLength":1},
@@ -730,7 +730,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "start_task",
-            "description": "Atomically start the ready FIFO head. Only the assignee may call it; queued tasks are rejected with their position instead of creating a parallel writer. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "description": "Start the ready FIFO head under the serialized workflow lock. Only the assignee may call it; queued tasks are rejected with their position instead of creating a parallel writer. Idempotent replay repairs an interrupted event/projection/active-anchor write. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "message": {"type":"string","default":"Started"},
@@ -739,7 +739,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "report_task",
-            "description": "Append a durable task progress/terminal report and update SLC state. A terminal report releases the assignee lane and atomically promotes the oldest queued task; transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "description": "Append a durable task progress/terminal report and update SLC state. The task must already be running; terminal reports cannot bypass the FIFO from ready/queued state. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task; idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "status": {"type":"string","enum":["in_progress","completed","blocked","failed"]},
@@ -747,6 +747,16 @@ fn tools() -> Vec<Value> {
                 "metadata": {"type":"object","description":"machine evidence, paths, hashes, metrics, and structured findings"},
                 "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
             },"required":["task_id","status","summary","idempotency_key"]}
+        }),
+        json!({
+            "name": "cancel_task",
+            "description": "Cancel a queued, ready, or running workflow task without starting it. The issuer, assignee, or global coordinator may cancel. Cancellation appends an immutable SLC event, releases a reserved lane, and promotes the next FIFO item when necessary. The cancellation itself does not request a new agent run; only next_delivery may wake a newly promoted head.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string","minLength":1},
+                "reason": {"type":"string","minLength":1},
+                "metadata": {"type":"object"},
+                "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
+            },"required":["task_id","reason","idempotency_key"]}
         }),
         json!({
             "name": "task_message",
@@ -769,7 +779,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "reconcile_task_queue",
-            "description": "Atomically inspect/repair one assignee FIFO. If the lane has no ready/running task, promote the oldest queued task and return its stable content-free delivery envelope. Use this for refill or recovery; never create a duplicate task to wake a busy role.",
+            "description": "Inspect/repair one assignee FIFO under the serialized workflow lock. If the lane has no ready/running task, promote the oldest queued task and return its stable content-free delivery envelope. Duplicate or out-of-order ready reservations are safely demoted; multiple running writers require operator recovery. Use this for refill or recovery; never create a duplicate task to wake a busy role.",
             "inputSchema": {"type":"object","properties":{
                 "assignee": {"type":"string","description":"stable workflow principal"}
             },"required":["assignee"]}
@@ -1170,7 +1180,8 @@ focus items, and reminders.
 
 Delegated development work is authoritative only in the workflow task API:
 `assign_task`, `get_task`, `list_tasks`, `list_task_events`,
-`reconcile_task_queue`, `start_task`, `task_message`, and `report_task`.
+`reconcile_task_queue`, `start_task`, `task_message`, `report_task`, and
+`cancel_task`.
 Transport resources and legacy document/task snapshots are not task truth. When
 the caller is the manager or this is a scheduled cron reconciliation, never
 call `list_documents`, `update_document`, `update_task`, `update_project`, or
@@ -1194,8 +1205,8 @@ and lifecycle save.
 3. **Represent ongoing work as documents.** Use `create_project`, `create_task`,
    or `add_document` for new work. A skill is a document with `category=skill`.
    Generated IDs are slugs without redundant `task_` or `project_` prefixes.
-   Canonical task statuses are `PENDING`, `IN_WORK`, `COMPLETED`, and
-   `CANCELLED`. Supply `project_id` when a task belongs to a project.
+   Canonical task statuses are `PENDING`, `IN_WORK`, `COMPLETED`, `BLOCKED`,
+   `FAILED`, and `CANCELLED`. Supply `project_id` when a task belongs to a project.
    Delegated work uses `assign_task`: SLC appends it to the assignee's FIFO and
    allows exactly one `ready`/`running` task for that role profile. Send a
    transport wake only when `wake_recommended=true`; a `queued` task is already
@@ -2224,6 +2235,51 @@ async fn call_tool(
                 "next_delivery": next_delivery,
             })
         }
+        "cancel_task" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let reason = args.get("reason").and_then(Value::as_str).unwrap_or("");
+            let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
+            let (task, event, next_ready_task) = engine
+                .workflow_cancel_task(seat_id, task_id, reason, metadata, idempotency_key)
+                .await
+                .map_err(json_err)?;
+            if let Some(assignee) = task.assignee.as_deref()
+                && let Some(target_seat) = engine.workflow_seat(assignee)
+            {
+                let _ = events.send(json!({
+                    "type": "task_cancelled",
+                    "seat_id": target_seat,
+                    "task_id": task.task_id,
+                    "event_id": event.event_id,
+                    "actor": event.actor,
+                }));
+            }
+            let next_delivery = next_ready_task.as_ref().map(|next| {
+                workflow_delivery(
+                    next.assignee.as_deref(),
+                    &next.task_id,
+                    next.queue_ready_event_id.as_deref(),
+                    "ready",
+                )
+            });
+            let next_wake_recommended = next_delivery.is_some();
+            json!({
+                "success": true,
+                "task": task,
+                "event": event,
+                "delivery": workflow_delivery(
+                    event.recipient.as_deref(),
+                    &task.task_id,
+                    Some(&event.event_id),
+                    "cancelled",
+                ),
+                "wake_recommended": false,
+                "next_ready_task": next_ready_task,
+                "next_wake_recommended": next_wake_recommended,
+                "next_delivery": next_delivery,
+            })
+        }
         "task_message" => {
             let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
             let recipient = args.get("recipient").and_then(Value::as_str).unwrap_or("");
@@ -2905,7 +2961,7 @@ async fn call_tool(
             if slc_core::tasks::is_workflow_task(&doc) {
                 return Err(json!({
                     "code": -32602,
-                    "message": "workflow tasks are append-only; use task_message or report_task"
+                    "message": "workflow tasks are append-only; use task_message, report_task, or cancel_task"
                 }));
             }
             // Тело: content (legacy, полная замена) и/или diff — оба

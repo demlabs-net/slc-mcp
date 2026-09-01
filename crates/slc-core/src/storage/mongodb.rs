@@ -174,6 +174,25 @@ fn filter_query(kind: &str, f: &DocFilter) -> BsonDoc {
     if let Some(t) = &f.doc_type {
         q.insert("metadata.doc_type", Bson::String(t.clone()));
     }
+    for (key, value) in &f.extra_strings {
+        q.insert(
+            format!("metadata.{key}"),
+            Bson::String(value.clone()),
+        );
+    }
+    for (key, values) in &f.extra_strings_not_in {
+        if !values.is_empty() {
+            q.insert(
+                format!("metadata.{key}"),
+                doc! {
+                    "$nin": values
+                        .iter()
+                        .map(|value| Bson::String(value.clone()))
+                        .collect::<Vec<_>>()
+                },
+            );
+        }
+    }
     if let Some(a) = f.archived {
         q.insert("metadata.archived", Bson::Boolean(a));
     }

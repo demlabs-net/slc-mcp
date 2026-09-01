@@ -5,7 +5,7 @@ members = ["crates/slc-core", "crates/slc-mcp"]
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.3.0"
+version = "0.3.1"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "test-util"] }

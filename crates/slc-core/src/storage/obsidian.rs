@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -149,6 +149,8 @@ pub struct IndexEntry {
     pub seat_id: Option<String>,
     pub doc_level: Option<String>,
     pub doc_type: Option<String>,
+    #[serde(default)]
+    pub extra_strings: BTreeMap<String, String>,
     pub archived: Option<bool>,
     pub consolidated: Option<bool>,
     pub compression_batch_id: Option<String>,
@@ -177,6 +179,16 @@ impl IndexEntry {
             seat_id: doc.seat_id.clone(),
             doc_level: doc.metadata.doc_level.map(|l| l.as_str().to_string()),
             doc_type: doc.metadata.doc_type.clone(),
+            extra_strings: doc
+                .metadata
+                .extra
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (key.clone(), value.to_string()))
+                })
+                .collect(),
             archived: doc.metadata.archived,
             consolidated: doc.metadata.consolidated,
             compression_batch_id: doc.metadata.compression_batch_id.clone(),
@@ -222,6 +234,18 @@ impl IndexEntry {
             if self.doc_type.as_deref() != Some(dt.as_str()) {
                 return false;
             }
+        }
+        if f.extra_strings.iter().any(|(key, expected)| {
+            self.extra_strings.get(key) != Some(expected)
+        }) {
+            return false;
+        }
+        if f.extra_strings_not_in.iter().any(|(key, excluded)| {
+            self.extra_strings
+                .get(key)
+                .is_some_and(|value| excluded.contains(value))
+        }) {
+            return false;
         }
         if let Some(archived) = f.archived {
             if self.archived != Some(archived) {
@@ -380,6 +404,20 @@ impl ObsidianVaultStore {
                             .and_then(|m| m.get("doc_type"))
                             .and_then(|v| v.as_str())
                             .map(String::from),
+                        extra_strings: meta
+                            .get("metadata")
+                            .and_then(|v| v.as_object())
+                            .map(|extra| {
+                                extra
+                                    .iter()
+                                    .filter_map(|(key, value)| {
+                                        value
+                                            .as_str()
+                                            .map(|value| (key.clone(), value.to_string()))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         archived: meta
                             .get("metadata")
                             .and_then(|m| m.get("archived"))
@@ -1437,6 +1475,63 @@ mod tests {
         assert_eq!(loaded.tags, vec!["new"]);
         assert_eq!(loaded.seat_id.as_deref(), Some("seat-a"));
         assert_eq!(loaded.metadata.extra["status"], "IN_WORK");
+    }
+
+    #[tokio::test]
+    async fn flattened_extra_metadata_filters_survive_index_rebuild() {
+        let root = tmp_vault("extra-filter");
+        let store = ObsidianVaultStore::open(&root, false).unwrap();
+
+        for (id, assignee, status) in [
+            ("task-a", "developer-0", "RUNNING"),
+            ("task-b", "developer-0", "QUEUED"),
+            ("task-c", "developer-1", "QUEUED"),
+        ] {
+            let mut metadata = DocMeta::default();
+            metadata.extra.insert("assignee".into(), json!(assignee));
+            metadata.extra.insert("status".into(), json!(status));
+            store
+                .kb_insert(&Document::new(
+                    id,
+                    DocumentCategory::Task,
+                    id,
+                    metadata,
+                    vec![],
+                    Some("manager".into()),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let mut filter = DocFilter::default();
+        filter.extra_strings.insert("assignee".into(), "developer-0".into());
+        filter
+            .extra_strings_not_in
+            .insert("status".into(), vec!["RUNNING".into()]);
+        let found = store
+            .kb_find(&filter, &DocSort::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|doc| doc.document_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-b"]
+        );
+
+        let reopened = ObsidianVaultStore::open(&root, false).unwrap();
+        let found_after_rebuild = reopened
+            .kb_find(&filter, &DocSort::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            found_after_rebuild
+                .iter()
+                .map(|doc| doc.document_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-b"]
+        );
     }
 
     #[tokio::test]

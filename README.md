@@ -119,20 +119,33 @@ process cache.
 
 SLC is the source of truth for delegated work. `assign_task` creates the task
 with stable issuer/assignee principals and parent/root lineage; `start_task`,
-`report_task`, and `task_message` append immutable events and update the task
-projection. `get_task`, workflow-aware `list_tasks`, and `list_task_events`
-work without any message bus. Idempotency keys make assignment and event
-retries safe; workflow mutations are serialized so concurrent retries cannot
-create duplicate events. Caller-owned assignment metadata is isolated from
-SLC projection fields and returned as `task.metadata`.
+`report_task`, `cancel_task`, and `task_message` append immutable events and
+update the task projection. `get_task`, workflow-aware `list_tasks`, and
+`list_task_events` work without any message bus. Idempotency keys make assignment and event
+retries safe. Their durable task/event IDs also repair a crash between the
+primary write and its portable-backend idempotency index. Old retries do not
+rewind the latest-event cursor, while their monotonic status transition is
+still repaired if the crash happened before the projection write. Workflow
+mutations are serialized so concurrent retries cannot create duplicate events.
+Caller-owned assignment metadata is isolated from SLC projection fields and
+returned as `task.metadata`.
 
 Every assignee has a durable FIFO with capacity one. A new assignment is
 `ready` only when it owns the lane; later work remains `queued`. `start_task`
-rejects queued work, a terminal `report_task` releases the lane and atomically
-promotes the oldest queued task, and `reconcile_task_queue` repairs/reads that
-projection after recovery. The queue is per agent profile, independently of
-how many global parallel slots its inference backend exposes. Assignment
-idempotency remains replayable after terminal tasks leave the runnable FIFO.
+rejects queued work, and every progress or terminal report requires the task
+to be running, so a queued task cannot close past the FIFO head. A terminal
+report releases the lane; `reconcile_task_queue` then promotes the oldest
+queued task and repairs interrupted projection writes or duplicate `ready`
+reservations. A non-running `ready` reservation that is not the oldest item is
+demoted and the true head is restored. Multiple actual `running` writers remain
+a hard error because choosing one automatically would be unsafe. Backend filtering happens before
+the 5000-item per-assignee safety bound, preventing unrelated or old terminal
+tasks from truncating a role queue silently. The queue is per agent profile,
+independently of how many global parallel slots its inference backend exposes.
+Assignment idempotency remains replayable after terminal tasks leave the
+runnable FIFO. `cancel_task` lets the issuer, assignee, or global coordinator
+remove queued/ready work without starting it; cancelling a reserved head also
+promotes the next FIFO item.
 
 Configure `SLC_PRINCIPAL_SEATS` to map transport-neutral participant names to
 the existing SLC seats, and configure delegation independently with
@@ -152,6 +165,10 @@ Swarm MCP, Matrix, or another adapter. A queued assignment returns
 it as the single ready head. The task description, message, and
 report body remain only in SLC. Replacing the adapter therefore does not
 migrate task state or conversation history.
+
+Cancellation never recommends waking the cancelled task itself. If cancelling
+the reserved head exposes another task, `next_wake_recommended=true` and the
+separate `next_delivery` envelope identify the only run that should be started.
 
 ## Mongo migration
 

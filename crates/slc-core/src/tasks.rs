@@ -290,7 +290,8 @@ impl<S: StorageBackend> WorkItemManager<S> {
         }
         if is_workflow_task(&doc) {
             return Err(SlcError::InvalidInput(
-                "workflow tasks are append-only; use task_message or report_task".into(),
+                "workflow tasks are append-only; use task_message, report_task, or cancel_task"
+                    .into(),
             ));
         }
         if let Some(n) = name {

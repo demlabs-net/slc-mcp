@@ -238,6 +238,38 @@ fn build_where(f: &DocFilter) -> (String, Vec<String>) {
         clauses.push("json_extract(metadata, '$.doc_type') = ?".to_string());
         params.push(dt.clone());
     }
+    for (key, value) in &f.extra_strings {
+        clauses.push(
+            "json_type(metadata, ?) = 'text' AND CAST(json_extract(metadata, ?) AS TEXT) = ?"
+                .to_string(),
+        );
+        let path = format!(
+            "$.{}",
+            serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string())
+        );
+        params.push(path.clone());
+        params.push(path);
+        params.push(value.clone());
+    }
+    for (key, values) in &f.extra_strings_not_in {
+        if values.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", values.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!(
+            "(json_type(metadata, ?) IS NULL OR json_type(metadata, ?) != 'text' OR CAST(json_extract(metadata, ?) AS TEXT) NOT IN ({placeholders}))"
+        ));
+        let path = format!(
+            "$.{}",
+            serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string())
+        );
+        params.push(path.clone());
+        params.push(path.clone());
+        params.push(path);
+        params.extend(values.iter().cloned());
+    }
     if let Some(archived) = f.archived {
         if archived {
             clauses.push("json_extract(metadata, '$.archived') = 1".to_string());
@@ -255,19 +287,33 @@ fn build_where(f: &DocFilter) -> (String, Vec<String>) {
     }
     if !f.tags_any.is_empty() {
         // tags stored as JSON array — match if ANY listed tag is a member.
+        let first_param = params.len() + 1;
         let ors: Vec<String> = f
             .tags_any
             .iter()
-            .map(|_| format!("EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})", params.len() + 1))
+            .enumerate()
+            .map(|(offset, _)| {
+                format!(
+                    "EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})",
+                    first_param + offset
+                )
+            })
             .collect();
         clauses.push(format!("({})", ors.join(" OR ")));
         params.extend(f.tags_any.iter().cloned());
     }
     if !f.tags_all.is_empty() {
+        let first_param = params.len() + 1;
         let ands: Vec<String> = f
             .tags_all
             .iter()
-            .map(|_| format!("EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})", params.len() + 1))
+            .enumerate()
+            .map(|(offset, _)| {
+                format!(
+                    "EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})",
+                    first_param + offset
+                )
+            })
             .collect();
         clauses.push(format!("({})", ands.join(" AND ")));
         params.extend(f.tags_all.iter().cloned());
@@ -1123,6 +1169,9 @@ mod tests {
 
         let mut meta = DocMeta::default();
         meta.doc_type = Some("notes".into());
+        meta.extra.insert("assignee".into(), Value::String("junior".into()));
+        meta.extra.insert("status".into(), Value::String("PENDING".into()));
+        meta.extra.insert("attempts".into(), Value::from(1));
         let doc = Document::new(
             "proj_vassista",
             DocumentCategory::Project,
@@ -1150,6 +1199,58 @@ mod tests {
         // Visibility: public doc visible to any seat.
         let f = DocFilter::visible_to("seat_a");
         assert_eq!(store.kb_count(&f).await.unwrap(), 1);
+        let workflow_filter = DocFilter {
+            extra_strings: std::collections::BTreeMap::from([(
+                "assignee".to_string(),
+                "junior".to_string(),
+            )]),
+            extra_strings_not_in: std::collections::BTreeMap::from([(
+                "status".to_string(),
+                vec!["COMPLETED".to_string(), "FAILED".to_string()],
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(store.kb_count(&workflow_filter).await.unwrap(), 1);
+        let terminal_filter = DocFilter {
+            extra_strings_not_in: std::collections::BTreeMap::from([(
+                "status".to_string(),
+                vec!["PENDING".to_string()],
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(store.kb_count(&terminal_filter).await.unwrap(), 0);
+        let numeric_is_not_a_string = DocFilter {
+            extra_strings: std::collections::BTreeMap::from([(
+                "attempts".to_string(),
+                "1".to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(store.kb_count(&numeric_is_not_a_string).await.unwrap(), 0);
+        let numeric_is_retained_by_string_exclusion = DocFilter {
+            extra_strings_not_in: std::collections::BTreeMap::from([(
+                "attempts".to_string(),
+                vec!["1".to_string()],
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .kb_count(&numeric_is_retained_by_string_exclusion)
+                .await
+                .unwrap(),
+            1
+        );
+        let any_tag_filter = DocFilter {
+            tags_any: vec!["missing".to_string(), "memory:semantic".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(store.kb_count(&any_tag_filter).await.unwrap(), 1);
+        let all_tag_filter = DocFilter {
+            tags_all: vec!["priority:high".to_string(), "memory:semantic".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(store.kb_count(&all_tag_filter).await.unwrap(), 1);
 
         // Content update bumps version.
         assert!(store.kb_update_content("proj_vassista", "v2").await.unwrap());

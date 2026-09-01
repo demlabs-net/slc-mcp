@@ -221,9 +221,9 @@ impl<S: StorageBackend> Paginator<S> {
         let mut pages: Vec<Value> = Vec::new();
         let mut current: Vec<Value> = Vec::new();
         let mut current_chars = 0usize;
-        let mut flush = |pages: &mut Vec<Value>,
-                         current: &mut Vec<Value>,
-                         current_chars: &mut usize| {
+        let flush = |pages: &mut Vec<Value>,
+                     current: &mut Vec<Value>,
+                     current_chars: &mut usize| {
             if !current.is_empty() {
                 let mut page = envelope.clone();
                 page[list_key.as_ref().unwrap()] = json!(*current);
@@ -573,6 +573,7 @@ mod tests {
         assert_eq!(combined, big, "склейка частей = полный контент документа");
     }
 
+    #[tokio::test]
     async fn invalid_page_errors() {
         let (p, _) = paginator();
         let small: Vec<Value> = vec![json!(1), json!(2)];

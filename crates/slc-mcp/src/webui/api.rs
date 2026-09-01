@@ -440,7 +440,7 @@ pub async fn update_document(
     if slc_core::tasks::is_workflow_task(&doc) {
         return ApiError(
             StatusCode::CONFLICT,
-            "workflow tasks are append-only; use task_message or report_task".into(),
+            "workflow tasks are append-only; use task_message, report_task, or cancel_task".into(),
         )
         .into_response();
     }
