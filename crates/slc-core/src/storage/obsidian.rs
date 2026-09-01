@@ -41,8 +41,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GIT_INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
-const GIT_ADD_TIMEOUT_SECONDS: u64 = 120;
-const GIT_COMMAND_TIMEOUT_SECONDS: u64 = 30;
 const GIT_COMMIT_DEBOUNCE: Duration = Duration::from_millis(500);
 
 fn quarantine_git_index_lock(
@@ -87,15 +85,7 @@ fn quarantine_stale_git_index_lock(
     quarantine_git_index_lock(root, now, GIT_INDEX_LOCK_STALE_AFTER)
 }
 
-fn git_command_timeout_seconds(args: &[&str]) -> u64 {
-    if args.first() == Some(&"add") {
-        GIT_ADD_TIMEOUT_SECONDS
-    } else {
-        GIT_COMMAND_TIMEOUT_SECONDS
-    }
-}
-
-/// Run one bounded Git snapshot for the vault. This is intentionally invoked
+/// Run one coalesced Git snapshot for the vault. This is intentionally invoked
 /// only by the coalesced worker below: the storage write path must never queue
 /// one Git process per document or seat update.
 fn run_vault_git_commit(root: &Path, author: &str) {
@@ -121,18 +111,16 @@ fn run_vault_git_commit(root: &Path, author: &str) {
         Err(error) => tracing::warn!("vault git lock recovery error: {error}"),
     }
     let run = |args: Vec<&str>| {
-        // A cold `git add -A` on the production vault can legitimately exceed
-        // 20 seconds during a write burst, while push and metadata-only
-        // commands should remain short. Bound both classes without turning a
-        // normal add into a stale lock.
-        let mut cmd = std::process::Command::new("timeout");
-        cmd.arg("--signal=KILL")
-            .arg(git_command_timeout_seconds(&args).to_string())
-            .arg("git")
-            .args(&args)
+        // The coalesced worker is deliberately detached from request handling,
+        // so direct Git waiting cannot stall SLC. Avoid an external `timeout`
+        // wrapper here: it can orphan/reparent `git` under a long-lived PID 1
+        // and leak zombies after a cancelled snapshot.
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(&args)
             .current_dir(root)
             .env("GIT_AUTHOR_NAME", &author_name)
             .env("GIT_AUTHOR_EMAIL", &author_email)
+            .env("GIT_TERMINAL_PROMPT", "0")
             .output()
     };
     let failed = |out: &std::process::Output| {
@@ -176,22 +164,7 @@ fn run_vault_git_commit(root: &Path, author: &str) {
                 Err(error) => tracing::warn!("vault git commit error: {error}"),
             }
         }
-        Ok(out) => {
-            if matches!(out.status.code(), Some(124) | Some(137)) {
-                // This worker owns the only in-process Git sequence and has
-                // just killed it. Quarantine its lock immediately; the
-                // age-based recovery remains for unrelated crashes.
-                match quarantine_git_index_lock(root, SystemTime::now(), Duration::ZERO) {
-                    Ok(Some(path)) => tracing::warn!(
-                        path = %path.display(),
-                        "vault git: quarantined index lock left by timeout"
-                    ),
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!("vault git timeout recovery error: {error}"),
-                }
-            }
-            failed(&out)
-        }
+        Ok(out) => failed(&out),
         Err(error) => tracing::warn!("vault git add error: {error}"),
     }
 }
@@ -1690,13 +1663,6 @@ mod tests {
         assert_eq!(std::fs::read(quarantined).unwrap(), b"stale evidence");
 
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn git_add_gets_a_longer_timeout_than_metadata_commands() {
-        assert_eq!(git_command_timeout_seconds(&["add", "-A"]), 120);
-        assert_eq!(git_command_timeout_seconds(&["diff", "--cached"]), 30);
-        assert_eq!(git_command_timeout_seconds(&["push", "-q"]), 30);
     }
 
     #[test]
