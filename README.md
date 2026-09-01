@@ -145,7 +145,14 @@ independently of how many global parallel slots its inference backend exposes.
 Assignment idempotency remains replayable after terminal tasks leave the
 runnable FIFO. `cancel_task` lets the issuer, assignee, or global coordinator
 remove queued/ready work without starting it; cancelling a reserved head also
-promotes the next FIFO item.
+promotes the next FIFO item. It deliberately rejects a running task: SLC does
+not own the executor process and therefore cannot safely release that lane.
+The assignee must submit the terminal report; after a crashed run is confirmed
+idle, send the assignee a durable `task_message` for that same task and dispatch
+its returned delivery rather than creating a parallel replacement. The
+recovery run reports the already-running task without calling `start_task`
+again. Only the assignee may call `report_task`, so a global coordinator cannot
+accidentally close a writer that is still running.
 
 Configure `SLC_PRINCIPAL_SEATS` to map transport-neutral participant names to
 the existing SLC seats, and configure delegation independently with

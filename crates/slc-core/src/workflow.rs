@@ -1297,16 +1297,6 @@ impl SlcEngine {
         let actor = self.workflow_principal(seat_id);
         let assignee = workflow_string(&doc, "assignee")
             .unwrap_or_else(|| doc.seat_id.clone().unwrap_or_default());
-        let global_coordinator = self
-            .config
-            .task_assign_acl
-            .get(&actor)
-            .is_some_and(|targets| targets.contains("*"));
-        if actor != assignee && !global_coordinator {
-            return Err(SlcError::PermissionDenied(
-                "only the assignee or a global task coordinator can report this task".into(),
-            ));
-        }
         let status = normalize_task_status(raw_status).ok_or_else(|| {
             SlcError::InvalidInput(
                 "status must be in_progress, completed, blocked, or failed".into(),
@@ -1367,6 +1357,12 @@ impl SlcEngine {
             }
             return Err(SlcError::InvalidInput(
                 "terminal task already has a report; retry only with the original idempotency_key"
+                    .into(),
+            ));
+        }
+        if actor != assignee {
+            return Err(SlcError::PermissionDenied(
+                "only the assignee can report this task; a coordinator must not close a live executor lane"
                     .into(),
             ));
         }
@@ -1516,10 +1512,21 @@ impl SlcEngine {
             ));
         }
 
-        let released_lane = matches!(
-            effective_queue_state(&doc),
-            QUEUE_STATE_READY | QUEUE_STATE_RUNNING
-        );
+        // SLC owns durable task state, not the transport/process lifecycle. A
+        // coordinator cancelling a RUNNING projection cannot prove that the
+        // corresponding Hermes run has stopped; releasing the lane here could
+        // promote a second writer while the first one is still editing. A
+        // live assignee must close its run with report_task. After a crashed
+        // transport is confirmed idle, wake that same assignee to recover and
+        // report the existing task instead of manufacturing a replacement.
+        if effective_queue_state(&doc) == QUEUE_STATE_RUNNING {
+            return Err(SlcError::InvalidInput(
+                "running task cannot be cancelled because SLC does not control its executor; let the assignee report it, or stop the transport and recover the same task"
+                    .into(),
+            ));
+        }
+
+        let released_lane = effective_queue_state(&doc) == QUEUE_STATE_READY;
         let event = self
             .append_task_event(
                 &task_id,
@@ -2647,6 +2654,107 @@ mod tests {
         assert_eq!(replayed.status, STATUS_CANCELLED);
         assert_eq!(replayed_event.event_id, event.event_id);
         assert!(replay_next.is_none(), "a replay must not emit a second ready wake");
+    }
+
+    #[tokio::test]
+    async fn cancellation_cannot_release_a_running_executor_lane() {
+        let engine = engine();
+        let running = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Running writer",
+                "Must retain its lane until its own terminal report",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("cancel-running-head"),
+            )
+            .await
+            .unwrap();
+        let queued = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Queued writer",
+                "Must not be promoted while the first process is live",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("cancel-running-tail"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-junior",
+                &running.task_id,
+                "Writer is live",
+                Some("cancel-running-start"),
+            )
+            .await
+            .unwrap();
+
+        let coordinator_report = engine
+            .workflow_report_task(
+                "seat-manager",
+                &running.task_id,
+                "completed",
+                "Coordinator must not close another process",
+                json!({}),
+                Some("coordinator-terminal-report"),
+            )
+            .await
+            .unwrap_err();
+        assert!(coordinator_report
+            .to_string()
+            .contains("only the assignee can report"));
+
+        for actor in ["seat-senior", "seat-junior", "seat-manager"] {
+            let error = engine
+                .workflow_cancel_task(
+                    actor,
+                    &running.task_id,
+                    "Do not release a live process",
+                    json!({}),
+                    Some(&format!("cancel-running-{actor}")),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("running task cannot be cancelled"));
+        }
+
+        let queue = engine
+            .workflow_reconcile_task_queue("seat-senior", "junior")
+            .await
+            .unwrap();
+        assert_eq!(
+            queue.running_task_id.as_deref(),
+            Some(running.task_id.as_str())
+        );
+        assert!(queue.ready_task_id.is_none());
+        assert_eq!(
+            queue
+                .entries
+                .iter()
+                .find(|entry| entry.task.task_id == queued.task_id)
+                .unwrap()
+                .task
+                .queue_state
+                .as_deref(),
+            Some(QUEUE_STATE_QUEUED)
+        );
+        assert_eq!(
+            engine
+                .task_get_active("seat-junior")
+                .await
+                .unwrap()
+                .unwrap()
+                .task_id,
+            running.task_id
+        );
     }
 
     #[tokio::test]

@@ -739,7 +739,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "report_task",
-            "description": "Append a durable task progress/terminal report and update SLC state. The task must already be running; terminal reports cannot bypass the FIFO from ready/queued state. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task; idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "description": "Append the assignee's durable task progress/terminal report and update SLC state. Only the assignee may report, and the task must already be running; coordinators cannot close a live executor lane and terminal reports cannot bypass the FIFO from ready/queued state. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task; idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "status": {"type":"string","enum":["in_progress","completed","blocked","failed"]},
@@ -750,7 +750,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "cancel_task",
-            "description": "Cancel a queued, ready, or running workflow task without starting it. The issuer, assignee, or global coordinator may cancel. Cancellation appends an immutable SLC event, releases a reserved lane, and promotes the next FIFO item when necessary. The cancellation itself does not request a new agent run; only next_delivery may wake a newly promoted head.",
+            "description": "Cancel a queued or ready workflow task without starting it. The issuer, assignee, or global coordinator may cancel. A running task cannot be cancelled here because SLC does not control the executor process; the assignee must report it, or the transport must first be stopped and the same task recovered. Cancellation appends an immutable SLC event, releases a ready reservation, and promotes the next FIFO item when necessary. The cancellation itself does not request a new agent run; only next_delivery may wake a newly promoted head.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string","minLength":1},
                 "reason": {"type":"string","minLength":1},
