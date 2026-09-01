@@ -36,12 +36,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GIT_INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const GIT_ADD_TIMEOUT_SECONDS: u64 = 120;
 const GIT_COMMAND_TIMEOUT_SECONDS: u64 = 30;
+const GIT_COMMIT_DEBOUNCE: Duration = Duration::from_millis(500);
 
 fn quarantine_git_index_lock(
     root: &Path,
@@ -75,9 +77,9 @@ fn quarantine_git_index_lock(
 }
 
 /// Preserve an abandoned Git index lock once it is old enough that it cannot
-/// belong to this store's bounded Git worker. The in-process `git_lock`
-/// serializes our own workers; the age guard avoids disrupting a short-lived
-/// external Git command operating on the same vault.
+/// belong to this store's bounded Git worker. The worker coalescer guarantees
+/// one in-process Git sequence at a time; the age guard avoids disrupting a
+/// short-lived external Git command operating on the same vault.
 fn quarantine_stale_git_index_lock(
     root: &Path,
     now: SystemTime,
@@ -91,6 +93,121 @@ fn git_command_timeout_seconds(args: &[&str]) -> u64 {
     } else {
         GIT_COMMAND_TIMEOUT_SECONDS
     }
+}
+
+/// Run one bounded Git snapshot for the vault. This is intentionally invoked
+/// only by the coalesced worker below: the storage write path must never queue
+/// one Git process per document or seat update.
+fn run_vault_git_commit(root: &Path, author: &str) {
+    let author_name = author
+        .split('<')
+        .next()
+        .unwrap_or("slc-mcp")
+        .trim()
+        .to_string();
+    let author_email = author
+        .split_once('<')
+        .and_then(|(_, email)| email.strip_suffix('>'))
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .unwrap_or("slc-mcp@local")
+        .to_string();
+    match quarantine_stale_git_index_lock(root, SystemTime::now()) {
+        Ok(Some(path)) => tracing::warn!(
+            path = %path.display(),
+            "vault git: quarantined abandoned index lock"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!("vault git lock recovery error: {error}"),
+    }
+    let run = |args: Vec<&str>| {
+        // A cold `git add -A` on the production vault can legitimately exceed
+        // 20 seconds during a write burst, while push and metadata-only
+        // commands should remain short. Bound both classes without turning a
+        // normal add into a stale lock.
+        let mut cmd = std::process::Command::new("timeout");
+        cmd.arg("--signal=KILL")
+            .arg(git_command_timeout_seconds(&args).to_string())
+            .arg("git")
+            .args(&args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", &author_name)
+            .env("GIT_AUTHOR_EMAIL", &author_email)
+            .output()
+    };
+    let failed = |out: &std::process::Output| {
+        tracing::warn!(
+            "vault git: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    };
+    match run(vec!["add", "-A"]) {
+        Ok(out) if out.status.success() => {
+            // A read-only lifecycle call may still persist operational
+            // metadata. Avoid manufacturing empty commits when the vault
+            // representation did not actually change.
+            match run(vec!["diff", "--cached", "--quiet"]) {
+                Ok(diff) if diff.status.success() => return,
+                Ok(diff) if diff.status.code() == Some(1) => {}
+                Ok(diff) => {
+                    failed(&diff);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!("vault git diff error: {error}");
+                    return;
+                }
+            }
+            let commit = run(vec!["commit", "-m", "slc: vault update"]);
+            match &commit {
+                Ok(commit) if commit.status.success() => {
+                    // Push the vault to its upstream (best-effort) — configured
+                    // remote only, silent otherwise.
+                    if let Ok(push) = run(vec!["push", "-q"]) {
+                        if !push.status.success() {
+                            tracing::debug!(
+                                "vault push: {}",
+                                String::from_utf8_lossy(&push.stderr).trim()
+                            );
+                        }
+                    }
+                }
+                Ok(commit) => failed(commit),
+                Err(error) => tracing::warn!("vault git commit error: {error}"),
+            }
+        }
+        Ok(out) => {
+            if matches!(out.status.code(), Some(124) | Some(137)) {
+                // This worker owns the only in-process Git sequence and has
+                // just killed it. Quarantine its lock immediately; the
+                // age-based recovery remains for unrelated crashes.
+                match quarantine_git_index_lock(root, SystemTime::now(), Duration::ZERO) {
+                    Ok(Some(path)) => tracing::warn!(
+                        path = %path.display(),
+                        "vault git: quarantined index lock left by timeout"
+                    ),
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!("vault git timeout recovery error: {error}"),
+                }
+            }
+            failed(&out)
+        }
+        Err(error) => tracing::warn!("vault git add error: {error}"),
+    }
+}
+
+/// Return whether the sole coalesced worker should immediately run another
+/// pass. The post-release recheck closes the race where a write arrives after
+/// the first idle observation but before a new worker can be scheduled.
+fn finish_git_commit_worker(dirty: &AtomicBool, worker_active: &AtomicBool) -> bool {
+    if dirty.swap(false, Ordering::AcqRel) {
+        return true;
+    }
+    worker_active.store(false, Ordering::Release);
+    dirty.load(Ordering::Acquire)
+        && worker_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
 }
 
 /// Human-readable file name from a unique document id.
@@ -309,7 +426,11 @@ pub struct ObsidianVaultStore {
     records: std::sync::Arc<Mutex<HashMap<(String, String), Value>>>,
     auto_git_commit: bool,
     git_author: String,
-    git_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    /// Writes mark the vault dirty. Exactly one coalesced worker drains that
+    /// flag, so high-frequency seat touches cannot build an unbounded queue of
+    /// git add/commit processes.
+    git_commit_dirty: Arc<AtomicBool>,
+    git_commit_worker_active: Arc<AtomicBool>,
 }
 
 impl ObsidianVaultStore {
@@ -329,7 +450,8 @@ impl ObsidianVaultStore {
             auto_git_commit,
             git_author: std::env::var("OBSIDIAN_GIT_AUTHOR")
                 .unwrap_or_else(|_| "slc-mcp <slc-mcp@local>".into()),
-            git_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            git_commit_dirty: Arc::new(AtomicBool::new(false)),
+            git_commit_worker_active: Arc::new(AtomicBool::new(false)),
         };
         store.rebuild_index()?;
         store.load_sidecars()?;
@@ -676,126 +798,46 @@ impl ObsidianVaultStore {
         out.into_iter().cloned().collect()
     }
 
-    /// Fire-and-forget vault commit. The write path must NEVER block on git:
-    /// a stuck index.lock, a hung push or a slow `git add -A` on a big vault
-    /// used to stall the calling MCP request (the write itself had already
-    /// landed on disk — only the versioning lagged). Runs detached with a
-    /// bounded timeout; a failure only logs.
+    /// Fire-and-forget, coalesced vault commit. The write path must NEVER
+    /// block on Git: a stuck index.lock, a hung push, or a slow `git add -A`
+    /// must not stall the MCP request. A burst of writes therefore marks one
+    /// shared dirty flag and is drained by at most one bounded worker instead
+    /// of queuing one Git process per write.
     fn git_commit(&self) {
         if !self.auto_git_commit {
             return;
         }
+        self.git_commit_dirty.store(true, Ordering::Release);
+        if self
+            .git_commit_worker_active
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
         let root = self.root.clone();
         let author = self.git_author.clone();
-        let git_lock = self.git_lock.clone();
+        let dirty = self.git_commit_dirty.clone();
+        let worker_active = self.git_commit_worker_active.clone();
         let _ = tokio::task::spawn(async move {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                tokio::task::spawn_blocking(move || {
-            let Ok(_guard) = git_lock.lock() else { return }; // serialize git index.lock
-            let author_name = author
-                .split('<')
-                .next()
-                .unwrap_or("slc-mcp")
-                .trim()
-                .to_string();
-            let author_email = author
-                .split_once('<')
-                .and_then(|(_, email)| email.strip_suffix('>'))
-                .map(str::trim)
-                .filter(|email| !email.is_empty())
-                .unwrap_or("slc-mcp@local")
-                .to_string();
-            match quarantine_stale_git_index_lock(&root, SystemTime::now()) {
-                Ok(Some(path)) => tracing::warn!(
-                    path = %path.display(),
-                    "vault git: quarantined abandoned index lock"
-                ),
-                Ok(None) => {}
-                Err(error) => tracing::warn!("vault git lock recovery error: {error}"),
-            }
-            let run = |args: Vec<&str>| {
-                // A cold `git add -A` on the production vault can legitimately
-                // exceed 20 seconds during a write burst, while push and the
-                // metadata-only commands should remain short. Bound both
-                // classes without turning a normal add into a stale lock.
-                let mut cmd = std::process::Command::new("timeout");
-                cmd.arg("--signal=KILL")
-                    .arg(git_command_timeout_seconds(&args).to_string())
-                    .arg("git")
-                    .args(&args)
-                    .current_dir(&root)
-                    .env("GIT_AUTHOR_NAME", &author_name)
-                    .env("GIT_AUTHOR_EMAIL", &author_email)
-                    .output()
-            };
-            let failed = |out: &std::process::Output| {
-                tracing::warn!(
-                    "vault git: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            };
-            match run(vec!["add", "-A"]) {
-                Ok(out) if out.status.success() => {
-                    // A read-only lifecycle call may still persist operational
-                    // metadata. Avoid manufacturing empty commits when the
-                    // vault representation did not actually change.
-                    match run(vec!["diff", "--cached", "--quiet"]) {
-                        Ok(diff) if diff.status.success() => return,
-                        Ok(diff) if diff.status.code() == Some(1) => {}
-                        Ok(diff) => {
-                            failed(&diff);
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::warn!("vault git diff error: {e}");
-                            return;
-                        }
-                    }
-                    let commit = run(vec!["commit", "-m", "slc: vault update"]);
-                    match &commit {
-                        Ok(c) if c.status.success() => {
-                            // Push the vault to its upstream (best-effort) —
-                            // configured remote only, silent otherwise.
-                            if let Ok(p) = run(vec!["push", "-q"]) {
-                                if !p.status.success() {
-                                    tracing::debug!(
-                                        "vault push: {}",
-                                        String::from_utf8_lossy(&p.stderr).trim()
-                                    );
-                                }
-                            }
-                        }
-                        Ok(c) => failed(c),
-                        Err(e) => tracing::warn!("vault git commit error: {e}"),
-                    }
+            loop {
+                tokio::time::sleep(GIT_COMMIT_DEBOUNCE).await;
+                // The current on-disk state covers all writes seen so far.
+                // Any write while Git runs sets this flag again and earns one
+                // follow-up pass after the current snapshot finishes.
+                dirty.store(false, Ordering::Release);
+                let worker_root = root.clone();
+                let worker_author = author.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    run_vault_git_commit(&worker_root, &worker_author);
+                })
+                .await
+                {
+                    tracing::warn!("vault git worker failed: {error}");
                 }
-                Ok(out) => {
-                    if matches!(out.status.code(), Some(124) | Some(137)) {
-                        // This worker owns the only in-process Git command and
-                        // has just killed it. Quarantine its lock immediately;
-                        // the age-based recovery remains for unrelated crashes.
-                        match quarantine_git_index_lock(
-                            &root,
-                            SystemTime::now(),
-                            Duration::ZERO,
-                        ) {
-                            Ok(Some(path)) => tracing::warn!(
-                                path = %path.display(),
-                                "vault git: quarantined index lock left by timeout"
-                            ),
-                            Ok(None) => {}
-                            Err(error) => {
-                                tracing::warn!("vault git timeout recovery error: {error}")
-                            }
-                        }
-                    }
-                    failed(&out)
+                if !finish_git_commit_worker(&dirty, &worker_active) {
+                    break;
                 }
-                Err(e) => tracing::warn!("vault git add error: {e}"),
             }
-                }),
-            ).await;
         });
     }
 }
@@ -1655,5 +1697,18 @@ mod tests {
         assert_eq!(git_command_timeout_seconds(&["add", "-A"]), 120);
         assert_eq!(git_command_timeout_seconds(&["diff", "--cached"]), 30);
         assert_eq!(git_command_timeout_seconds(&["push", "-q"]), 30);
+    }
+
+    #[test]
+    fn coalesced_git_worker_repeats_only_for_writes_during_a_snapshot() {
+        let dirty = AtomicBool::new(true);
+        let worker_active = AtomicBool::new(true);
+
+        assert!(finish_git_commit_worker(&dirty, &worker_active));
+        assert!(!dirty.load(Ordering::Acquire));
+        assert!(worker_active.load(Ordering::Acquire));
+
+        assert!(!finish_git_commit_worker(&dirty, &worker_active));
+        assert!(!worker_active.load(Ordering::Acquire));
     }
 }
