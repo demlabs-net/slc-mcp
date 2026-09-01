@@ -42,6 +42,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GIT_INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const GIT_COMMIT_DEBOUNCE: Duration = Duration::from_millis(500);
+// Git's automatic maintenance can intentionally detach a `git` child after
+// commits. It is then reparented to the SLC container's PID 1, which has no
+// generic child reaper, leaving an exited maintenance process as a zombie.
+// Vault snapshots are already scheduled by SLC; disable overlapping Git work.
+const GIT_NO_BACKGROUND_MAINTENANCE: &[&str] = &[
+    "-c",
+    "maintenance.auto=false",
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "gc.autoDetach=false",
+];
 
 fn quarantine_git_index_lock(
     root: &Path,
@@ -116,7 +128,8 @@ fn run_vault_git_commit(root: &Path, author: &str) {
         // wrapper here: it can orphan/reparent `git` under a long-lived PID 1
         // and leak zombies after a cancelled snapshot.
         let mut cmd = std::process::Command::new("git");
-        cmd.args(&args)
+        cmd.args(GIT_NO_BACKGROUND_MAINTENANCE)
+            .args(&args)
             .current_dir(root)
             .env("GIT_AUTHOR_NAME", &author_name)
             .env("GIT_AUTHOR_EMAIL", &author_email)
