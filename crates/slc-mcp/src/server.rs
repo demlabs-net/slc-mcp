@@ -730,7 +730,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "start_task",
-            "description": "Atomically start the ready FIFO head. Only the assignee may call it; queued tasks are rejected with their position instead of creating a parallel writer.",
+            "description": "Atomically start the ready FIFO head. Only the assignee may call it; queued tasks are rejected with their position instead of creating a parallel writer. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "message": {"type":"string","default":"Started"},
@@ -739,7 +739,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "report_task",
-            "description": "Append a durable task progress/terminal report and update SLC state. A terminal report releases the assignee lane and atomically promotes the oldest queued task; transports must not copy report content or infer task state.",
+            "description": "Append a durable task progress/terminal report and update SLC state. A terminal report releases the assignee lane and atomically promotes the oldest queued task; transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "status": {"type":"string","enum":["in_progress","completed","blocked","failed"]},
@@ -750,7 +750,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "task_message",
-            "description": "Append a durable message to a task conversation. Recipient must be that task's issuer or assignee. The result includes a content-free wake envelope for an optional transport; the message body remains canonical only here.",
+            "description": "Append a durable message to a task conversation. Recipient must be that task's issuer or assignee. The result includes a content-free wake envelope for an optional transport; the message body remains canonical only here. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "recipient": {"type":"string"},

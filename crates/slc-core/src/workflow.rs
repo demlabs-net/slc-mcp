@@ -335,6 +335,42 @@ impl SlcEngine {
         Ok(doc)
     }
 
+    /// Resolve a missing task argument from the caller's active SLC task.
+    ///
+    /// Hermes' deferred MCP bridge can occasionally preserve the tool call's
+    /// idempotency key while dropping the required `task_id` field.  A role
+    /// has at most one active task pointer, so using it is unambiguous and
+    /// keeps the workflow lane safe.  We deliberately do not guess from the
+    /// global queue here: callers must have explicitly activated the task (or
+    /// have started it already), and a missing pointer remains a clear input
+    /// error rather than silently selecting unrelated work.
+    async fn workflow_task_id_or_active(
+        &self,
+        seat_id: &str,
+        task_id: &str,
+    ) -> SlcResult<String> {
+        let task_id = task_id.trim();
+        if !task_id.is_empty() {
+            return Ok(task_id.to_string());
+        }
+
+        let actor = self.workflow_principal(seat_id);
+        let active = self
+            .task_get_active(seat_id)
+            .await?
+            .ok_or_else(|| {
+                SlcError::InvalidInput(
+                    "task_id must not be empty (no active SLC task to resolve)".into(),
+                )
+            })?;
+        if active.assignee.as_deref() != Some(actor.as_str()) {
+            return Err(SlcError::PermissionDenied(
+                "the active SLC task is not assigned to the caller".into(),
+            ));
+        }
+        Ok(active.task_id)
+    }
+
     async fn append_task_event(
         &self,
         task_id: &str,
@@ -816,6 +852,8 @@ impl SlcEngine {
         idempotency_key: Option<&str>,
     ) -> SlcResult<(TaskInfo, TaskEvent)> {
         let _workflow_guard = self.workflow_lock.lock().await;
+        let task_id = self.workflow_task_id_or_active(seat_id, task_id).await?;
+        let task_id = task_id.as_str();
         let mut doc = self.workflow_task_document(seat_id, task_id).await?;
         let actor = self.workflow_principal(seat_id);
         if workflow_string(&doc, "assignee").as_deref() != Some(&actor) {
@@ -917,6 +955,8 @@ impl SlcEngine {
         idempotency_key: Option<&str>,
     ) -> SlcResult<(TaskInfo, TaskEvent, Option<TaskInfo>)> {
         let _workflow_guard = self.workflow_lock.lock().await;
+        let task_id = self.workflow_task_id_or_active(seat_id, task_id).await?;
+        let task_id = task_id.as_str();
         let doc = self.workflow_task_document(seat_id, task_id).await?;
         let actor = self.workflow_principal(seat_id);
         let assignee = workflow_string(&doc, "assignee")
@@ -1058,6 +1098,8 @@ impl SlcEngine {
         idempotency_key: Option<&str>,
     ) -> SlcResult<TaskEvent> {
         let _workflow_guard = self.workflow_lock.lock().await;
+        let task_id = self.workflow_task_id_or_active(seat_id, task_id).await?;
+        let task_id = task_id.as_str();
         let doc = self.workflow_task_document(seat_id, task_id).await?;
         let actor = self.workflow_principal(seat_id);
         let recipient = clean_required(recipient, "recipient", 128)?;
@@ -1247,6 +1289,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(issued.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_task_argument_resolves_active_assignee_task() {
+        let engine = engine();
+        let task = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Active pointer fallback",
+                "Use the active task when the bridge drops task_id",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("active-fallback-assignment"),
+            )
+            .await
+            .unwrap();
+
+        // This mirrors the deferred MCP bridge failure seen in live runs:
+        // activate_task succeeds, while the subsequent start_task payload
+        // loses its required task_id but retains its idempotency key.
+        engine
+            .task_activate("seat-junior", &task.task_id)
+            .await
+            .unwrap();
+        let (started, _) = engine
+            .workflow_start_task(
+                "seat-junior",
+                "",
+                "Started via active task",
+                Some("active-fallback-start"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.task_id, task.task_id);
+        assert_eq!(started.status, STATUS_ACTIVE);
+
+        let (reported, _, _) = engine
+            .workflow_report_task(
+                "seat-junior",
+                "",
+                "completed",
+                "Machine checks passed; visual review remains external",
+                json!({}),
+                Some("active-fallback-report"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reported.task_id, task.task_id);
+        assert_eq!(reported.status, STATUS_COMPLETED);
+        assert!(engine.task_get_active("seat-junior").await.unwrap().is_none());
     }
 
     #[tokio::test]
