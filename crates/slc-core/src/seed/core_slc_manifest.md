@@ -135,8 +135,11 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 - `set_page_limit(page_token_limit)` — persisted default page size (the
   operator's `SLC_PAGE_TOKEN_LIMIT` environment value has precedence)
 - `get_page_settings` — server defaults and effective connection settings
-- When `_pagination.total_pages > 1`, retrieve every remaining page in order
-  with `get_page` before interpreting or acting on the result.
+- When `_pagination.has_more=true`, the response ends with the exact next
+  `mcp__slc__get_page({...})` invocation. Execute that command immediately,
+  then follow the command at the end of the next page. Do not interpret, act
+  on, summarize, or update the document until a page reports
+  `_pagination.has_more=false`.
 
 ### Other
 - `seat_info` — seat info + usage stats

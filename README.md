@@ -35,11 +35,13 @@ the same initialize/tools flow.
 
 `update_context` applies only the seat's configured context-token budget. It
 does not invoke an LLM merely to fit a Hermes- or vendor-specific output cap.
-Large list-shaped tool results can use SLC's advertised `get_page` extension;
+Large tool results, including a single document with a large `content` field,
+can use SLC's advertised `get_page` extension;
 the extension is carried in ordinary MCP `TextContent` and needs no transport
-patch in the client. When more than one page exists, page one ends with an
-explicit instruction to retrieve every remaining page in order before acting
-on the result.
+patch in the client. Every non-final page ends with the exact next
+`mcp__slc__get_page({...})` invocation and a mandatory continuation instruction.
+The final page explicitly marks pagination complete. Clients must follow the
+advertised command page by page before acting on the result.
 
 Pagination is enabled by default. `SLC_PAGINATION_ENABLED` toggles it for the
 server and `SLC_PAGE_TOKEN_LIMIT` sets both the approximate page size and the

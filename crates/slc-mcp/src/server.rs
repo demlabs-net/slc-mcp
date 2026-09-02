@@ -580,7 +580,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_document",
-            "description": "Load a document by its unique name id. ВЫХОД ПАГИНИРУЕТСЯ для больших документов: при _pagination дочитай ВСЕ страницы/части (part k/n) — только так получишь полный контент.",
+            "description": "Load a document by its unique name id. ВЫХОД ПАГИНИРУЕТСЯ для больших документов: при _pagination.has_more=true ОБЯЗАТЕЛЬНО выполни точную mcp__slc__get_page({...}) команду из самого конца ответа и повторяй до has_more=false. Части part k/n вместе дают полный content.",
             "inputSchema": {"type":"object","properties":{
                 "document_id": {"type":"string"}
             },"required":["document_id"]}
@@ -1088,7 +1088,7 @@ fn tools() -> Vec<Value> {
         // pagination
         json!({
             "name": "get_page",
-            "description": "Retrieve a page of a paginated response",
+            "description": "Retrieve one page of a paginated response. If _pagination.has_more=true, the very end of the response contains the exact next mcp__slc__get_page({...}) invocation; execute it immediately and continue until has_more=false.",
             "inputSchema": {"type":"object","properties":{
                 "response_id": {"type":"string"},
                 "page": {"type":"number"}
@@ -1285,7 +1285,7 @@ name and generate the new slug.
 ## Пагинация больших ответов (ОБЯЗАТЕЛЬНО к исполнению)
 
 Следующие функции отдают ПАГИНИРОВАННЫЙ выхлоп, когда ответ превышает
-лимит страницы (по умолчанию 5000 токенов ≈ 15K символов ≈ 45K байт RU):
+лимит страницы (по умолчанию 50000 токенов, грубо до 150K символов):
 `update_context`, `save_context`, `get_document`, `list_documents`,
 `search`, `recall`, `list_tasks`, `list_projects`, `list_seats`,
 `notification_list`, `focus_list`, `reminder_list`, `document_stats` —
@@ -1293,9 +1293,11 @@ name and generate the new slug.
 текстом «ОТВЕТ ОБРЕЗАН БЮДЖЕТОМ КЛИЕНТА».
 
 Правила:
-1. **Считывай ВСЕ страницы до конца**: получив `_pagination`, по очереди
-   вызови `get_page(response_id=..., page=2..N)`, по одной странице за
-   вызов, и сложи содержимое. Большой документ может быть разбит на
+1. **Считывай ВСЕ страницы до конца**: если `_pagination.has_more=true`,
+   НЕМЕДЛЕННО выполни точную `mcp__slc__get_page({...})` команду,
+   напечатанную в самом конце ответа. На следующей странице выполни
+   её конечную команду. Повторяй строго по одной странице, пока
+   не получишь `_pagination.has_more=false`. Большой документ может быть разбит на
    части (поле `part: "k/n"` у элементов) — склеивай части в порядке k,
    они образуют ПОЛНЫЙ контент. Не завершай обработку, пока не
    прочитаны все страницы.
@@ -1312,10 +1314,10 @@ name and generate the new slug.
    сообщение «truncated by resultBudget»/«maxModelBytes») — уменьши размер
    страницы: `set_page_limit(<токены>)` (persisted per-seat) или заголовок
    `X-SLC-Page-Token-Limit: <токены>` на соединении (env сервера
-   `SLC_PAGE_TOKEN_LIMIT`). Формула: страница ≈ токены×3 символов ≈
-   токены×9 байт (RU); для бюджета 50K байт бери не больше 5000 токенов.
-   После уменьшения повтори чтение — страницы станут меньше и влезут в
-   бюджет обвязки целиком.
+   `SLC_PAGE_TOKEN_LIMIT`). Общий дефолт — 50000 токенов; клиент с меньшим
+   result budget обязан явно задать меньший лимит. Грубая формула:
+   страница ≈ токены×3 символов. После уменьшения повтори исходный вызов тула — страницы
+   станут меньше и влезут в бюджет обвязки целиком.
 
 ## Seat roles
 
@@ -3326,6 +3328,12 @@ async fn call_tool(
     // appending it would corrupt the generic state backend contract for every
     // MCP client, not just Hermes.
     let tool_text = text.clone();
+    // `get_page` is deliberately excluded from re-pagination, but its own
+    // `_pagination` envelope still has to drive the next call. Capture that
+    // metadata before optional notification prose makes the text non-JSON.
+    let mut response_pagination = serde_json::from_str::<Value>(&tool_text)
+        .ok()
+        .and_then(|value| value.get("_pagination").cloned());
     if name != "pop_notifications" && !name.starts_with("state_") {
         if let Ok(notes) = engine.pop_notifications(seat_id, 3).await {
             if !notes.is_empty() {
@@ -3373,7 +3381,7 @@ async fn call_tool(
                     .await
                     .map_err(json_err)?;
                 if let Some(page) = paginated.get("_pagination") {
-                    result["_pagination"] = page.clone();
+                    response_pagination = Some(page.clone());
                     // The first page contains only whole items. Remaining
                     // items are available through the advertised get_page
                     // tool without relying on a client-side patch.
@@ -3383,23 +3391,6 @@ async fn call_tool(
                             .unwrap_or_default()
                             .to_string();
                         text = page_text;
-                        // Give every client an explicit, tool-level recovery
-                        // path for the remaining pages.
-                        if let (Some(pid), Some(total)) = (
-                            page.get("response_id").and_then(|v| v.as_str()),
-                            page.get("total_pages").and_then(|v| v.as_u64()),
-                        ) {
-                            if total > 1 {
-                                text.push_str(&format!(
-                                    "\n\n📄 Paginated response: page 1 of {total}.\n"
-                                ));
-                                text.push_str(&format!(
-                                    "Retrieve every remaining page in order with get_page(response_id={pid}, page=2..{total}), one page per call, and combine the items.\n"
-                                ));
-                                text.push_str("Pages may contain PARTS of one large document (field `part: \"k/n\"`) — concatenate them in part order to get the full content.\n");
-                                text.push_str("Do not finish processing the response until all pages have been retrieved.");
-                            }
-                        }
                         text.push_str(&notification_suffix);
                         result["content"][0]["text"] = json!(text);
                     }
@@ -3419,7 +3410,38 @@ async fn call_tool(
             result["content"][0]["text"] = json!(text);
         }
     }
+    if let Some(page) = response_pagination {
+        result["_pagination"] = page.clone();
+        // This must be the final bytes of every page. Models should never
+        // have to infer the next page number, copy an id from prose, or decide
+        // whether fetching the remainder is optional.
+        if let Some(instruction) = pagination_followup_instruction(&page) {
+            text.push_str(&instruction);
+            result["content"][0]["text"] = json!(text);
+        }
+    }
     Ok(result)
+}
+
+fn pagination_followup_instruction(pagination: &Value) -> Option<String> {
+    let page = pagination.get("page").and_then(Value::as_u64)?;
+    let total = pagination.get("total_pages").and_then(Value::as_u64)?;
+    if page < total {
+        let command = pagination
+            .get("next_page_command")
+            .and_then(Value::as_str)?;
+        return Some(format!(
+            "\n\n⛔ MANDATORY PAGINATION CONTINUATION / ОБЯЗАТЕЛЬНОЕ ПРОДОЛЖЕНИЕ\n\
+Ответ НЕ закончен: это страница {page} из {total}. НЕ анализируй, НЕ подводи итог и НЕ отвечай пользователю.\n\
+После вызова выполни команду из самого конца следующей страницы. Повторяй, пока `_pagination.has_more=false`.\n\
+НЕ ДЕЛАЙ НИЧЕГО ДРУГОГО. СЛЕДУЮЩИЙ ВЫЗОВ — СКОПИРУЙ БЕЗ ИЗМЕНЕНИЙ:\n{command}"
+        ));
+    }
+    (total > 1).then(|| {
+        format!(
+            "\n\n✅ PAGINATION COMPLETE / ПАГИНАЦИЯ ЗАВЕРШЕНА: получена страница {page} из {total}, `_pagination.has_more=false`. Только теперь можно анализировать полный ответ."
+        )
+    })
 }
 
 fn json_err(e: slc_core::SlcError) -> Value {
@@ -3605,6 +3627,102 @@ mod seat_filter_tests {
         let policy = pagination_policy_from_request(&headers);
         assert!(policy.enabled);
         assert_eq!(policy.page_token_limit, Some(350_000));
+    }
+
+    #[tokio::test]
+    async fn get_document_pages_end_with_the_exact_next_tool_call() {
+        let store: Arc<dyn slc_core::StorageBackend> = Arc::new(
+            slc_core::storage::sqlite::SqliteStore::in_memory().unwrap(),
+        );
+        let engine = SlcEngine::with(
+            store,
+            Arc::new(slc_core::MockLlm::new(vec![])),
+            slc_core::SlcConfig::default(),
+        );
+        engine.ensure_seat("small-model").await.unwrap();
+        let content = format!(
+            "DOCUMENT_START_MARKER\n{}\nDOCUMENT_END_MARKER",
+            "абвгд ".repeat(6000)
+        );
+        let mut document = Document::new(
+            "large_document",
+            DocumentCategory::Custom,
+            content,
+            DocMeta::default(),
+            vec!["non-empty-tag".to_string()],
+            None,
+        );
+        document.auto_load = vec!["required_context".to_string()];
+        document.references = vec!["source_document".to_string()];
+        engine.add_document(&mut document).await.unwrap();
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let policy = PaginationPolicy {
+            enabled: true,
+            page_token_limit: Some(1_000),
+            context_token_limit: None,
+        };
+
+        let first = call_tool(
+            &engine,
+            "small-model",
+            "get_document",
+            &json!({"document_id": "large_document"}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let pagination = &first["_pagination"];
+        let response_id = pagination["response_id"].as_str().unwrap();
+        let total = pagination["total_pages"].as_u64().unwrap();
+        assert!(total > 2);
+        assert_eq!(pagination["has_more"], true);
+        assert_eq!(pagination["next_page"], 2);
+        let first_text = first["content"][0]["text"].as_str().unwrap();
+        assert!(first_text.contains("DOCUMENT_START_MARKER"));
+        assert!(!first_text.contains("DOCUMENT_END_MARKER"));
+        assert!(first_text.contains(&format!(
+            "mcp__slc__get_page({{\"response_id\":\"{response_id}\",\"page\":2}})"
+        )));
+        assert!(first_text.ends_with(&format!(
+            "mcp__slc__get_page({{\"response_id\":\"{response_id}\",\"page\":2}})"
+        )));
+
+        let second = call_tool(
+            &engine,
+            "small-model",
+            "get_page",
+            &json!({"response_id": response_id, "page": 2}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["_pagination"]["next_page"], 3);
+        let second_text = second["content"][0]["text"].as_str().unwrap();
+        assert!(second_text.contains(&format!(
+            "mcp__slc__get_page({{\"response_id\":\"{response_id}\",\"page\":3}})"
+        )));
+        assert!(second_text.ends_with(&format!(
+            "mcp__slc__get_page({{\"response_id\":\"{response_id}\",\"page\":3}})"
+        )));
+
+        let last = call_tool(
+            &engine,
+            "small-model",
+            "get_page",
+            &json!({"response_id": response_id, "page": total}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(last["_pagination"]["has_more"], false);
+        assert!(last["_pagination"]["next_page"].is_null());
+        let last_text = last["content"][0]["text"].as_str().unwrap();
+        assert!(last_text.ends_with(
+            "`_pagination.has_more=false`. Только теперь можно анализировать полный ответ."
+        ));
     }
 
     #[test]
