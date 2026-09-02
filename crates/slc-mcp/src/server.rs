@@ -3362,10 +3362,15 @@ async fn call_tool(
     // otherwise `content` itself looks like the list and no useful split is
     // possible. This is an application-level SLC tool contract layered on
     // ordinary MCP TextContent, so it remains consumable by any MCP client.
-    let pagination_candidate = !matches!(
-        name,
-        "get_page" | "delete_response" | "set_page_limit" | "get_page_settings"
-    );
+    // The generic external-state backend is consumed by machine clients that
+    // parse TextContent as JSON when structuredContent is omitted.  Neither a
+    // pagination instruction nor the large-response warning may be appended
+    // to state_* results: either suffix would corrupt that JSON contract.
+    let pagination_candidate = !name.starts_with("state_")
+        && !matches!(
+            name,
+            "get_page" | "delete_response" | "set_page_limit" | "get_page_settings"
+        );
     let effective_page_token_limit = match pagination.page_token_limit {
         Some(limit) => limit,
         None => engine.page_token_limit().await.map_err(json_err)?,
@@ -3627,6 +3632,63 @@ mod seat_filter_tests {
         let policy = pagination_policy_from_request(&headers);
         assert!(policy.enabled);
         assert_eq!(policy.page_token_limit, Some(350_000));
+    }
+
+    #[tokio::test]
+    async fn large_external_state_lists_remain_machine_parseable() {
+        let store: Arc<dyn slc_core::StorageBackend> =
+            Arc::new(slc_core::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let engine = SlcEngine::with(
+            store,
+            Arc::new(slc_core::MockLlm::new(vec![])),
+            slc_core::SlcConfig::default(),
+        );
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let seat = "external-state-client";
+        for index in 0..8 {
+            let key = format!("skill-{index}-{}", "x".repeat(400));
+            call_tool(
+                &engine,
+                seat,
+                "state_put",
+                &json!({
+                    "namespace": "hermes-skills",
+                    "key": key,
+                    "content": "content",
+                }),
+                &events,
+                PaginationPolicy {
+                    enabled: false,
+                    page_token_limit: Some(1),
+                    context_token_limit: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let listed = call_tool(
+            &engine,
+            seat,
+            "state_list",
+            &json!({"namespace": "hermes-skills", "limit": 1000}),
+            &events,
+            PaginationPolicy {
+                enabled: true,
+                page_token_limit: Some(1),
+                context_token_limit: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(listed.get("_pagination").is_none());
+        assert!(listed.get("structuredContent").is_none());
+        let text = listed["content"][0]["text"].as_str().unwrap();
+        assert!(text.chars().count() > 2_000);
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["count"], 8);
+        assert_eq!(parsed["objects"].as_array().unwrap().len(), 8);
     }
 
     #[tokio::test]
