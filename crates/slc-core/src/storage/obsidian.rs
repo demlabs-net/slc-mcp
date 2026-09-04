@@ -42,8 +42,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GIT_INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
-const GIT_COMMIT_DEBOUNCE: Duration = Duration::from_millis(500);
+const GIT_COMMIT_DEBOUNCE: Duration = Duration::from_secs(5);
+const GIT_MAINTENANCE_CHECK_INTERVAL: u64 = 16;
+const GIT_MAINTENANCE_LOOSE_OBJECT_LIMIT: u64 = 1024;
+const GIT_MAINTENANCE_LOOSE_KIB_LIMIT: u64 = 128 * 1024;
 static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static GIT_COMMITS_SINCE_START: AtomicU64 = AtomicU64::new(0);
 // Git's automatic maintenance can intentionally detach a `git` child after
 // commits. It is then reparented to the SLC container's PID 1, which has no
 // generic child reaper, leaving an exited maintenance process as a zombie.
@@ -101,7 +105,6 @@ fn atomic_replace(temp_dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result
         "could not allocate a unique vault temporary file",
     ))
 }
-
 fn quarantine_git_index_lock(
     root: &Path,
     now: SystemTime,
@@ -142,6 +145,23 @@ fn quarantine_stale_git_index_lock(
     now: SystemTime,
 ) -> std::io::Result<Option<PathBuf>> {
     quarantine_git_index_lock(root, now, GIT_INDEX_LOCK_STALE_AFTER)
+}
+
+fn parse_git_count_objects(output: &str) -> Option<(u64, u64)> {
+    let mut count = None;
+    let mut size_kib = None;
+    for line in output.lines() {
+        let Some((key, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = raw_value.trim().parse::<u64>().ok();
+        match key.trim() {
+            "count" => count = value,
+            "size" => size_kib = value,
+            _ => {}
+        }
+    }
+    count.zip(size_kib)
 }
 
 /// Run one coalesced Git snapshot for the vault. This is intentionally invoked
@@ -217,6 +237,38 @@ fn run_vault_git_commit(root: &Path, author: &str) {
                                 "vault push: {}",
                                 String::from_utf8_lossy(&push.stderr).trim()
                             );
+                        }
+                    }
+                    let committed = GIT_COMMITS_SINCE_START.fetch_add(1, Ordering::Relaxed) + 1;
+                    if committed == 1 || committed % GIT_MAINTENANCE_CHECK_INTERVAL == 0 {
+                        match run(vec!["count-objects", "-v"]) {
+                            Ok(count_objects) if count_objects.status.success() => {
+                                let summary = String::from_utf8_lossy(&count_objects.stdout);
+                                if let Some((loose_count, loose_kib)) =
+                                    parse_git_count_objects(&summary)
+                                {
+                                    if loose_count >= GIT_MAINTENANCE_LOOSE_OBJECT_LIMIT
+                                        || loose_kib >= GIT_MAINTENANCE_LOOSE_KIB_LIMIT
+                                    {
+                                        tracing::info!(
+                                            loose_count,
+                                            loose_kib,
+                                            "vault git: compacting loose objects"
+                                        );
+                                        match run(vec!["gc", "--prune=2.weeks.ago"]) {
+                                            Ok(gc) if gc.status.success() => {}
+                                            Ok(gc) => failed(&gc),
+                                            Err(error) => {
+                                                tracing::warn!("vault git gc error: {error}")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(count_objects) => failed(&count_objects),
+                            Err(error) => {
+                                tracing::warn!("vault git count-objects error: {error}")
+                            }
                         }
                     }
                 }
@@ -1769,5 +1821,12 @@ mod tests {
 
         assert!(!finish_git_commit_worker(&dirty, &worker_active));
         assert!(!worker_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn parses_git_loose_object_summary_for_maintenance_thresholds() {
+        let summary = "count: 2148\nsize: 574904\nin-pack: 2891\nsize-pack: 160460\n";
+        assert_eq!(parse_git_count_objects(summary), Some((2148, 574904)));
+        assert_eq!(parse_git_count_objects("count: nope\nsize: 1\n"), None);
     }
 }
