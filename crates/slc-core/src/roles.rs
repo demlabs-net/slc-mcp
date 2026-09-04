@@ -135,6 +135,33 @@ pub fn parse_principal_seats_env() -> HashMap<String, String> {
     }
 }
 
+/// Parse the stable workflow-principal → active policy document registry.
+///
+/// Format: JSON object `{"manager":"swarm_pipeline_manager_v2", ...}`.
+/// The document body remains mutable SLC state; this map only ensures every
+/// newly assigned task auto-loads the current policy for its assignee.
+pub fn parse_principal_policy_documents_env() -> HashMap<String, String> {
+    let Ok(raw) = std::env::var("SLC_PRINCIPAL_POLICY_DOCUMENTS") else {
+        return HashMap::new();
+    };
+    match serde_json::from_str::<HashMap<String, String>>(&raw) {
+        Ok(mapping)
+            if mapping.iter().all(|(principal, document)| {
+                !principal.trim().is_empty() && !document.trim().is_empty()
+            }) => mapping,
+        Ok(_) => {
+            tracing::warn!(
+                "SLC_PRINCIPAL_POLICY_DOCUMENTS contains an empty principal or document; ignoring it"
+            );
+            HashMap::new()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "SLC_PRINCIPAL_POLICY_DOCUMENTS is not a JSON string map; ignoring it");
+            HashMap::new()
+        }
+    }
+}
+
 /// Parse task-delegation authority independently from any message transport.
 ///
 /// Format: JSON object `{"manager":["*"],"dev-senior-0":["dev-middle-0"]}`.
@@ -228,6 +255,10 @@ mod tests {
                 "SLC_TASK_ASSIGN_ACL",
                 r#"{"manager":["*"],"senior":["worker"]}"#,
             );
+            std::env::set_var(
+                "SLC_PRINCIPAL_POLICY_DOCUMENTS",
+                r#"{"manager":"swarm_pipeline_manager_v2","worker":"swarm_pipeline_middle_v2"}"#,
+            );
             std::env::set_var("SLC_TEXT_ONLY_PRINCIPALS", "worker, junior");
         }
         let principals = parse_principal_seats_env();
@@ -235,6 +266,8 @@ mod tests {
         let acl = parse_task_assign_acl_env();
         assert!(acl["manager"].contains("*"));
         assert!(acl["senior"].contains("worker"));
+        let policies = parse_principal_policy_documents_env();
+        assert_eq!(policies["worker"], "swarm_pipeline_middle_v2");
         let text_only = parse_text_only_principals_env();
         assert!(text_only.contains("worker"));
         unsafe {
@@ -247,6 +280,7 @@ mod tests {
         unsafe {
             std::env::remove_var("SLC_PRINCIPAL_SEATS");
             std::env::remove_var("SLC_TASK_ASSIGN_ACL");
+            std::env::remove_var("SLC_PRINCIPAL_POLICY_DOCUMENTS");
             std::env::remove_var("SLC_TEXT_ONLY_PRINCIPALS");
         }
     }

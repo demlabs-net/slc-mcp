@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use slc_core::{
     DocFilter, DocMeta, DocSort, Document, DocumentCategory, SlcEngine, SortDir, TaskListScope,
 };
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::{auth, webui};
@@ -1410,10 +1411,18 @@ async fn build_context(
     let to_tokens = |chars: usize| chars.div_ceil(slc_core::CHARS_PER_TOKEN).max(1);
     let mut used_tokens = 0usize;
 
-    // Blocks in priority order: active document FIRST (never dropped),
-    // then focuses, then profiles, then base docs.
+    // Blocks in priority order: active document FIRST (never dropped), its
+    // recursive auto_load contract, then focuses, profiles, and base docs.
     let mut active_block: Option<Value> = None;
+    let mut auto_load_blocks: Vec<Value> = Vec::new();
     if let Ok(Some(d)) = engine.document_get_active(seat_id).await {
+        let active_document_id = d.document_id.clone();
+        let configured_policy = engine
+            .config
+            .principal_policy_documents
+            .get(&engine.workflow_principal(seat_id))
+            .cloned();
+        let active_is_policy = configured_policy.as_deref() == Some(active_document_id.as_str());
         used_tokens += to_tokens(
             d.document_id.chars().count()
                 + d.category.as_str().chars().count()
@@ -1422,6 +1431,44 @@ async fn build_context(
         active_block = Some(
             json!({"id": d.document_id, "type": d.category.as_str(), "name": d.document_id, "content": d.content}),
         );
+        let mut seen = HashSet::from([active_document_id]);
+        let mut pending = d
+            .auto_load
+            .into_iter()
+            .map(|document_id| {
+                let trusted = active_is_policy
+                    || configured_policy.as_deref() == Some(document_id.as_str());
+                (document_id, trusted)
+            })
+            .collect::<VecDeque<_>>();
+        while let Some((document_id, trusted_policy_chain)) = pending.pop_front() {
+            if seen.len() >= 64 || !seen.insert(document_id.clone()) {
+                continue;
+            }
+            if let Ok(Some(linked)) = engine.get_document(&document_id).await {
+                if !trusted_policy_chain && !engine.can_read_document(seat_id, &linked) {
+                    continue;
+                }
+                used_tokens += to_tokens(
+                    linked.document_id.chars().count()
+                        + linked.category.as_str().chars().count()
+                        + linked.content.chars().count(),
+                );
+                pending.extend(
+                    linked
+                        .auto_load
+                        .iter()
+                        .cloned()
+                        .map(|child| (child, trusted_policy_chain)),
+                );
+                auto_load_blocks.push(json!({
+                    "id": linked.document_id,
+                    "type": linked.category.as_str(),
+                    "name": linked.document_id,
+                    "content": linked.content,
+                }));
+            }
+        }
     }
     let mut focus_block: Option<Value> = None;
     if let Ok(items) = engine.focus_list(seat_id, None).await {
@@ -1486,6 +1533,7 @@ async fn build_context(
     if let Some(b) = active_block {
         docs.push(b);
     }
+    docs.extend(auto_load_blocks);
     if let Some(b) = focus_block {
         docs.push(b);
     }
@@ -3629,6 +3677,81 @@ mod seat_filter_tests {
         let policy = pagination_policy_from_request(&headers);
         assert!(policy.enabled);
         assert_eq!(policy.page_token_limit, Some(350_000));
+    }
+
+    #[tokio::test]
+    async fn update_context_recursively_loads_active_document_dependencies() {
+        let store: Arc<dyn slc_core::StorageBackend> =
+            Arc::new(slc_core::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let mut config = slc_core::SlcConfig::default();
+        config
+            .principal_policy_documents
+            .insert("worker".into(), "role_policy".into());
+        let engine = SlcEngine::with(
+            store,
+            Arc::new(slc_core::MockLlm::new(vec![])),
+            config,
+        );
+        let mut global = Document::new(
+            "global_policy",
+            DocumentCategory::System,
+            "GLOBAL_POLICY_MARKER",
+            DocMeta::default(),
+            vec![],
+            Some("manager".into()),
+        );
+        engine.add_document(&mut global).await.unwrap();
+        let mut role = Document::new(
+            "role_policy",
+            DocumentCategory::System,
+            "ROLE_POLICY_MARKER",
+            DocMeta::default(),
+            vec![],
+            Some("manager".into()),
+        );
+        role.auto_load = vec!["global_policy".into()];
+        engine.add_document(&mut role).await.unwrap();
+        let mut private = Document::new(
+            "private_secret",
+            DocumentCategory::Custom,
+            "PRIVATE_SECRET_MARKER",
+            DocMeta::default(),
+            vec![],
+            Some("other-seat".into()),
+        );
+        engine.add_document(&mut private).await.unwrap();
+        let mut task = Document::new(
+            "active_task",
+            DocumentCategory::Task,
+            "ACTIVE_TASK_MARKER",
+            DocMeta::default(),
+            vec![],
+            Some("worker".into()),
+        );
+        task.auto_load = vec!["private_secret".into(), "role_policy".into()];
+        engine.add_document(&mut task).await.unwrap();
+        engine.ensure_seat("worker").await.unwrap();
+        engine.document_activate("worker", "active_task").await.unwrap();
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let context = call_tool(
+            &engine,
+            "worker",
+            "update_context",
+            &json!({"include_base_docs": false}),
+            &events,
+            PaginationPolicy {
+                enabled: false,
+                page_token_limit: None,
+                context_token_limit: Some(100_000),
+            },
+        )
+        .await
+        .unwrap()
+        .to_string();
+        assert!(context.contains("ACTIVE_TASK_MARKER"), "{context}");
+        assert!(context.contains("ROLE_POLICY_MARKER"), "{context}");
+        assert!(context.contains("GLOBAL_POLICY_MARKER"), "{context}");
+        assert!(!context.contains("PRIVATE_SECRET_MARKER"), "{context}");
     }
 
     #[tokio::test]

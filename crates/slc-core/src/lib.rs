@@ -197,6 +197,9 @@ pub struct SlcConfig {
     /// Stable workflow principal → SLC seat mapping. Workflow records never
     /// contain Swarm MCP endpoint names or transport-specific identities.
     pub principal_seats: std::collections::HashMap<String, String>,
+    /// Workflow principal → SLC policy document automatically attached to
+    /// every new assigned task through its `auto_load` chain.
+    pub principal_policy_documents: std::collections::HashMap<String, String>,
     /// Principal-level task delegation ACL, independent from message routing.
     pub task_assign_acl: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Text-only principals cannot claim visual acceptance in task reports.
@@ -263,6 +266,7 @@ impl Default for SlcConfig {
             seat_roles: roles::parse_roles_env(),
             seat_manage_acl: roles::parse_manage_acl_env(),
             principal_seats: roles::parse_principal_seats_env(),
+            principal_policy_documents: roles::parse_principal_policy_documents_env(),
             task_assign_acl: roles::parse_task_assign_acl_env(),
             text_only_principals: roles::parse_text_only_principals_env(),
         }

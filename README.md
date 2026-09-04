@@ -159,6 +159,10 @@ accidentally close a writer that is still running.
 Configure `SLC_PRINCIPAL_SEATS` to map transport-neutral participant names to
 the existing SLC seats, and configure delegation independently with
 `SLC_TASK_ASSIGN_ACL`. A global coordinator requires an explicit `"*"` grant.
+`SLC_PRINCIPAL_POLICY_DOCUMENTS` maps each principal to the mutable SLC policy
+document that is automatically appended to every new task's `auto_load` chain.
+`update_context` recursively resolves that chain, so activating the task does
+not hide the assignee's live operating policy.
 `SLC_TEXT_ONLY_PRINCIPALS` prevents non-vision models from claiming visual
 acceptance while still allowing them to report hashes, dimensions, and other
 machine evidence.

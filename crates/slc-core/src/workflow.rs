@@ -996,13 +996,20 @@ impl SlcEngine {
             workflow_metadata.insert("root_task_id".into(), json!(root_id));
         }
 
+        let mut effective_auto_load = auto_load.to_vec();
+        if let Some(policy_document) = self.config.principal_policy_documents.get(&assignee)
+            && !effective_auto_load.iter().any(|item| item == policy_document)
+        {
+            effective_auto_load.push(policy_document.clone());
+        }
+
         let task = self
             .task_create(
                 &target_seat,
                 &clean_name,
                 description,
                 project_id,
-                auto_load,
+                &effective_auto_load,
                 &Value::Object(workflow_metadata),
             )
             .await?;
@@ -1651,6 +1658,10 @@ mod tests {
                 ("manager".into(), HashSet::from(["*".into()])),
                 ("senior".into(), HashSet::from(["junior".into()])),
             ]),
+            principal_policy_documents: HashMap::from([
+                ("senior".into(), "swarm_pipeline_senior_v2".into()),
+                ("junior".into(), "swarm_pipeline_junior_v2".into()),
+            ]),
             text_only_principals: HashSet::from(["junior".into()]),
             ..Default::default()
         };
@@ -1696,6 +1707,10 @@ mod tests {
             Some(parent.task_id.as_str())
         );
         assert_eq!(child.root_task_id.as_deref(), Some(parent.task_id.as_str()));
+        assert_eq!(
+            child.auto_load,
+            vec!["swarm_pipeline_junior_v2".to_string()]
+        );
         assert!(
             engine
                 .task_get_active("seat-junior")
