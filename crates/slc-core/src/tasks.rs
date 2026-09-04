@@ -384,6 +384,9 @@ impl<S: StorageBackend> WorkItemManager<S> {
 
     /// Set the seat's active task pointer (working-memory context).
     pub async fn set_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
+        if self.get_task(seat_id, task_id).await?.is_none() {
+            return Ok(false);
+        }
         self.store.set_seat_active_task(seat_id, task_id).await
     }
 
@@ -796,6 +799,10 @@ mod tests {
             .unwrap();
         assert!(m.set_active_task("seat_a", &t.task_id).await.unwrap());
         let engine = engine(store);
+        let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
+        assert_eq!(active.document_id, t.task_id);
+
+        assert!(!m.set_active_task("seat_a", "task_a_expanded").await.unwrap());
         let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
         assert_eq!(active.document_id, t.task_id);
     }
