@@ -1688,7 +1688,7 @@ fn workflow_delivery(
 ) -> Value {
     let message = if matches!(event_kind, "created" | "ready") {
         format!(
-            "SLC task {task_id} is ready at the head of your FIFO. The exact opaque task_id is `{task_id}`: copy it byte-for-byte and never expand, normalize, or reconstruct it from a task name or slug. Read it with get_task and call start_task with that exact task_id before editing."
+            "SLC task {task_id} is ready at the head of your FIFO. Read it with get_task and call start_task before editing."
         )
     } else {
         format!(
@@ -4012,15 +4012,5 @@ mod seat_filter_tests {
         assert!(!serialized.contains("private report"));
         assert!(serialized.contains("list_task_events"));
 
-        let ready = workflow_delivery(
-            Some("dev-senior-0"),
-            "whole_design_build_gostinitsa_sky_port_novosibir",
-            Some("event_ready"),
-            "ready",
-        );
-        let message = ready["message"].as_str().unwrap();
-        assert!(message.contains("copy it byte-for-byte"));
-        assert!(message.contains("never expand, normalize, or reconstruct"));
-        assert!(message.contains("`whole_design_build_gostinitsa_sky_port_novosibir`"));
     }
 }
