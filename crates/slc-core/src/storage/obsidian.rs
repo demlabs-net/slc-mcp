@@ -35,13 +35,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GIT_INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const GIT_COMMIT_DEBOUNCE: Duration = Duration::from_millis(500);
+static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // Git's automatic maintenance can intentionally detach a `git` child after
 // commits. It is then reparented to the SLC container's PID 1, which has no
 // generic child reaper, leaving an exited maintenance process as a zombie.
@@ -54,6 +56,51 @@ const GIT_NO_BACKGROUND_MAINTENANCE: &[&str] = &[
     "-c",
     "gc.autoDetach=false",
 ];
+
+/// Replace a vault file without truncating the inode a concurrent `git add`
+/// may already have mmaped. Truncating that inode can terminate Git with
+/// SIGBUS, leave index.lock behind, and stall all later snapshots. Temporary
+/// files live under `.git` when available so Git never stages an in-flight
+/// write; rename is atomic because both paths remain on the vault filesystem.
+fn atomic_replace(temp_dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(temp_dir)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "invalid vault file name"))?;
+    for _ in 0..32 {
+        let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = temp_dir.join(format!(
+            "{file_name}.{}.{}",
+            std::process::id(),
+            sequence
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = file.write_all(bytes).and_then(|_| file.flush()) {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        drop(file);
+        if let Err(error) = std::fs::rename(&temporary, path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        "could not allocate a unique vault temporary file",
+    ))
+}
 
 fn quarantine_git_index_lock(
     root: &Path,
@@ -448,6 +495,17 @@ impl ObsidianVaultStore {
         self.root.join(".slc")
     }
 
+    fn atomic_write(&self, path: &Path, bytes: &[u8]) -> SlcResult<()> {
+        let git_temp = self.root.join(".git/slc-write-tmp");
+        let temp_dir = if self.root.join(".git").is_dir() {
+            git_temp
+        } else {
+            self.slc_dir().join("write-tmp")
+        };
+        atomic_replace(&temp_dir, path, bytes)?;
+        Ok(())
+    }
+
     /// Scan the vault and rebuild the document index from file frontmatter
     /// (picks up hand-edits made in Obsidian).
     pub fn rebuild_index(&self) -> SlcResult<()> {
@@ -632,22 +690,21 @@ impl ObsidianVaultStore {
     fn persist_index(&self) -> SlcResult<()> {
         let map = self.index.lock().unwrap();
         let text = serde_json::to_string_pretty(&*map)?;
-        std::fs::write(self.slc_dir().join("index.json"), text)?;
+        self.atomic_write(&self.slc_dir().join("index.json"), text.as_bytes())?;
         Ok(())
     }
 
     fn persist_embeddings(&self) -> SlcResult<()> {
         let map = self.embeddings.lock().unwrap();
-        std::fs::write(
-            self.slc_dir().join("embeddings.json"),
-            serde_json::to_string_pretty(&*map)?,
-        )?;
+        let text = serde_json::to_string_pretty(&*map)?;
+        self.atomic_write(&self.slc_dir().join("embeddings.json"), text.as_bytes())?;
         Ok(())
     }
 
     fn persist_timers(&self) -> SlcResult<()> {
         let map = self.timers.lock().unwrap();
-        std::fs::write(self.slc_dir().join("timers.json"), serde_json::to_string_pretty(&*map)?)?;
+        let text = serde_json::to_string_pretty(&*map)?;
+        self.atomic_write(&self.slc_dir().join("timers.json"), text.as_bytes())?;
         Ok(())
     }
 
@@ -657,13 +714,15 @@ impl ObsidianVaultStore {
             .iter()
             .map(|((c, k), v)| (format!("{c}\u{0}{k}"), v.clone()))
             .collect();
-        std::fs::write(self.slc_dir().join("records.json"), serde_json::to_string_pretty(&flat)?)?;
+        let text = serde_json::to_string_pretty(&flat)?;
+        self.atomic_write(&self.slc_dir().join("records.json"), text.as_bytes())?;
         Ok(())
     }
 
     fn persist_seat(&self, seat: &Seat) -> SlcResult<()> {
         let path = self.root.join("seats").join(format!("{}.json", safe_file_name(&seat.seat_id)));
-        std::fs::write(path, serde_json::to_string_pretty(seat)?)?;
+        let text = serde_json::to_string_pretty(seat)?;
+        self.atomic_write(&path, text.as_bytes())?;
         Ok(())
     }
 
@@ -680,7 +739,7 @@ impl ObsidianVaultStore {
             .unwrap_or_else(|| safe_file_name(&doc.document_id));
         let path = dir.join(format!("{file_name}.md"));
         let text = render_doc(doc)?;
-        std::fs::write(path, text)?;
+        self.atomic_write(&path, text.as_bytes())?;
 
         // A full replacement may change category or project binding, which
         // changes the canonical folder. Leaving the old note behind creates
@@ -1647,6 +1706,27 @@ mod tests {
         ] {
             assert!(sanitize_folder(bad).is_err(), "must reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn atomic_replace_preserves_the_inode_seen_by_a_concurrent_reader() {
+        use std::io::Read as _;
+
+        let root = tmp_vault("atomic-replace");
+        let target = root.join(".slc/index.json");
+        let temp_dir = root.join(".git/slc-write-tmp");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"old-complete-value").unwrap();
+        let mut existing_reader = std::fs::File::open(&target).unwrap();
+
+        atomic_replace(&temp_dir, &target, b"new-complete-value").unwrap();
+
+        let mut old_value = Vec::new();
+        existing_reader.read_to_end(&mut old_value).unwrap();
+        assert_eq!(old_value, b"old-complete-value");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-complete-value");
+        assert_eq!(std::fs::read_dir(&temp_dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
