@@ -739,7 +739,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "report_task",
-            "description": "Append the assignee's durable task progress/terminal report and update SLC state. Only the assignee may report, and the task must already be running; coordinators cannot close a live executor lane and terminal reports cannot bypass the FIFO from ready/queued state. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task; idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "description": "Append the assignee's durable task progress/terminal report and update SLC state. Only the assignee may report, and the task must already be running; coordinators cannot close a live executor lane and terminal reports cannot bypass the FIFO from ready/queued state. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task, but the response deliberately does not disclose that successor: wake the issuer with delivery and end this executor run; the issuer reconciles and wakes the next head as a fresh run. Idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "status": {"type":"string","enum":["in_progress","completed","blocked","failed"]},
@@ -2197,7 +2197,7 @@ async fn call_tool(
             let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
             let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
             let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
-            let (task, event, next_ready_task) = engine
+            let (task, event, _next_ready_task) = engine
                 .workflow_report_task(seat_id, task_id, status, summary, metadata, idempotency_key)
                 .await
                 .map_err(json_err)?;
@@ -2214,14 +2214,6 @@ async fn call_tool(
                 }));
             }
             let terminal = matches!(task.status.as_str(), "COMPLETED" | "BLOCKED" | "FAILED");
-            let next_delivery = next_ready_task.as_ref().map(|next| {
-                workflow_delivery(
-                    next.assignee.as_deref(),
-                    &next.task_id,
-                    next.queue_ready_event_id.as_deref(),
-                    "ready",
-                )
-            });
             json!({
                 "success": true,
                 "task": task,
@@ -2233,8 +2225,6 @@ async fn call_tool(
                     event.kind.as_str(),
                 ),
                 "wake_recommended": terminal,
-                "next_ready_task": next_ready_task,
-                "next_delivery": next_delivery,
             })
         }
         "cancel_task" => {
@@ -3689,6 +3679,87 @@ mod seat_filter_tests {
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["count"], 8);
         assert_eq!(parsed["objects"].as_array().unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn terminal_report_does_not_invite_assignee_to_start_successor() {
+        use slc_core::storage::sqlite::SqliteStore;
+        use slc_core::{MockLlm, SlcConfig, StorageBackend};
+        use std::collections::{HashMap, HashSet};
+
+        let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
+        let config = SlcConfig {
+            principal_seats: HashMap::from([
+                ("manager".into(), "seat-manager".into()),
+                ("worker".into(), "seat-worker".into()),
+            ]),
+            task_assign_acl: HashMap::from([("manager".into(), HashSet::from(["worker".into()]))]),
+            ..Default::default()
+        };
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let policy = PaginationPolicy {
+            enabled: false,
+            page_token_limit: None,
+            context_token_limit: None,
+        };
+
+        let first = call_tool(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            &json!({"assignee":"worker","name":"first","idempotency_key":"assign-1"}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let first: Value =
+            serde_json::from_str(first["content"][0]["text"].as_str().unwrap()).unwrap();
+        let first_id = first["task"]["task_id"].as_str().unwrap();
+        call_tool(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            &json!({"assignee":"worker","name":"second","idempotency_key":"assign-2"}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        call_tool(
+            &engine,
+            "seat-worker",
+            "start_task",
+            &json!({"task_id":first_id,"idempotency_key":"start-1"}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let reported = call_tool(
+            &engine,
+            "seat-worker",
+            "report_task",
+            &json!({
+                "task_id":first_id,
+                "status":"completed",
+                "summary":"done",
+                "idempotency_key":"report-1"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let reported: Value =
+            serde_json::from_str(reported["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(reported["success"], true);
+        assert_eq!(reported["wake_recommended"], true);
+        assert!(reported.get("next_ready_task").is_none());
+        assert!(reported.get("next_delivery").is_none());
+        assert_eq!(reported["delivery"]["recipient"], "manager");
     }
 
     #[tokio::test]
