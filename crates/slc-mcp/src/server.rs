@@ -739,7 +739,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "report_task",
-            "description": "Append the assignee's durable task progress/terminal report and update SLC state. Only the assignee may report, and the task must already be running; coordinators cannot close a live executor lane and terminal reports cannot bypass the FIFO from ready/queued state. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task, but the response deliberately does not disclose that successor: wake the issuer with delivery and end this executor run; the issuer reconciles and wakes the next head as a fresh run. Idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "description": "Append the assignee's durable task progress/terminal report and update SLC state. Only the assignee may report, and the task must already be running; coordinators cannot close a live executor lane and terminal reports cannot bypass the FIFO from ready/queued state. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task, but the response deliberately does not disclose that successor. Normally wake the issuer with delivery and end this executor run; the issuer reconciles and wakes the next head as a fresh run. Manager-issued leads_mass_redesign reports are the bounded polling exception: delivery is null and wake_recommended=false because the deterministic manager queue pump observes SLC directly, so do not send a duplicate manager message. Idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "status": {"type":"string","enum":["in_progress","completed","blocked","failed"]},
@@ -2214,17 +2214,24 @@ async fn call_tool(
                 }));
             }
             let terminal = matches!(task.status.as_str(), "COMPLETED" | "BLOCKED" | "FAILED");
+            let polled_manager_portfolio = terminal
+                && task.issuer.as_deref() == Some("manager")
+                && task.project_id.as_deref() == Some("leads_mass_redesign");
             json!({
                 "success": true,
                 "task": task,
                 "event": event,
-                "delivery": workflow_delivery(
-                    task.issuer.as_deref(),
-                    &task.task_id,
-                    Some(&event.event_id),
-                    event.kind.as_str(),
-                ),
-                "wake_recommended": terminal,
+                "delivery": if polled_manager_portfolio {
+                    Value::Null
+                } else {
+                    workflow_delivery(
+                        task.issuer.as_deref(),
+                        &task.task_id,
+                        Some(&event.event_id),
+                        event.kind.as_str(),
+                    )
+                },
+                "wake_recommended": terminal && !polled_manager_portfolio,
             })
         }
         "cancel_task" => {
@@ -3763,10 +3770,85 @@ mod seat_filter_tests {
     }
 
     #[tokio::test]
+    async fn manager_portfolio_terminal_report_is_polled_without_transport_wake() {
+        use slc_core::storage::sqlite::SqliteStore;
+        use slc_core::{MockLlm, SlcConfig, StorageBackend};
+        use std::collections::{HashMap, HashSet};
+
+        let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
+        let config = SlcConfig {
+            principal_seats: HashMap::from([
+                ("manager".into(), "seat-manager".into()),
+                ("worker".into(), "seat-worker".into()),
+            ]),
+            task_assign_acl: HashMap::from([("manager".into(), HashSet::from(["worker".into()]))]),
+            ..Default::default()
+        };
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let policy = PaginationPolicy {
+            enabled: false,
+            page_token_limit: None,
+            context_token_limit: None,
+        };
+
+        let assigned = call_tool(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            &json!({
+                "assignee":"worker",
+                "name":"portfolio build",
+                "project_id":"leads_mass_redesign",
+                "idempotency_key":"assign-portfolio"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let assigned: Value =
+            serde_json::from_str(assigned["content"][0]["text"].as_str().unwrap()).unwrap();
+        let task_id = assigned["task"]["task_id"].as_str().unwrap();
+        call_tool(
+            &engine,
+            "seat-worker",
+            "start_task",
+            &json!({"task_id":task_id,"idempotency_key":"start-portfolio"}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let reported = call_tool(
+            &engine,
+            "seat-worker",
+            "report_task",
+            &json!({
+                "task_id":task_id,
+                "status":"completed",
+                "summary":"done",
+                "idempotency_key":"report-portfolio"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let reported: Value =
+            serde_json::from_str(reported["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(reported["success"], true);
+        assert_eq!(reported["wake_recommended"], false);
+        assert!(reported["delivery"].is_null());
+        assert!(reported.get("next_ready_task").is_none());
+        assert!(reported.get("next_delivery").is_none());
+    }
+
+    #[tokio::test]
     async fn get_document_pages_end_with_the_exact_next_tool_call() {
-        let store: Arc<dyn slc_core::StorageBackend> = Arc::new(
-            slc_core::storage::sqlite::SqliteStore::in_memory().unwrap(),
-        );
+        let store: Arc<dyn slc_core::StorageBackend> =
+            Arc::new(slc_core::storage::sqlite::SqliteStore::in_memory().unwrap());
         let engine = SlcEngine::with(
             store,
             Arc::new(slc_core::MockLlm::new(vec![])),
