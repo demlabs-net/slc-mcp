@@ -15,6 +15,7 @@ extended-description = """SLC MCP: MCP (JSON-RPC /mcp, SSE /sse) + REST + SPA we
 assets = [
   ["target/release/slc-mcp", "usr/local/bin/", "755"],
   ["webui/**/*", "usr/share/slc-mcp/webui/", "644"],
+  ["packaging/slc-mcp.service", "lib/systemd/system/", "644"],
 ]
 
 [[bin]]

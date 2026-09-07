@@ -25,7 +25,7 @@ use crate::model::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 /// Filter for document queries — typed subset the engine actually uses.
 #[derive(Debug, Clone, Default)]
@@ -40,6 +40,12 @@ pub struct DocFilter {
     pub visible_to: Option<String>,
     pub doc_level: Option<DocLevel>,
     pub doc_type: Option<String>,
+    /// Exact string matches inside `metadata.extra`. This keeps workflow
+    /// queue queries selective before the backend applies their result limit.
+    pub extra_strings: BTreeMap<String, String>,
+    /// Exclude documents whose string-valued `metadata.extra` field is in the
+    /// supplied set. Missing/non-string values are retained.
+    pub extra_strings_not_in: BTreeMap<String, Vec<String>>,
     /// `Some(true)` = archived; `Some(false)` = explicitly not archived.
     pub archived: Option<bool>,
     /// `Some(true)` = `consolidated != true` (not yet consolidated).

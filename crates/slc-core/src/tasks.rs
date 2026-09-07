@@ -11,13 +11,15 @@ use crate::error::{SlcError, SlcResult};
 use crate::model::{DocMeta, Document, DocumentCategory, content_hash};
 use crate::storage::{DocFilter, DocSort, SortDir, StorageBackend};
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Canonical status values shared by tasks and projects (SCREAMING_SNAKE,
 /// same set the Mongo migration normalizes legacy statuses into).
 pub const STATUS_PENDING: &str = "PENDING";
 pub const STATUS_ACTIVE: &str = "IN_WORK";
 pub const STATUS_COMPLETED: &str = "COMPLETED";
+pub const STATUS_BLOCKED: &str = "BLOCKED";
+pub const STATUS_FAILED: &str = "FAILED";
 pub const STATUS_CANCELLED: &str = "CANCELLED";
 pub const STATUS_ARCHIVED: &str = "ARCHIVED";
 
@@ -42,6 +44,8 @@ pub fn normalize_task_status(raw: &str) -> Option<&'static str> {
         "completed" | "done" | "closed" | "finished" | "resolved" | "merged" | "released" => {
             Some(STATUS_COMPLETED)
         }
+        "blocked" | "waiting" | "stalled" | "onhold" => Some(STATUS_BLOCKED),
+        "failed" | "error" | "errored" => Some(STATUS_FAILED),
         "cancelled" | "canceled" | "rejected" | "abandoned" | "wontfix" => Some(STATUS_CANCELLED),
         _ => None,
     }
@@ -58,6 +62,24 @@ pub struct TaskInfo {
     pub auto_load: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Stable workflow principal that created/delegated this task.
+    pub issuer: Option<String>,
+    /// Stable workflow principal that owns execution of this task.
+    pub assignee: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub root_task_id: Option<String>,
+    pub last_event_id: Option<String>,
+    pub last_event_at: Option<String>,
+    pub terminal_summary: Option<String>,
+    /// Durable per-assignee execution lane state. Workflow tasks are queued
+    /// FIFO and at most one task may be `ready` or `running` for a principal.
+    pub queue_state: Option<String>,
+    /// Stable FIFO key assigned once when the workflow task is created.
+    pub queue_order: Option<String>,
+    /// Event used as the idempotency key for the current runnable wake.
+    pub queue_ready_event_id: Option<String>,
+    /// Caller-owned structured task data, isolated from SLC projection fields.
+    pub metadata: Value,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -72,10 +94,28 @@ pub struct ProjectInfo {
 }
 
 fn extra_field(doc: &Document, key: &str) -> Option<String> {
-    doc.metadata.extra.get(key).and_then(|v| v.as_str()).map(String::from)
+    doc.metadata
+        .extra
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
-fn doc_to_task(doc: &Document) -> TaskInfo {
+/// Whether a task participates in the durable delegated-workflow contract.
+/// Such tasks are append-only through workflow events; legacy CRUD must not
+/// rewrite identity, lineage, status, or canonical task content behind the
+/// event stream.
+pub fn is_workflow_task(doc: &Document) -> bool {
+    doc.category == DocumentCategory::Task
+        && doc
+            .metadata
+            .extra
+            .get("workflow_version")
+            .and_then(Value::as_u64)
+            .is_some()
+}
+
+pub(crate) fn doc_to_task(doc: &Document) -> TaskInfo {
     TaskInfo {
         task_id: doc.document_id.clone(),
         name: extra_field(doc, "name").unwrap_or_else(|| doc.document_id.clone()),
@@ -86,6 +126,22 @@ fn doc_to_task(doc: &Document) -> TaskInfo {
         auto_load: doc.auto_load.clone(),
         created_at: doc.created_at.to_rfc3339(),
         updated_at: doc.updated_at.to_rfc3339(),
+        issuer: extra_field(doc, "issuer"),
+        assignee: extra_field(doc, "assignee"),
+        parent_task_id: extra_field(doc, "parent_task_id"),
+        root_task_id: extra_field(doc, "root_task_id").or_else(|| Some(doc.document_id.clone())),
+        last_event_id: extra_field(doc, "last_event_id"),
+        last_event_at: extra_field(doc, "last_event_at"),
+        terminal_summary: extra_field(doc, "terminal_summary"),
+        queue_state: extra_field(doc, "queue_state"),
+        queue_order: extra_field(doc, "queue_order"),
+        queue_ready_event_id: extra_field(doc, "queue_ready_event_id"),
+        metadata: doc
+            .metadata
+            .extra
+            .get("workflow_metadata")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(doc.metadata.extra.clone())),
     }
 }
 
@@ -188,7 +244,13 @@ impl<S: StorageBackend> WorkItemManager<S> {
         }
         let mut id = slug.clone();
         let mut n = 1usize;
-        while self.store.kb_get(&id).await.map(|d| d.is_some()).unwrap_or(true) {
+        while self
+            .store
+            .kb_get(&id)
+            .await
+            .map(|d| d.is_some())
+            .unwrap_or(true)
+        {
             n += 1;
             id = format!("{slug}_{n}");
             if n > 100 {
@@ -199,7 +261,9 @@ impl<S: StorageBackend> WorkItemManager<S> {
     }
 
     pub async fn get_task(&self, seat_id: &str, task_id: &str) -> SlcResult<Option<TaskInfo>> {
-        let Some(doc) = self.store.kb_get(task_id).await? else { return Ok(None) };
+        let Some(doc) = self.store.kb_get(task_id).await? else {
+            return Ok(None);
+        };
         if !doc.is_kb_visible(seat_id) || doc.category != DocumentCategory::Task {
             return Ok(None);
         }
@@ -218,9 +282,17 @@ impl<S: StorageBackend> WorkItemManager<S> {
         status: Option<&str>,
         metadata: Option<&Value>,
     ) -> SlcResult<Option<TaskInfo>> {
-        let Some(mut doc) = self.store.kb_get(task_id).await? else { return Ok(None) };
+        let Some(mut doc) = self.store.kb_get(task_id).await? else {
+            return Ok(None);
+        };
         if !doc.is_kb_visible(seat_id) || doc.category != DocumentCategory::Task {
             return Ok(None);
+        }
+        if is_workflow_task(&doc) {
+            return Err(SlcError::InvalidInput(
+                "workflow tasks are append-only; use task_message, report_task, or cancel_task"
+                    .into(),
+            ));
         }
         if let Some(n) = name {
             doc.metadata.extra.insert("name".into(), json!(n));
@@ -231,8 +303,8 @@ impl<S: StorageBackend> WorkItemManager<S> {
         }
         if let Some(patch) = description_patch {
             // Инкрементальное обновление вместо пересылки всего тела.
-            doc.content = apply_description_patch(&doc.content, patch)
-                .map_err(SlcError::InvalidInput)?;
+            doc.content =
+                apply_description_patch(&doc.content, patch).map_err(SlcError::InvalidInput)?;
             doc.content_hash = content_hash(&doc.content);
         }
         if let Some(Some(pid)) = project_id {
@@ -265,25 +337,45 @@ impl<S: StorageBackend> WorkItemManager<S> {
     }
 
     pub async fn delete_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
-        let Some(doc) = self.store.kb_get(task_id).await? else { return Ok(false) };
+        let Some(doc) = self.store.kb_get(task_id).await? else {
+            return Ok(false);
+        };
         if !doc.is_kb_visible(seat_id) || doc.category != DocumentCategory::Task {
             return Ok(false);
+        }
+        if is_workflow_task(&doc) {
+            return Err(SlcError::InvalidInput(
+                "workflow tasks cannot be deleted; preserve their event history".into(),
+            ));
         }
         self.store.kb_purge(task_id).await
     }
 
-    pub async fn list_tasks(&self, seat_id: &str, project_id: Option<&str>, status: Option<&str>, limit: usize) -> SlcResult<Vec<TaskInfo>> {
+    pub async fn list_tasks(
+        &self,
+        seat_id: &str,
+        project_id: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> SlcResult<Vec<TaskInfo>> {
         let filter = DocFilter {
             category: Some(DocumentCategory::Task),
             seat_id: Some(seat_id.into()),
             ..Default::default()
         };
-        let docs = self.store.kb_find(&filter, &DocSort::by_updated(SortDir::Desc), 500).await?;
+        let docs = self
+            .store
+            .kb_find(&filter, &DocSort::by_updated(SortDir::Desc), 500)
+            .await?;
         let mut out: Vec<TaskInfo> = docs
             .into_iter()
             .filter(|d| d.is_kb_visible(seat_id))
             .map(|d| doc_to_task(&d))
-            .filter(|t| project_id.map(|p| t.project_id.as_deref() == Some(p)).unwrap_or(true))
+            .filter(|t| {
+                project_id
+                    .map(|p| t.project_id.as_deref() == Some(p))
+                    .unwrap_or(true)
+            })
             .filter(|t| status.map(|s| t.status == s).unwrap_or(true))
             .collect();
         out.truncate(limit);
@@ -292,14 +384,19 @@ impl<S: StorageBackend> WorkItemManager<S> {
 
     /// Set the seat's active task pointer (working-memory context).
     pub async fn set_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
-        self.store
-            .set_seat_active_task(seat_id, task_id)
-            .await
+        if self.get_task(seat_id, task_id).await?.is_none() {
+            return Ok(false);
+        }
+        self.store.set_seat_active_task(seat_id, task_id).await
     }
 
     pub async fn get_active_task(&self, seat_id: &str) -> SlcResult<Option<TaskInfo>> {
-        let Some(seat) = self.store.get_seat(seat_id).await? else { return Ok(None) };
-        let Some(task_id) = seat.active_task_id else { return Ok(None) };
+        let Some(seat) = self.store.get_seat(seat_id).await? else {
+            return Ok(None);
+        };
+        let Some(task_id) = seat.active_task_id else {
+            return Ok(None);
+        };
         self.get_task(seat_id, &task_id).await
     }
 
@@ -329,8 +426,14 @@ impl<S: StorageBackend> WorkItemManager<S> {
         Ok(doc_to_project(&doc))
     }
 
-    pub async fn get_project(&self, seat_id: &str, project_id: &str) -> SlcResult<Option<ProjectInfo>> {
-        let Some(doc) = self.store.kb_get(project_id).await? else { return Ok(None) };
+    pub async fn get_project(
+        &self,
+        seat_id: &str,
+        project_id: &str,
+    ) -> SlcResult<Option<ProjectInfo>> {
+        let Some(doc) = self.store.kb_get(project_id).await? else {
+            return Ok(None);
+        };
         if !doc.is_kb_visible(seat_id) || doc.category != DocumentCategory::Project {
             return Ok(None);
         }
@@ -348,7 +451,9 @@ impl<S: StorageBackend> WorkItemManager<S> {
         status: Option<&str>,
         metadata: Option<&Value>,
     ) -> SlcResult<Option<ProjectInfo>> {
-        let Some(mut doc) = self.store.kb_get(project_id).await? else { return Ok(None) };
+        let Some(mut doc) = self.store.kb_get(project_id).await? else {
+            return Ok(None);
+        };
         if !doc.is_kb_visible(seat_id) || doc.category != DocumentCategory::Project {
             return Ok(None);
         }
@@ -360,8 +465,8 @@ impl<S: StorageBackend> WorkItemManager<S> {
             doc.content_hash = content_hash(&doc.content);
         }
         if let Some(patch) = description_patch {
-            doc.content = apply_description_patch(&doc.content, patch)
-                .map_err(SlcError::InvalidInput)?;
+            doc.content =
+                apply_description_patch(&doc.content, patch).map_err(SlcError::InvalidInput)?;
             doc.content_hash = content_hash(&doc.content);
         }
         if let Some(al) = auto_load {
@@ -382,20 +487,30 @@ impl<S: StorageBackend> WorkItemManager<S> {
     }
 
     pub async fn delete_project(&self, seat_id: &str, project_id: &str) -> SlcResult<bool> {
-        let Some(doc) = self.store.kb_get(project_id).await? else { return Ok(false) };
+        let Some(doc) = self.store.kb_get(project_id).await? else {
+            return Ok(false);
+        };
         if !doc.is_kb_visible(seat_id) || doc.category != DocumentCategory::Project {
             return Ok(false);
         }
         self.store.kb_purge(project_id).await
     }
 
-    pub async fn list_projects(&self, seat_id: &str, status: Option<&str>, limit: usize) -> SlcResult<Vec<ProjectInfo>> {
+    pub async fn list_projects(
+        &self,
+        seat_id: &str,
+        status: Option<&str>,
+        limit: usize,
+    ) -> SlcResult<Vec<ProjectInfo>> {
         let filter = DocFilter {
             category: Some(DocumentCategory::Project),
             seat_id: Some(seat_id.into()),
             ..Default::default()
         };
-        let docs = self.store.kb_find(&filter, &DocSort::by_updated(SortDir::Desc), 500).await?;
+        let docs = self
+            .store
+            .kb_find(&filter, &DocSort::by_updated(SortDir::Desc), 500)
+            .await?;
         let mut out: Vec<ProjectInfo> = docs
             .into_iter()
             .filter(|d| d.is_kb_visible(seat_id))
@@ -534,8 +649,12 @@ mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteStore;
 
-    fn mgr() -> (WorkItemManager<std::sync::Arc<dyn StorageBackend>>, std::sync::Arc<dyn StorageBackend>) {
-        let store: std::sync::Arc<dyn StorageBackend> = std::sync::Arc::new(SqliteStore::in_memory().unwrap());
+    fn mgr() -> (
+        WorkItemManager<std::sync::Arc<dyn StorageBackend>>,
+        std::sync::Arc<dyn StorageBackend>,
+    ) {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(SqliteStore::in_memory().unwrap());
         (WorkItemManager::new(store.clone()), store)
     }
 
@@ -554,8 +673,14 @@ mod tests {
         engine.seats.ensure_seat("seat_a").await.unwrap();
 
         // Skill is a document: parse + folder + RAG-eligible.
-        assert_eq!(crate::model::DocumentCategory::parse("skill"), Some(crate::model::DocumentCategory::Skill));
-        assert_eq!(crate::model::DocumentCategory::parse("skills"), Some(crate::model::DocumentCategory::Skill));
+        assert_eq!(
+            crate::model::DocumentCategory::parse("skill"),
+            Some(crate::model::DocumentCategory::Skill)
+        );
+        assert_eq!(
+            crate::model::DocumentCategory::parse("skills"),
+            Some(crate::model::DocumentCategory::Skill)
+        );
         assert!(crate::model::DocumentCategory::Skill.is_kb());
         let skill_doc = crate::model::Document::new(
             "skill_demo",
@@ -577,7 +702,12 @@ mod tests {
             Some("seat_a".into()),
         );
         engine.add_document(&mut skill).await.unwrap();
-        assert!(engine.document_activate("seat_a", "skill_rust").await.unwrap());
+        assert!(
+            engine
+                .document_activate("seat_a", "skill_rust")
+                .await
+                .unwrap()
+        );
         let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
         assert_eq!(active.document_id, "skill_rust");
         assert_eq!(active.category, crate::model::DocumentCategory::Skill);
@@ -592,7 +722,12 @@ mod tests {
             Some("seat_a".into()),
         );
         engine.add_document(&mut proj).await.unwrap();
-        assert!(engine.document_activate("seat_a", "project_vassista").await.unwrap());
+        assert!(
+            engine
+                .document_activate("seat_a", "project_vassista")
+                .await
+                .unwrap()
+        );
         let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
         assert_eq!(active.category, crate::model::DocumentCategory::Project);
 
@@ -613,9 +748,20 @@ mod tests {
         assert_eq!(t.task_id, "task_x");
 
         // Unknown document → false; deactivate clears both pointers.
-        assert!(!engine.document_activate("seat_a", "missing_doc").await.unwrap());
+        assert!(
+            !engine
+                .document_activate("seat_a", "missing_doc")
+                .await
+                .unwrap()
+        );
         engine.document_deactivate("seat_a").await.unwrap();
-        assert!(engine.document_get_active("seat_a").await.unwrap().is_none());
+        assert!(
+            engine
+                .document_get_active("seat_a")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(engine.task_get_active("seat_a").await.unwrap().is_none());
     }
 
@@ -634,7 +780,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t2.task_id, "migratsiya_bd_2");
-        let t3 = m.create_task("seat_a", "!!!", "", None, &[], &json!({})).await.unwrap();
+        let t3 = m
+            .create_task("seat_a", "!!!", "", None, &[], &json!({}))
+            .await
+            .unwrap();
         assert!(t3.task_id.starts_with("task_")); // fallback: unique_id
         assert_ne!(t3.task_id, "task_");
     }
@@ -644,9 +793,16 @@ mod tests {
         let (m, store) = mgr();
         let sm = crate::seat::SeatManager::new(store.clone(), 3600);
         sm.ensure_seat("seat_a").await.unwrap();
-        let t = m.create_task("seat_a", "Task A", "", None, &[], &json!({})).await.unwrap();
+        let t = m
+            .create_task("seat_a", "Task A", "", None, &[], &json!({}))
+            .await
+            .unwrap();
         assert!(m.set_active_task("seat_a", &t.task_id).await.unwrap());
         let engine = engine(store);
+        let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
+        assert_eq!(active.document_id, t.task_id);
+
+        assert!(!m.set_active_task("seat_a", "task_a_expanded").await.unwrap());
         let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
         assert_eq!(active.document_id, t.task_id);
     }
@@ -654,21 +810,41 @@ mod tests {
     #[tokio::test]
     async fn task_crud_and_visibility() {
         let (m, _) = mgr();
-        let t = m.create_task("seat_t", "Fix audio", "do it", None, &[], &json!({})).await.unwrap();
+        let t = m
+            .create_task("seat_t", "Fix audio", "do it", None, &[], &json!({}))
+            .await
+            .unwrap();
         assert_eq!(t.task_id, "fix_audio"); // без категорийного префикса
         assert_eq!(t.status, STATUS_PENDING);
 
         let got = m.get_task("seat_t", &t.task_id).await.unwrap().unwrap();
         assert_eq!(got.name, "Fix audio");
 
-        let upd = m.update_task("seat_t", &t.task_id, Some("Fixed"), Some("done"), None, Some(None), None, Some(STATUS_COMPLETED), None).await.unwrap().unwrap();
+        let upd = m
+            .update_task(
+                "seat_t",
+                &t.task_id,
+                Some("Fixed"),
+                Some("done"),
+                None,
+                Some(None),
+                None,
+                Some(STATUS_COMPLETED),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(upd.status, STATUS_COMPLETED);
         assert_eq!(upd.description, "done");
 
         // other seat cannot see it
         assert!(m.get_task("other", &t.task_id).await.unwrap().is_none());
 
-        let tasks = m.list_tasks("seat_t", None, Some(STATUS_COMPLETED), 10).await.unwrap();
+        let tasks = m
+            .list_tasks("seat_t", None, Some(STATUS_COMPLETED), 10)
+            .await
+            .unwrap();
         assert_eq!(tasks.len(), 1);
         assert!(m.delete_task("seat_t", &t.task_id).await.unwrap());
         assert!(m.get_task("seat_t", &t.task_id).await.unwrap().is_none());
@@ -677,17 +853,49 @@ mod tests {
     #[tokio::test]
     async fn project_crud_and_task_link() {
         let (m, _) = mgr();
-        let p = m.create_project("seat_p", "Vassista", "voice assistant", &["core_manifest".into()], &json!({})).await.unwrap();
+        let p = m
+            .create_project(
+                "seat_p",
+                "Vassista",
+                "voice assistant",
+                &["core_manifest".into()],
+                &json!({}),
+            )
+            .await
+            .unwrap();
         assert_eq!(p.project_id, "vassista"); // без категорийного префикса
         assert_eq!(p.auto_load, vec!["core_manifest".to_string()]);
 
-        let t = m.create_task("seat_p", "STT", "stt plugin", Some(&p.project_id), &[], &json!({})).await.unwrap();
+        let t = m
+            .create_task(
+                "seat_p",
+                "STT",
+                "stt plugin",
+                Some(&p.project_id),
+                &[],
+                &json!({}),
+            )
+            .await
+            .unwrap();
         assert_eq!(t.project_id.as_deref(), Some(p.project_id.as_str()));
 
         let projects = m.list_projects("seat_p", None, 10).await.unwrap();
         assert_eq!(projects.len(), 1);
 
-        let upd = m.update_project("seat_p", &p.project_id, None, None, None, None, Some(STATUS_PROJECT_ARCHIVED), None).await.unwrap().unwrap();
+        let upd = m
+            .update_project(
+                "seat_p",
+                &p.project_id,
+                None,
+                None,
+                None,
+                None,
+                Some(STATUS_PROJECT_ARCHIVED),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(upd.status, STATUS_PROJECT_ARCHIVED);
         assert!(m.delete_project("seat_p", &p.project_id).await.unwrap());
     }
@@ -695,7 +903,10 @@ mod tests {
     #[tokio::test]
     async fn active_task_pointer() {
         let (m, store) = mgr();
-        let t = m.create_task("seat_a", "Task A", "", None, &[], &json!({})).await.unwrap();
+        let t = m
+            .create_task("seat_a", "Task A", "", None, &[], &json!({}))
+            .await
+            .unwrap();
         // ensure the seat exists before setting the active pointer
         let sm = crate::seat::SeatManager::new(store, 3600);
         sm.ensure_seat("seat_a").await.unwrap();

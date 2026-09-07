@@ -354,9 +354,16 @@ mod tests {
             .unwrap();
         let _ = registry.start().await;
         signal.notified().await;
-        yield_a_bit().await;
         assert_eq!(fired.load(Ordering::Relaxed), 1);
-        assert!(registry.list(Some("seat_o")).await.unwrap().is_empty(), "one-shot done → inactive");
+        let mut active = registry.list(Some("seat_o")).await.unwrap();
+        for _ in 0..128 {
+            if active.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            active = registry.list(Some("seat_o")).await.unwrap();
+        }
+        assert!(active.is_empty(), "one-shot done → inactive");
     }
 
     #[tokio::test]

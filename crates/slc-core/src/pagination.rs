@@ -18,11 +18,7 @@ pub const COLLECTION: &str = "paginated_responses";
 
 /// Default page size. Clients with a smaller result budget can override it
 /// per connection with `X-SLC-Page-Token-Limit`.
-/// 5000 токенов × 3 симв/токен = 15K символов ≈ 45K байт UTF-8 (RU) —
-/// страница гарантированно влезает в типовой resultBudget харнеса
-/// (50K байт на вывод одного тула). Клиенты с большим бюджетом
-/// настраивают X-SLC-Page-Token-Limit / SLC_PAGE_TOKEN_LIMIT.
-pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 5_000;
+pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 50_000;
 
 /// Rough chars-per-token estimate (RU/EN смесь, как в движке).
 pub const CHARS_PER_TOKEN: usize = 3;
@@ -158,7 +154,7 @@ impl<S: StorageBackend> Paginator<S> {
             data.clone()
         };
         let list_key = find_list_key(&result);
-        let char_limit = page_token_limit * CHARS_PER_TOKEN;
+        let char_limit = page_token_limit.saturating_mul(CHARS_PER_TOKEN);
         // Часть контента никогда не меньше 200 символов: защита от
         // underflow (char_limit < 200) и от тысяч микро-страниц при
         // экстремально малых лимитах.
@@ -194,18 +190,14 @@ impl<S: StorageBackend> Paginator<S> {
                         )
                         .await?;
                     let mut first = parts.into_iter().next().unwrap_or_default();
-                    first["_pagination"] = json!({
-                        "response_id": response_id,
-                        "page": 1,
-                        "total_pages": total_pages,
-                        "total_items": 1,
-                    });
+                    first["_pagination"] =
+                        page_metadata(response_id, 1, total_pages, Some(1));
                     return Ok(first);
                 }
             }
             // Not a list — single page, still tagged.
             let mut out = result.clone();
-            out["_pagination"] = json!({ "response_id": response_id, "page": 1, "total_pages": 1 });
+            out["_pagination"] = page_metadata(response_id, 1, 1, None);
             return Ok(out);
         }
 
@@ -221,9 +213,9 @@ impl<S: StorageBackend> Paginator<S> {
         let mut pages: Vec<Value> = Vec::new();
         let mut current: Vec<Value> = Vec::new();
         let mut current_chars = 0usize;
-        let mut flush = |pages: &mut Vec<Value>,
-                         current: &mut Vec<Value>,
-                         current_chars: &mut usize| {
+        let flush = |pages: &mut Vec<Value>,
+                     current: &mut Vec<Value>,
+                     current_chars: &mut usize| {
             if !current.is_empty() {
                 let mut page = envelope.clone();
                 page[list_key.as_ref().unwrap()] = json!(*current);
@@ -280,12 +272,8 @@ impl<S: StorageBackend> Paginator<S> {
 
         // First page inline.
         let mut first = pages.into_iter().next().unwrap_or_default();
-        first["_pagination"] = json!({
-            "response_id": response_id,
-            "page": 1,
-            "total_pages": total_pages,
-            "total_items": total_items,
-        });
+        first["_pagination"] =
+            page_metadata(response_id, 1, total_pages, Some(total_items));
         Ok(first)
     }
 
@@ -300,11 +288,7 @@ impl<S: StorageBackend> Paginator<S> {
             return Ok(json!({ "error": format!("Invalid page {page}; total pages {}", pages.len()) }));
         }
         let mut out = pages[page - 1].clone();
-        out["_pagination"] = json!({
-            "response_id": response_id,
-            "page": page,
-            "total_pages": pages.len(),
-        });
+        out["_pagination"] = page_metadata(response_id, page, pages.len(), None);
         // Мета-инфо о том, КОГДА и ПРИ КАКОМ лимите создан кэш: клиент,
         // получивший total_pages=1 из старого кэша, видит причину.
         if let Ok(Some(meta)) = self
@@ -395,6 +379,14 @@ fn estimate_chars(v: &Value) -> usize {
 /// First key whose value is a non-empty list.
 fn find_list_key(result: &Value) -> Option<String> {
     let obj = result.as_object()?;
+    // `get_document` is a single record whose primary payload is a string.
+    // Its metadata may contain non-empty arrays (`tags`, `auto_load`, or
+    // `references`). Those arrays must never turn the document into a list
+    // response, otherwise the large `content` string remains in the envelope
+    // and every alleged page still contains the complete document.
+    if obj.get("content").is_some_and(Value::is_string) {
+        return None;
+    }
     // Только НЕПУСТЫЕ массивы считаются списками: пустые поля объекта
     // (auto_load/references/tags у документа) иначе перехватывали бы
     // пагинацию, и одиночный объект с большим content не резался бы.
@@ -412,6 +404,40 @@ fn find_list_key(result: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// Build a self-driving pagination envelope. Every non-final page carries the
+/// exact next MCP invocation, so even a small model can advance deterministically
+/// without deriving the response id or page number itself.
+fn page_metadata(
+    response_id: &str,
+    page: usize,
+    total_pages: usize,
+    total_items: Option<usize>,
+) -> Value {
+    let has_more = page < total_pages;
+    let mut metadata = json!({
+        "response_id": response_id,
+        "page": page,
+        "total_pages": total_pages,
+        "has_more": has_more,
+        "continuation_required": has_more,
+        "next_page": Value::Null,
+        "next_page_command": Value::Null,
+    });
+    if let Some(total_items) = total_items {
+        metadata["total_items"] = json!(total_items);
+    }
+    if has_more {
+        let next_page = page + 1;
+        let encoded_response_id =
+            serde_json::to_string(response_id).unwrap_or_else(|_| "\"\"".to_string());
+        metadata["next_page"] = json!(next_page);
+        metadata["next_page_command"] = json!(format!(
+            "mcp__slc__get_page({{\"response_id\":{encoded_response_id},\"page\":{next_page}}})"
+        ));
+    }
+    metadata
 }
 
 #[cfg(test)]
@@ -487,7 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_page_reports_cached_limit_and_hint() {
-        // Кэш создан при лимите 2000; текущий лимит (default 5000) другой —
+        // Кэш создан при лимите 300000; текущий лимит (default 50000) другой —
         // get_page должен сообщить, при каком лимите создан кэш, и
         // подсказать, что при обрезке нужно перевызвать исходный тул.
         let (p, _) = paginator();
@@ -506,7 +532,7 @@ mod tests {
         let pag = &page1["_pagination"];
         assert_eq!(pag["response_page_token_limit"], 300_000);
         assert!(pag.get("response_created_at").is_some());
-        // cached(300000) != current(default 5000) → hint про перевызов.
+        // cached(300000) != current(default 50000) → hint про перевызов.
         let hint = pag.get("hint").and_then(|v| v.as_str()).unwrap_or("");
         assert!(hint.contains("set_page_limit"), "hint: {hint}");
     }
@@ -552,6 +578,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_metadata_arrays_never_capture_content_pagination() {
+        let (p, _) = paginator();
+        let big = "абвгд ".repeat(3000);
+        let data = json!({
+            "document_id": "doc_with_metadata",
+            "category": "custom",
+            "content": big,
+            "tags": ["important", "workflow"],
+            "auto_load": ["base_rules"],
+            "references": ["source_notes"],
+        });
+        let first = p
+            .paginate_with_limit("s", "resp_metadata", &data, 2000)
+            .await
+            .unwrap();
+        let total = first["_pagination"]["total_pages"].as_u64().unwrap() as usize;
+        assert!(total >= 3, "document content must be split, total={total}");
+        assert_eq!(first["tags"], data["tags"]);
+        assert_eq!(first["auto_load"], data["auto_load"]);
+        assert_eq!(first["references"], data["references"]);
+
+        let mut combined = String::new();
+        for page in 1..=total {
+            let value = if page == 1 {
+                first.clone()
+            } else {
+                p.get_page("s", "resp_metadata", page).await.unwrap()
+            };
+            combined.push_str(value["content"].as_str().unwrap());
+            let pagination = &value["_pagination"];
+            if page < total {
+                assert_eq!(pagination["has_more"], true);
+                assert_eq!(pagination["continuation_required"], true);
+                assert_eq!(pagination["next_page"], page + 1);
+                assert_eq!(
+                    pagination["next_page_command"],
+                    format!(
+                        "mcp__slc__get_page({{\"response_id\":\"resp_metadata\",\"page\":{}}})",
+                        page + 1
+                    )
+                );
+            } else {
+                assert_eq!(pagination["has_more"], false);
+                assert_eq!(pagination["continuation_required"], false);
+                assert!(pagination["next_page"].is_null());
+                assert!(pagination["next_page_command"].is_null());
+            }
+        }
+        assert_eq!(combined, big);
+    }
+
+    #[tokio::test]
     async fn single_object_content_splits_into_parts() {
         // get_document-подобный ответ (объект, не список) с большим
         // content — режется по содержимому; склейка = полный контент.
@@ -573,6 +651,7 @@ mod tests {
         assert_eq!(combined, big, "склейка частей = полный контент документа");
     }
 
+    #[tokio::test]
     async fn invalid_page_errors() {
         let (p, _) = paginator();
         let small: Vec<Value> = vec![json!(1), json!(2)];
@@ -602,9 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn default_page_is_five_thousand_tokens() {
-        // 5K токенов × 3 симв = 15K символов ≈ 45K байт RU — страница
-        // влезает в типовой resultBudget харнеса (50K байт).
-        assert_eq!(DEFAULT_PAGE_TOKEN_LIMIT, 5_000);
+    fn default_page_is_fifty_thousand_tokens() {
+        assert_eq!(DEFAULT_PAGE_TOKEN_LIMIT, 50_000);
     }
 }

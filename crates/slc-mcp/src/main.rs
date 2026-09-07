@@ -356,7 +356,15 @@ async fn main() -> anyhow::Result<()> {
             let engine = SlcEngine::open_async(config).await?;
             let report = engine.reindex_embeddings(seat.as_deref()).await?;
             println!("reindex complete: {report:?}");
-            Ok(())
+            // Exit immediately: tokio's graceful shutdown waits for
+            // background spawn_blocking tasks (git commit on a large
+            // vault) and the process hangs in futex_wait forever after
+            // the work is done. Flush stdout first — exit() skips the
+            // normal flush of buffered stdio (the report was observed
+            // missing from redirected logs).
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
         }
     }
 }

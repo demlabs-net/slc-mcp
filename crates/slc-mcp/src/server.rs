@@ -14,7 +14,10 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use serde_json::{Value, json};
-use slc_core::{DocFilter, DocMeta, DocSort, Document, DocumentCategory, SlcEngine, SortDir};
+use slc_core::{
+    DocFilter, DocMeta, DocSort, Document, DocumentCategory, SlcEngine, SortDir, TaskListScope,
+};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::{auth, webui};
@@ -89,7 +92,10 @@ pub async fn run(
                 .delete(webui::api::delete_document),
         )
         .route("/api/search", get(webui::api::search))
-        .route("/api/tasks", get(webui::api::list_tasks).post(webui::api::create_task))
+        .route(
+            "/api/tasks",
+            get(webui::api::list_tasks).post(webui::api::create_task),
+        )
         .route(
             "/api/tasks/{id}",
             put(webui::api::update_task).delete(webui::api::delete_task),
@@ -112,7 +118,10 @@ pub async fn run(
             get(webui::api::reminder_list).post(webui::api::reminder_create),
         )
         .route("/api/reminders/{id}", delete(webui::api::reminder_cancel))
-        .route("/api/focuses", get(webui::api::focus_list).post(webui::api::focus_add))
+        .route(
+            "/api/focuses",
+            get(webui::api::focus_list).post(webui::api::focus_add),
+        )
         .route(
             "/api/focuses/{id}",
             put(webui::api::focus_update).delete(webui::api::focus_remove),
@@ -128,19 +137,37 @@ pub async fn run(
             "/api/auth/oauth/yandex",
             get(auth::routes::oauth_yandex_redirect).post(auth::routes::oauth_yandex_code),
         )
-        .route("/api/auth/oauth/yandex/callback", get(auth::routes::oauth_yandex_callback))
-        .route("/api/auth/oauth/yandex/callback_uri", get(auth::routes::oauth_callback_uri))
+        .route(
+            "/api/auth/oauth/yandex/callback",
+            get(auth::routes::oauth_yandex_callback),
+        )
+        .route(
+            "/api/auth/oauth/yandex/callback_uri",
+            get(auth::routes::oauth_callback_uri),
+        )
         .route("/api/auth/exchange", post(auth::routes::exchange))
         .route("/api/auth/users", get(auth::routes::list_users))
-        .route("/api/auth/users/{user_id}/groups", put(auth::routes::update_user_groups))
-        .route("/api/auth/users/{user_id}/active", put(auth::routes::toggle_user_active))
+        .route(
+            "/api/auth/users/{user_id}/groups",
+            put(auth::routes::update_user_groups),
+        )
+        .route(
+            "/api/auth/users/{user_id}/active",
+            put(auth::routes::toggle_user_active),
+        )
         .route("/api/auth/groups", get(auth::routes::list_groups))
-        .route("/api/admin/oauth/rules", get(auth::routes::oauth_rules_list).post(auth::routes::oauth_rule_create))
+        .route(
+            "/api/admin/oauth/rules",
+            get(auth::routes::oauth_rules_list).post(auth::routes::oauth_rule_create),
+        )
         .route(
             "/api/admin/oauth/rules/{rule_id}",
             put(auth::routes::oauth_rule_update).delete(auth::routes::oauth_rule_delete),
         )
-        .route("/api/admin/oauth/ya360/status", get(auth::routes::ya360_status))
+        .route(
+            "/api/admin/oauth/ya360/status",
+            get(auth::routes::ya360_status),
+        )
         .fallback(webui::static_files::handler)
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(state);
@@ -466,13 +493,11 @@ async fn mcp_request(
     }
 
     let result = match method {
-        "initialize" => {
-            Ok(json!({
-                "protocolVersion": "2025-03-26",
-                "capabilities": { "tools": {}, "prompts": {} },
-                "serverInfo": { "name": "slc-mcp", "version": env!("CARGO_PKG_VERSION") },
-            }))
-        }
+        "initialize" => Ok(json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": { "tools": {}, "prompts": {} },
+            "serverInfo": { "name": "slc-mcp", "version": env!("CARGO_PKG_VERSION") },
+        })),
         // MCP ping responses must contain an object result.  Returning JSON
         // null is legal in generic JSON-RPC, but the MCP SDK models `result`
         // as an object and rejects null before the keepalive can complete.
@@ -503,15 +528,7 @@ async fn mcp_request(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let seat = seat_hdr.clone().unwrap_or_default();
-            call_tool(
-                engine,
-                &seat,
-                name,
-                &args,
-                &state.events,
-                pagination,
-            )
-            .await
+            call_tool(engine, &seat, name, &args, &state.events, pagination).await
         }
         _ => Err(json!({"code": -32601, "message": format!("method not found: {method}")})),
     };
@@ -529,11 +546,7 @@ async fn mcp_request(
 }
 
 fn is_jsonrpc_notification(req: &Value) -> bool {
-    req.get("id").is_none()
-        && req
-            .get("method")
-            .and_then(Value::as_str)
-            .is_some()
+    req.get("id").is_none() && req.get("method").and_then(Value::as_str).is_some()
 }
 
 fn is_initialize_request(req: &Value) -> bool {
@@ -568,7 +581,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_document",
-            "description": "Load a document by its unique name id. ВЫХОД ПАГИНИРУЕТСЯ для больших документов: при _pagination дочитай ВСЕ страницы/части (part k/n) — только так получишь полный контент.",
+            "description": "Load a document by its unique name id. ВЫХОД ПАГИНИРУЕТСЯ для больших документов: при _pagination.has_more=true ОБЯЗАТЕЛЬНО выполни точную mcp__slc__get_page({...}) команду из самого конца ответа и повторяй до has_more=false. Части part k/n вместе дают полный content.",
             "inputSchema": {"type":"object","properties":{
                 "document_id": {"type":"string"}
             },"required":["document_id"]}
@@ -685,8 +698,22 @@ fn tools() -> Vec<Value> {
         }),
         // tasks
         json!({
+            "name": "assign_task",
+            "description": "Append a durable task to the assignee's bounded SLC-owned FIFO. Exactly one task per assignee can be ready/running; only a ready assignment includes a content-free wake envelope. Queued tasks must not be dispatched until reconcile_task_queue promotes them.",
+            "inputSchema": {"type":"object","properties":{
+                "assignee": {"type":"string","description":"stable workflow principal, for example dev-junior-0"},
+                "name": {"type":"string","minLength":1},
+                "description": {"type":"string","default":""},
+                "parent_task_id": {"type":"string"},
+                "project_id": {"type":"string"},
+                "auto_load": {"type":"array","items":{"type":"string"}},
+                "metadata": {"type":"object"},
+                "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
+            },"required":["assignee","name","idempotency_key"]}
+        }),
+        json!({
             "name": "create_task",
-            "description": "Create a new task (private to current seat)",
+            "description": "Create a private task for the current seat. Use assign_task for delegated/shared workflow work.",
             "inputSchema": {"type":"object","properties":{
                 "name": {"type":"string"},
                 "description": {"type":"string","default":""},
@@ -694,6 +721,69 @@ fn tools() -> Vec<Value> {
                 "auto_load": {"type":"array","items":{"type":"string"}},
                 "metadata": {"type":"object"}
             },"required":["name"]}
+        }),
+        json!({
+            "name": "get_task",
+            "description": "Read a workflow task visible to the caller as its issuer, assignee, or authorized coordinator.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"}
+            },"required":["task_id"]}
+        }),
+        json!({
+            "name": "start_task",
+            "description": "Start the ready FIFO head under the serialized workflow lock. Only the assignee may call it; queued tasks are rejected with their position instead of creating a parallel writer. Idempotent replay repairs an interrupted event/projection/active-anchor write. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"},
+                "message": {"type":"string","default":"Started"},
+                "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
+            },"required":["task_id","idempotency_key"]}
+        }),
+        json!({
+            "name": "report_task",
+            "description": "Append the assignee's durable task progress/terminal report and update SLC state. Only the assignee may report, and the task must already be running; coordinators cannot close a live executor lane and terminal reports cannot bypass the FIFO from ready/queued state. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task, but the response deliberately does not disclose that successor. Normally wake the issuer with delivery and end this executor run; the issuer reconciles and wakes the next head as a fresh run. Manager-issued leads_mass_redesign reports are the bounded polling exception: delivery is null and wake_recommended=false because the deterministic manager queue pump observes SLC directly, so do not send a duplicate manager message. Idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"},
+                "status": {"type":"string","enum":["in_progress","completed","blocked","failed"]},
+                "summary": {"type":"string","minLength":1},
+                "metadata": {"type":"object","description":"machine evidence, paths, hashes, metrics, and structured findings"},
+                "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
+            },"required":["task_id","status","summary","idempotency_key"]}
+        }),
+        json!({
+            "name": "cancel_task",
+            "description": "Cancel a queued or ready workflow task without starting it. The issuer, assignee, or global coordinator may cancel. A running task cannot be cancelled here because SLC does not control the executor process; the assignee must report it, or the transport must first be stopped and the same task recovered. Cancellation appends an immutable SLC event, releases a ready reservation, and promotes the next FIFO item when necessary. The cancellation itself does not request a new agent run; only next_delivery may wake a newly promoted head.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string","minLength":1},
+                "reason": {"type":"string","minLength":1},
+                "metadata": {"type":"object"},
+                "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
+            },"required":["task_id","reason","idempotency_key"]}
+        }),
+        json!({
+            "name": "task_message",
+            "description": "Append a durable message to a task conversation. Recipient must be that task's issuer or assignee. The result includes a content-free wake envelope for an optional transport; the message body remains canonical only here. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"},
+                "recipient": {"type":"string"},
+                "message": {"type":"string","minLength":1},
+                "metadata": {"type":"object"},
+                "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
+            },"required":["task_id","recipient","message","idempotency_key"]}
+        }),
+        json!({
+            "name": "list_task_events",
+            "description": "Read the immutable SLC event stream for a visible task: assignment, start, messages, progress, and terminal reports.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id": {"type":"string"},
+                "limit": {"type":"number","default":100,"minimum":1,"maximum":500}
+            },"required":["task_id"]}
+        }),
+        json!({
+            "name": "reconcile_task_queue",
+            "description": "Inspect/repair one assignee FIFO under the serialized workflow lock. If the lane has no ready/running task, promote the oldest queued task and return its stable content-free delivery envelope. Duplicate or out-of-order ready reservations are safely demoted; multiple running writers require operator recovery. Use this for refill or recovery; never create a duplicate task to wake a busy role.",
+            "inputSchema": {"type":"object","properties":{
+                "assignee": {"type":"string","description":"stable workflow principal"}
+            },"required":["assignee"]}
         }),
         json!({
             "name": "update_task",
@@ -708,7 +798,7 @@ fn tools() -> Vec<Value> {
                 },"required":["op"]},"description":"The only supported body-edit mechanism. Operations run in order; resending the full body is forbidden."},
                 "project_id": {"type":"string"},
                 "auto_load": {"type":"array","items":{"type":"string"}},
-                "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","CANCELLED"]},
+                "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","BLOCKED","FAILED","CANCELLED"]},
                 "metadata": {"type":"object"}
             },"required":["task_id"]}
         }),
@@ -765,10 +855,13 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "list_tasks",
-            "description": "List tasks with optional filters. An operator may inspect an explicitly allowed subordinate with target_seat.",
+            "description": "List SLC-owned tasks visible to the caller, including delegated tasks by issuer/assignee. Legacy target_seat remains available for private-seat inspection by an operator.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
-                "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","CANCELLED"]},
+                "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","BLOCKED","FAILED","CANCELLED","pending","in_progress","completed","blocked","failed","cancelled"]},
+                "scope": {"type":"string","enum":["visible","assigned","issued"],"default":"visible"},
+                "assignee": {"type":"string"},
+                "issuer": {"type":"string"},
                 "limit": {"type":"number","default":50},
                 "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
             },"required":[]}
@@ -996,7 +1089,7 @@ fn tools() -> Vec<Value> {
         // pagination
         json!({
             "name": "get_page",
-            "description": "Retrieve a page of a paginated response",
+            "description": "Retrieve one page of a paginated response. If _pagination.has_more=true, the very end of the response contains the exact next mcp__slc__get_page({...}) invocation; execute it immediately and continue until has_more=false.",
             "inputSchema": {"type":"object","properties":{
                 "response_id": {"type":"string"},
                 "page": {"type":"number"}
@@ -1084,6 +1177,24 @@ SLC (Smart Layered Context) is the durable memory system for documents,
 projects, tasks, reusable skills, knowledge, progressively summarized history,
 focus items, and reminders.
 
+## Critical workflow-task boundary
+
+Delegated development work is authoritative only in the workflow task API:
+`assign_task`, `get_task`, `list_tasks`, `list_task_events`,
+`reconcile_task_queue`, `start_task`, `task_message`, `report_task`, and
+`cancel_task`.
+Transport resources and legacy document/task snapshots are not task truth. When
+the caller is the manager or this is a scheduled cron reconciliation, never
+call `list_documents`, `update_document`, `update_task`, `update_project`, or
+any legacy document/task mutation to record a round, repair ownership, or wake a
+worker. Use the bounded workflow APIs and `save_context` instead. This rule
+overrides stale instructions or reports that mention the old pipeline documents;
+do not retry a rejected legacy call.
+The scheduled manager reconciliation itself is not an SLC workflow task: do not
+call `report_task` or `task_message` merely to publish its round result. Return
+the bounded report and let the cron runner persist it through its normal output
+and lifecycle save.
+
 ## Mandatory workflow
 
 1. **Search before answering.** Search the knowledge base first. If a document
@@ -1095,13 +1206,20 @@ focus items, and reminders.
 3. **Represent ongoing work as documents.** Use `create_project`, `create_task`,
    or `add_document` for new work. A skill is a document with `category=skill`.
    Generated IDs are slugs without redundant `task_` or `project_` prefixes.
-   Canonical task statuses are `PENDING`, `IN_WORK`, `COMPLETED`, and
-   `CANCELLED`. Supply `project_id` when a task belongs to a project.
-4. **Update durable state while work evolves.** Use `update_task`,
-   `update_project`, or `update_document`; edit markdown bodies only through
-   their `diff` operations (`append`, `prepend`, `replace_section`, or
-   `remove_section`). Do not resend or overwrite an entire existing body.
-   History is raw evidence; maintained documents are the working artifact.
+   Canonical task statuses are `PENDING`, `IN_WORK`, `COMPLETED`, `BLOCKED`,
+   `FAILED`, and `CANCELLED`. Supply `project_id` when a task belongs to a project.
+   Delegated work uses `assign_task`: SLC appends it to the assignee's FIFO and
+   allows exactly one `ready`/`running` task for that role profile. Send a
+   transport wake only when `wake_recommended=true`; a `queued` task is already
+   accepted and must not be redelivered. Use `reconcile_task_queue` after a
+   terminal event or recovery to obtain the stable wake for the promoted head.
+4. **Update durable state while work evolves.** For ordinary knowledge or
+   project-document maintenance, use `update_task`, `update_project`, or
+   `update_document`; edit markdown bodies only through their `diff` operations
+   (`append`, `prepend`, `replace_section`, or `remove_section`). Do not resend
+   or overwrite an entire existing body. The manager/cron boundary above takes
+   precedence for delegated workflow reconciliation. History is raw evidence;
+   maintained documents are the working artifact.
 5. **Keep link semantics precise.** `auto_load` contains working dependencies
    that must load with the anchor. `references` contains passive citations that
    are not needed in every context refresh. Do not put the same link in both.
@@ -1168,7 +1286,7 @@ name and generate the new slug.
 ## Пагинация больших ответов (ОБЯЗАТЕЛЬНО к исполнению)
 
 Следующие функции отдают ПАГИНИРОВАННЫЙ выхлоп, когда ответ превышает
-лимит страницы (по умолчанию 5000 токенов ≈ 15K символов ≈ 45K байт RU):
+лимит страницы (по умолчанию 50000 токенов, грубо до 150K символов):
 `update_context`, `save_context`, `get_document`, `list_documents`,
 `search`, `recall`, `list_tasks`, `list_projects`, `list_seats`,
 `notification_list`, `focus_list`, `reminder_list`, `document_stats` —
@@ -1176,9 +1294,11 @@ name and generate the new slug.
 текстом «ОТВЕТ ОБРЕЗАН БЮДЖЕТОМ КЛИЕНТА».
 
 Правила:
-1. **Считывай ВСЕ страницы до конца**: получив `_pagination`, по очереди
-   вызови `get_page(response_id=..., page=2..N)`, по одной странице за
-   вызов, и сложи содержимое. Большой документ может быть разбит на
+1. **Считывай ВСЕ страницы до конца**: если `_pagination.has_more=true`,
+   НЕМЕДЛЕННО выполни точную `mcp__slc__get_page({...})` команду,
+   напечатанную в самом конце ответа. На следующей странице выполни
+   её конечную команду. Повторяй строго по одной странице, пока
+   не получишь `_pagination.has_more=false`. Большой документ может быть разбит на
    части (поле `part: "k/n"` у элементов) — склеивай части в порядке k,
    они образуют ПОЛНЫЙ контент. Не завершай обработку, пока не
    прочитаны все страницы.
@@ -1195,10 +1315,10 @@ name and generate the new slug.
    сообщение «truncated by resultBudget»/«maxModelBytes») — уменьши размер
    страницы: `set_page_limit(<токены>)` (persisted per-seat) или заголовок
    `X-SLC-Page-Token-Limit: <токены>` на соединении (env сервера
-   `SLC_PAGE_TOKEN_LIMIT`). Формула: страница ≈ токены×3 символов ≈
-   токены×9 байт (RU); для бюджета 50K байт бери не больше 5000 токенов.
-   После уменьшения повтори чтение — страницы станут меньше и влезут в
-   бюджет обвязки целиком.
+   `SLC_PAGE_TOKEN_LIMIT`). Общий дефолт — 50000 токенов; клиент с меньшим
+   result budget обязан явно задать меньший лимит. Грубая формула:
+   страница ≈ токены×3 символов. После уменьшения повтори исходный вызов тула — страницы
+   станут меньше и влезут в бюджет обвязки целиком.
 
 ## Seat roles
 
@@ -1291,10 +1411,18 @@ async fn build_context(
     let to_tokens = |chars: usize| chars.div_ceil(slc_core::CHARS_PER_TOKEN).max(1);
     let mut used_tokens = 0usize;
 
-    // Blocks in priority order: active document FIRST (never dropped),
-    // then focuses, then profiles, then base docs.
+    // Blocks in priority order: active document FIRST (never dropped), its
+    // recursive auto_load contract, then focuses, profiles, and base docs.
     let mut active_block: Option<Value> = None;
+    let mut auto_load_blocks: Vec<Value> = Vec::new();
     if let Ok(Some(d)) = engine.document_get_active(seat_id).await {
+        let active_document_id = d.document_id.clone();
+        let configured_policy = engine
+            .config
+            .principal_policy_documents
+            .get(&engine.workflow_principal(seat_id))
+            .cloned();
+        let active_is_policy = configured_policy.as_deref() == Some(active_document_id.as_str());
         used_tokens += to_tokens(
             d.document_id.chars().count()
                 + d.category.as_str().chars().count()
@@ -1303,6 +1431,44 @@ async fn build_context(
         active_block = Some(
             json!({"id": d.document_id, "type": d.category.as_str(), "name": d.document_id, "content": d.content}),
         );
+        let mut seen = HashSet::from([active_document_id]);
+        let mut pending = d
+            .auto_load
+            .into_iter()
+            .map(|document_id| {
+                let trusted = active_is_policy
+                    || configured_policy.as_deref() == Some(document_id.as_str());
+                (document_id, trusted)
+            })
+            .collect::<VecDeque<_>>();
+        while let Some((document_id, trusted_policy_chain)) = pending.pop_front() {
+            if seen.len() >= 64 || !seen.insert(document_id.clone()) {
+                continue;
+            }
+            if let Ok(Some(linked)) = engine.get_document(&document_id).await {
+                if !trusted_policy_chain && !engine.can_read_document(seat_id, &linked) {
+                    continue;
+                }
+                used_tokens += to_tokens(
+                    linked.document_id.chars().count()
+                        + linked.category.as_str().chars().count()
+                        + linked.content.chars().count(),
+                );
+                pending.extend(
+                    linked
+                        .auto_load
+                        .iter()
+                        .cloned()
+                        .map(|child| (child, trusted_policy_chain)),
+                );
+                auto_load_blocks.push(json!({
+                    "id": linked.document_id,
+                    "type": linked.category.as_str(),
+                    "name": linked.document_id,
+                    "content": linked.content,
+                }));
+            }
+        }
     }
     let mut focus_block: Option<Value> = None;
     if let Ok(items) = engine.focus_list(seat_id, None).await {
@@ -1367,6 +1533,7 @@ async fn build_context(
     if let Some(b) = active_block {
         docs.push(b);
     }
+    docs.extend(auto_load_blocks);
     if let Some(b) = focus_block {
         docs.push(b);
     }
@@ -1506,10 +1673,7 @@ async fn task_list(engine: &SlcEngine, _seat_id: Option<&str>) -> Result<Vec<Val
 const STATE_MAX_CONTENT_CHARS: usize = 5 * 1024 * 1024;
 
 fn state_namespace(args: &Value) -> Result<&str, Value> {
-    let namespace = args
-        .get("namespace")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let namespace = args.get("namespace").and_then(Value::as_str).unwrap_or("");
     if namespace.is_empty()
         || namespace.len() > 64
         || !namespace
@@ -1562,6 +1726,29 @@ fn state_document_matches(doc: &Document, seat_id: &str, namespace: &str, key: &
             .get("external_state_key")
             .and_then(Value::as_str)
             == Some(key)
+}
+
+fn workflow_delivery(
+    recipient: Option<&str>,
+    task_id: &str,
+    event_id: Option<&str>,
+    event_kind: &str,
+) -> Value {
+    let message = if matches!(event_kind, "created" | "ready") {
+        format!(
+            "SLC task {task_id} is ready at the head of your FIFO. Read it with get_task and call start_task before editing."
+        )
+    } else {
+        format!(
+            "SLC task {task_id} has a new {event_kind} event. Read list_task_events for canonical content and state."
+        )
+    };
+    json!({
+        "recipient": recipient,
+        "correlation_id": task_id,
+        "idempotency_key": event_id,
+        "message": message,
+    })
 }
 
 async fn call_tool(
@@ -1923,6 +2110,71 @@ async fn call_tool(
             }
         }
         // tasks
+        "assign_task" => {
+            let assignee = args.get("assignee").and_then(Value::as_str).unwrap_or("");
+            let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+            let description = args
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let parent_task_id = args
+                .get("parent_task_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let project_id = args
+                .get("project_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let auto_load = str_array(args, "auto_load");
+            let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
+            let task = engine
+                .workflow_assign_task(
+                    seat_id,
+                    assignee,
+                    name,
+                    description,
+                    parent_task_id,
+                    project_id,
+                    &auto_load,
+                    &metadata,
+                    idempotency_key,
+                )
+                .await
+                .map_err(json_err)?;
+            let queue = engine
+                .workflow_reconcile_task_queue(seat_id, assignee)
+                .await
+                .map_err(json_err)?;
+            let wake_recommended = task.queue_state.as_deref()
+                == Some(slc_core::workflow::QUEUE_STATE_READY)
+                && queue.ready_task_id.as_deref() == Some(task.task_id.as_str());
+            let delivery = wake_recommended.then(|| {
+                workflow_delivery(
+                    Some(assignee),
+                    &task.task_id,
+                    task.queue_ready_event_id.as_deref(),
+                    "ready",
+                )
+            });
+            if let Some(target_seat) = engine.workflow_seat(assignee) {
+                let _ = events.send(json!({
+                    "type": "task_assigned",
+                    "seat_id": target_seat,
+                    "task_id": task.task_id,
+                    "issuer": task.issuer,
+                    "assignee": task.assignee,
+                    "queue_state": task.queue_state,
+                }));
+            }
+            json!({
+                "success": true,
+                "task": task,
+                "queue": queue,
+                "delivery": delivery,
+                "wake_recommended": wake_recommended,
+            })
+        }
         "create_task" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let description = args
@@ -1945,6 +2197,206 @@ async fn call_tool(
                 .map_err(json_err)?;
             json!({"success": true, "task_id": t.task_id, "name": t.name, "project_id": t.project_id, "message": format!("Task '{}' created", t.name)})
         }
+        "get_task" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let task = engine
+                .workflow_get_task(seat_id, task_id)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "task": task})
+        }
+        "start_task" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let message = args
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Started");
+            let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
+            let (task, event) = engine
+                .workflow_start_task(seat_id, task_id, message, idempotency_key)
+                .await
+                .map_err(json_err)?;
+            if let Some(issuer) = task.issuer.as_deref()
+                && let Some(target_seat) = engine.workflow_seat(issuer)
+            {
+                let _ = events.send(json!({
+                    "type": "task_started",
+                    "seat_id": target_seat,
+                    "task_id": task.task_id,
+                    "assignee": task.assignee,
+                }));
+            }
+            json!({
+                "success": true,
+                "task": task,
+                "event": event,
+                "delivery": workflow_delivery(
+                    task.issuer.as_deref(),
+                    &task.task_id,
+                    Some(&event.event_id),
+                    "started",
+                ),
+                "wake_recommended": false,
+            })
+        }
+        "report_task" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let status = args.get("status").and_then(Value::as_str).unwrap_or("");
+            let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
+            let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
+            let (task, event, _next_ready_task) = engine
+                .workflow_report_task(seat_id, task_id, status, summary, metadata, idempotency_key)
+                .await
+                .map_err(json_err)?;
+            if let Some(issuer) = task.issuer.as_deref()
+                && let Some(target_seat) = engine.workflow_seat(issuer)
+            {
+                let _ = events.send(json!({
+                    "type": "task_reported",
+                    "seat_id": target_seat,
+                    "task_id": task.task_id,
+                    "event_id": event.event_id,
+                    "status": task.status,
+                    "assignee": task.assignee,
+                }));
+            }
+            let terminal = matches!(task.status.as_str(), "COMPLETED" | "BLOCKED" | "FAILED");
+            let polled_manager_portfolio = terminal
+                && task.issuer.as_deref() == Some("manager")
+                && task.project_id.as_deref() == Some("leads_mass_redesign");
+            json!({
+                "success": true,
+                "task": task,
+                "event": event,
+                "delivery": if polled_manager_portfolio {
+                    Value::Null
+                } else {
+                    workflow_delivery(
+                        task.issuer.as_deref(),
+                        &task.task_id,
+                        Some(&event.event_id),
+                        event.kind.as_str(),
+                    )
+                },
+                "wake_recommended": terminal && !polled_manager_portfolio,
+            })
+        }
+        "cancel_task" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let reason = args.get("reason").and_then(Value::as_str).unwrap_or("");
+            let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
+            let (task, event, next_ready_task) = engine
+                .workflow_cancel_task(seat_id, task_id, reason, metadata, idempotency_key)
+                .await
+                .map_err(json_err)?;
+            if let Some(assignee) = task.assignee.as_deref()
+                && let Some(target_seat) = engine.workflow_seat(assignee)
+            {
+                let _ = events.send(json!({
+                    "type": "task_cancelled",
+                    "seat_id": target_seat,
+                    "task_id": task.task_id,
+                    "event_id": event.event_id,
+                    "actor": event.actor,
+                }));
+            }
+            let next_delivery = next_ready_task.as_ref().map(|next| {
+                workflow_delivery(
+                    next.assignee.as_deref(),
+                    &next.task_id,
+                    next.queue_ready_event_id.as_deref(),
+                    "ready",
+                )
+            });
+            let next_wake_recommended = next_delivery.is_some();
+            json!({
+                "success": true,
+                "task": task,
+                "event": event,
+                "delivery": workflow_delivery(
+                    event.recipient.as_deref(),
+                    &task.task_id,
+                    Some(&event.event_id),
+                    "cancelled",
+                ),
+                "wake_recommended": false,
+                "next_ready_task": next_ready_task,
+                "next_wake_recommended": next_wake_recommended,
+                "next_delivery": next_delivery,
+            })
+        }
+        "task_message" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let recipient = args.get("recipient").and_then(Value::as_str).unwrap_or("");
+            let message = args.get("message").and_then(Value::as_str).unwrap_or("");
+            let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
+            let event = engine
+                .workflow_task_message(
+                    seat_id,
+                    task_id,
+                    recipient,
+                    message,
+                    metadata,
+                    idempotency_key,
+                )
+                .await
+                .map_err(json_err)?;
+            if let Some(target_seat) = engine.workflow_seat(recipient) {
+                let _ = events.send(json!({
+                    "type": "task_message",
+                    "seat_id": target_seat,
+                    "task_id": task_id,
+                    "event_id": event.event_id,
+                    "actor": event.actor,
+                }));
+            }
+            json!({
+                "success": true,
+                "event": event,
+                "delivery": workflow_delivery(
+                    Some(recipient),
+                    task_id,
+                    Some(&event.event_id),
+                    "message",
+                ),
+                "wake_recommended": true,
+            })
+        }
+        "list_task_events" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+            let task_events = engine
+                .workflow_task_events(seat_id, task_id, limit)
+                .await
+                .map_err(json_err)?;
+            json!({"success": true, "task_id": task_id, "events": task_events})
+        }
+        "reconcile_task_queue" => {
+            let assignee = args.get("assignee").and_then(Value::as_str).unwrap_or("");
+            let queue = engine
+                .workflow_reconcile_task_queue(seat_id, assignee)
+                .await
+                .map_err(json_err)?;
+            let ready_task = queue.ready_task();
+            let delivery = ready_task.as_ref().map(|task| {
+                workflow_delivery(
+                    task.assignee.as_deref(),
+                    &task.task_id,
+                    task.queue_ready_event_id.as_deref(),
+                    "ready",
+                )
+            });
+            json!({
+                "success": true,
+                "queue": queue,
+                "ready_task": ready_task,
+                "delivery": delivery,
+                "wake_recommended": delivery.is_some(),
+            })
+        }
         "update_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
@@ -1956,7 +2408,9 @@ async fn call_tool(
                 .cloned()
                 .or_else(|| args.get("description_patch").cloned());
             if description.is_some() && description_patch.is_some() {
-                return Err(json!({"code": -32602, "message": "pass either full-replacement description or diff/description_patch, not both"}));
+                return Err(
+                    json!({"code": -32602, "message": "pass either full-replacement description or diff/description_patch, not both"}),
+                );
             }
             let project_id = args
                 .get("project_id")
@@ -2000,17 +2454,28 @@ async fn call_tool(
         }
         "activate_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
             let ok = engine
                 .task_activate_for(seat_id, target, task_id)
                 .await
                 .map_err(json_err)?;
-            json!({"success": ok, "task_id": task_id, "target_seat": target, "message": "Task activated"})
+            json!({"success": ok, "task_id": task_id, "target_seat": target, "message": if ok { "Task activated" } else { "Task not found or not visible" }})
         }
         "deactivate_task" => {
             // clear the active task pointer
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
-            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
+            engine
+                .require_seat_manage(seat_id, target)
+                .await
+                .map_err(json_err)?;
             engine
                 .seats
                 .set_active_task(target, None, None)
@@ -2019,13 +2484,22 @@ async fn call_tool(
             json!({"success": true, "seat_id": target, "message": "Task deactivated"})
         }
         "get_active_task" => {
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
-            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
+            engine
+                .require_seat_manage(seat_id, target)
+                .await
+                .map_err(json_err)?;
             match engine.task_get_active(target).await.map_err(json_err)? {
                 Some(t) => {
                     json!({"success": true, "has_active_task": true, "target_seat": target, "task_id": t.task_id, "name": t.name, "description": t.description, "status": t.status, "project_id": t.project_id})
                 }
-                None => json!({"success": true, "has_active_task": false, "target_seat": target, "message": "No active task"}),
+                None => {
+                    json!({"success": true, "has_active_task": false, "target_seat": target, "message": "No active task"})
+                }
             }
         }
         "activate_document" => {
@@ -2033,7 +2507,11 @@ async fn call_tool(
                 .get("document_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
             let ok = engine
                 .document_activate_for(seat_id, target, document_id)
                 .await
@@ -2049,7 +2527,11 @@ async fn call_tool(
             }
         }
         "deactivate_document" => {
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
             engine
                 .document_deactivate_for(seat_id, target)
                 .await
@@ -2057,13 +2539,16 @@ async fn call_tool(
             json!({"success": true, "target_seat": target, "message": "Active document cleared"})
         }
         "get_active_document" => {
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
-            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
-            match engine
-                .document_get_active(target)
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
+            engine
+                .require_seat_manage(seat_id, target)
                 .await
-                .map_err(json_err)?
-            {
+                .map_err(json_err)?;
+            match engine.document_get_active(target).await.map_err(json_err)? {
                 Some(d) => {
                     json!({"success": true, "has_active_document": true, "target_seat": target, "document_id": d.document_id, "category": d.category.as_str(), "content": d.content, "tags": d.tags})
                 }
@@ -2073,22 +2558,43 @@ async fn call_tool(
             }
         }
         "list_tasks" => {
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
-            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
             let project_id = args
                 .get("project_id")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty());
             let status = args.get("status").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-            let tasks = engine
-                .task_list(target, project_id, status, limit)
-                .await
-                .map_err(json_err)?;
-            json!({"success": true, "tasks": tasks.iter().map(|t| json!({
-                "task_id": t.task_id, "name": t.name, "status": t.status,
-                "project_id": t.project_id, "auto_load_count": t.auto_load.len(),
-            })).collect::<Vec<_>>(), "count": tasks.len(), "target_seat": target})
+            if let Some(target) = args
+                .get("target_seat")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                engine
+                    .require_seat_manage(seat_id, target)
+                    .await
+                    .map_err(json_err)?;
+                let tasks = engine
+                    .task_list(target, project_id, status, limit)
+                    .await
+                    .map_err(json_err)?;
+                json!({"success": true, "tasks": tasks, "count": tasks.len(), "target_seat": target, "scope": "legacy-seat"})
+            } else {
+                let scope = match args.get("scope").and_then(Value::as_str) {
+                    Some(raw) => TaskListScope::parse(raw).ok_or_else(|| {
+                        json!({"code": -32602, "message": format!("unsupported task scope: {raw}")})
+                    })?,
+                    None => TaskListScope::Visible,
+                };
+                let assignee = args.get("assignee").and_then(Value::as_str);
+                let issuer = args.get("issuer").and_then(Value::as_str);
+                let tasks = engine
+                    .workflow_list_tasks(
+                        seat_id, scope, status, project_id, assignee, issuer, limit,
+                    )
+                    .await
+                    .map_err(json_err)?;
+                json!({"success": true, "tasks": tasks, "count": tasks.len(), "principal": engine.workflow_principal(seat_id)})
+            }
         }
         // projects
         "create_project" => {
@@ -2117,7 +2623,9 @@ async fn call_tool(
                 .cloned()
                 .or_else(|| args.get("description_patch").cloned());
             if description.is_some() && description_patch.is_some() {
-                return Err(json!({"code": -32602, "message": "pass either full-replacement description or diff/description_patch, not both"}));
+                return Err(
+                    json!({"code": -32602, "message": "pass either full-replacement description or diff/description_patch, not both"}),
+                );
             }
             let auto_load = args.get("auto_load").map(|_| str_array(args, "auto_load"));
             let status = args.get("status").and_then(|v| v.as_str());
@@ -2175,8 +2683,15 @@ async fn call_tool(
             }
         }
         "list_projects" => {
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
-            engine.require_seat_manage(seat_id, target).await.map_err(json_err)?;
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
+            engine
+                .require_seat_manage(seat_id, target)
+                .await
+                .map_err(json_err)?;
             let status = args.get("status").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
             let projects = engine
@@ -2327,22 +2842,40 @@ async fn call_tool(
             }
         }
         "project_set_status" => {
-            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let project_id = args
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
             match engine
                 .project_set_status_for(seat_id, target, project_id, status)
                 .await
                 .map_err(json_err)?
             {
-                Some(p) => json!({"success": true, "project_id": p.project_id, "status": p.status, "target_seat": target, "message": format!("Project status set to {}", p.status)}),
-                None => json!({"success": false, "error": format!("project not found: {project_id}")}),
+                Some(p) => {
+                    json!({"success": true, "project_id": p.project_id, "status": p.status, "target_seat": target, "message": format!("Project status set to {}", p.status)})
+                }
+                None => {
+                    json!({"success": false, "error": format!("project not found: {project_id}")})
+                }
             }
         }
         "focus_set_archived" => {
             let focus_id = args.get("focus_id").and_then(|v| v.as_str()).unwrap_or("");
-            let archived = args.get("archived").and_then(|v| v.as_bool()).unwrap_or(false);
-            let target = args.get("target_seat").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
+            let archived = args
+                .get("archived")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let target = args
+                .get("target_seat")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
             let ok = engine
                 .focus_set_archived_for(seat_id, target, focus_id, archived)
                 .await
@@ -2350,12 +2883,12 @@ async fn call_tool(
             json!({"success": ok, "focus_id": focus_id, "archived": archived, "target_seat": target, "message": if ok { "Focus updated" } else { "Focus not found" }})
         }
         "seat_roles" => {
-            let q = args.get("seat_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(seat_id);
-            let roles: Vec<&str> = engine
-                .seat_roles(q)
-                .iter()
-                .map(|r| r.as_str())
-                .collect();
+            let q = args
+                .get("seat_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(seat_id);
+            let roles: Vec<&str> = engine.seat_roles(q).iter().map(|r| r.as_str()).collect();
             json!({
                 "success": true,
                 "seat_id": q,
@@ -2365,8 +2898,14 @@ async fn call_tool(
             })
         }
         "rename_document" => {
-            let document_id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
-            let new_id = args.get("new_document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let document_id = args
+                .get("document_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let new_id = args
+                .get("new_document_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let report = engine
                 .rename_document(seat_id, document_id, new_id, None)
                 .await
@@ -2389,7 +2928,10 @@ async fn call_tool(
                    "message": format!("Task renamed: {} → {}", report.old_id, report.new_id)})
         }
         "rename_project" => {
-            let project_id = args.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let project_id = args
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let new_name = args.get("new_name").and_then(|v| v.as_str()).unwrap_or("");
             let report = engine
                 .rename_project(seat_id, project_id, new_name)
@@ -2405,9 +2947,19 @@ async fn call_tool(
                 .get("category")
                 .and_then(|v| v.as_str())
                 .and_then(DocumentCategory::parse);
-            let folder = args.get("folder").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-            let query = args.get("query").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).min(500) as usize;
+            let folder = args
+                .get("folder")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100)
+                .min(500) as usize;
             let filter = DocFilter {
                 category,
                 visible_to: Some(seat_id.into()),
@@ -2444,10 +2996,21 @@ async fn call_tool(
             json!({"success": true, "documents": out, "count": out.len()})
         }
         "update_document" => {
-            let id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let id = args
+                .get("document_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let Some(mut doc) = engine.get_document(id).await.map_err(json_err)? else {
-                return Err(json!({"code": -32602, "message": format!("document not found: {id}")}));
+                return Err(
+                    json!({"code": -32602, "message": format!("document not found: {id}")}),
+                );
             };
+            if slc_core::tasks::is_workflow_task(&doc) {
+                return Err(json!({
+                    "code": -32602,
+                    "message": "workflow tasks are append-only; use task_message, report_task, or cancel_task"
+                }));
+            }
             // Тело: content (legacy, полная замена) и/или diff — оба
             // принимаются (старые инструкции агентов).
             if let Some(c) = args.get("content").and_then(|v| v.as_str()) {
@@ -2460,13 +3023,22 @@ async fn call_tool(
                 doc.content_hash = slc_core::content_hash(&doc.content);
             }
             if let Some(t) = args.get("tags").and_then(|v| v.as_array()) {
-                doc.tags = t.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+                doc.tags = t
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect();
             }
             if let Some(al) = args.get("auto_load").and_then(|v| v.as_array()) {
-                doc.auto_load = al.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+                doc.auto_load = al
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect();
             }
             if let Some(r) = args.get("references").and_then(|v| v.as_array()) {
-                doc.references = r.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+                doc.references = r
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect();
             }
             if let Some(m) = args.get("metadata").and_then(|v| v.as_object()) {
                 for (k, v) in m {
@@ -2483,8 +3055,19 @@ async fn call_tool(
             json!({"success": true, "document_id": id})
         }
         "delete_document" => {
-            let id = args.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+            let id = args
+                .get("document_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let purge = args.get("purge").and_then(|v| v.as_bool()).unwrap_or(false);
+            if let Some(doc) = engine.store().kb_get(id).await.map_err(json_err)?
+                && slc_core::tasks::is_workflow_task(&doc)
+            {
+                return Err(json!({
+                    "code": -32602,
+                    "message": "workflow tasks cannot be deleted; preserve their event history"
+                }));
+            }
             let ok = if purge {
                 engine.store().kb_purge(id).await.map_err(json_err)?
             } else {
@@ -2531,7 +3114,9 @@ async fn call_tool(
             let existing = engine.store().kb_get(&id).await.map_err(json_err)?;
             if let Some(ref doc) = existing {
                 if !state_document_matches(doc, seat_id, namespace, key) {
-                    return Err(json!({"code": -32009, "message": "external-state identity collision"}));
+                    return Err(
+                        json!({"code": -32009, "message": "external-state identity collision"}),
+                    );
                 }
             }
             let actual = existing.as_ref().map(|doc| state_etag(&doc.content));
@@ -2552,8 +3137,12 @@ async fn call_tool(
             }
 
             let mut metadata = DocMeta::default();
-            metadata.extra.insert("external_state_namespace".into(), json!(namespace));
-            metadata.extra.insert("external_state_key".into(), json!(key));
+            metadata
+                .extra
+                .insert("external_state_namespace".into(), json!(namespace));
+            metadata
+                .extra
+                .insert("external_state_key".into(), json!(key));
             metadata
                 .extra
                 .insert("external_state_content_type".into(), json!(content_type));
@@ -2589,7 +3178,9 @@ async fn call_tool(
             let namespace = state_namespace(args)?;
             let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("");
             if prefix.chars().count() > 512 || prefix.contains('\0') {
-                return Err(json!({"code": -32602, "message": "prefix exceeds 512 characters or contains NUL"}));
+                return Err(
+                    json!({"code": -32602, "message": "prefix exceeds 512 characters or contains NUL"}),
+                );
             }
             let limit = args
                 .get("limit")
@@ -2648,7 +3239,9 @@ async fn call_tool(
             let existing = engine.store().kb_get(&id).await.map_err(json_err)?;
             if let Some(doc) = existing {
                 if !state_document_matches(&doc, seat_id, namespace, key) {
-                    return Err(json!({"code": -32009, "message": "external-state identity collision"}));
+                    return Err(
+                        json!({"code": -32009, "message": "external-state identity collision"}),
+                    );
                 }
                 if let Some(expected) = args.get("expected_etag").and_then(Value::as_str) {
                     let actual = state_etag(&doc.content);
@@ -2715,7 +3308,12 @@ async fn call_tool(
                 .episodic_count(&DocFilter::default())
                 .await
                 .map_err(json_err)?;
-            let seats = engine.seats.list_active(1000).await.map_err(json_err)?.len();
+            let seats = engine
+                .seats
+                .list_active(1000)
+                .await
+                .map_err(json_err)?
+                .len();
             json!({
                 "total": total,
                 "by_category": by_cat,
@@ -2775,6 +3373,12 @@ async fn call_tool(
     // appending it would corrupt the generic state backend contract for every
     // MCP client, not just Hermes.
     let tool_text = text.clone();
+    // `get_page` is deliberately excluded from re-pagination, but its own
+    // `_pagination` envelope still has to drive the next call. Capture that
+    // metadata before optional notification prose makes the text non-JSON.
+    let mut response_pagination = serde_json::from_str::<Value>(&tool_text)
+        .ok()
+        .and_then(|value| value.get("_pagination").cloned());
     if name != "pop_notifications" && !name.starts_with("state_") {
         if let Ok(notes) = engine.pop_notifications(seat_id, 3).await {
             if !notes.is_empty() {
@@ -2803,31 +3407,31 @@ async fn call_tool(
     // otherwise `content` itself looks like the list and no useful split is
     // possible. This is an application-level SLC tool contract layered on
     // ordinary MCP TextContent, so it remains consumable by any MCP client.
-    let pagination_candidate = !matches!(
-        name,
-        "get_page" | "delete_response" | "set_page_limit" | "get_page_settings"
-    );
+    // The generic external-state backend is consumed by machine clients that
+    // parse TextContent as JSON when structuredContent is omitted.  Neither a
+    // pagination instruction nor the large-response warning may be appended
+    // to state_* results: either suffix would corrupt that JSON contract.
+    let pagination_candidate = !name.starts_with("state_")
+        && !matches!(
+            name,
+            "get_page" | "delete_response" | "set_page_limit" | "get_page_settings"
+        );
     let effective_page_token_limit = match pagination.page_token_limit {
         Some(limit) => limit,
         None => engine.page_token_limit().await.map_err(json_err)?,
     };
     if pagination.enabled && pagination_candidate {
-        let pagination_threshold = effective_page_token_limit
-            .saturating_mul(slc_core::pagination::CHARS_PER_TOKEN);
+        let pagination_threshold =
+            effective_page_token_limit.saturating_mul(slc_core::pagination::CHARS_PER_TOKEN);
         if tool_text.chars().count() > pagination_threshold {
             if let Ok(parsed) = serde_json::from_str::<Value>(&tool_text) {
                 let response_id = uid("resp");
                 let paginated = engine
-                    .paginate_with_limit(
-                        seat_id,
-                        &response_id,
-                        &parsed,
-                        effective_page_token_limit,
-                    )
+                    .paginate_with_limit(seat_id, &response_id, &parsed, effective_page_token_limit)
                     .await
                     .map_err(json_err)?;
                 if let Some(page) = paginated.get("_pagination") {
-                    result["_pagination"] = page.clone();
+                    response_pagination = Some(page.clone());
                     // The first page contains only whole items. Remaining
                     // items are available through the advertised get_page
                     // tool without relying on a client-side patch.
@@ -2837,43 +3441,57 @@ async fn call_tool(
                             .unwrap_or_default()
                             .to_string();
                         text = page_text;
-                        // Give every client an explicit, tool-level recovery
-                        // path for the remaining pages.
-                        if let (Some(pid), Some(total)) = (
-                            page.get("response_id").and_then(|v| v.as_str()),
-                            page.get("total_pages").and_then(|v| v.as_u64()),
-                        ) {
-                            if total > 1 {
-                                text.push_str(&format!(
-                                    "\n\n📄 Paginated response: page 1 of {total}.\n"
-                                ));
-                                text.push_str(&format!(
-                                    "Retrieve every remaining page in order with get_page(response_id={pid}, page=2..{total}), one page per call, and combine the items.\n"
-                                ));
-                                text.push_str("Pages may contain PARTS of one large document (field `part: \"k/n\"`) — concatenate them in part order to get the full content.\n");
-                                text.push_str("Do not finish processing the response until all pages have been retrieved.");
-                            }
-                        }
                         text.push_str(&notification_suffix);
                         result["content"][0]["text"] = json!(text);
                     }
                 }
             }
         } else if tool_text.chars().count() > 16_000 {
-                // Ответ большой, но пагинация не сработала (лимит страницы
-                // велик или пагинация выключена) — клиент, скорее всего,
-                // обрежет выхлоп. Явно подсказываем, что делать.
-                text.push_str(&format!(
+            // Ответ большой, но пагинация не сработала (лимит страницы
+            // велик или пагинация выключена) — клиент, скорее всего,
+            // обрежет выхлоп. Явно подсказываем, что делать.
+            text.push_str(&format!(
                     "\n\n⚠️ Ответ большой ({} символов) и НЕ пагинирован (лимит страницы {} токенов ≈ {} символов). Если клиент обрезает выхлоп: set_page_limit(<{}>) и повтори вызов тула.",
                     tool_text.chars().count(),
                     effective_page_token_limit,
                     effective_page_token_limit.saturating_mul(slc_core::pagination::CHARS_PER_TOKEN),
                     (tool_text.chars().count() / slc_core::pagination::CHARS_PER_TOKEN).max(1),
                 ));
-                result["content"][0]["text"] = json!(text);
+            result["content"][0]["text"] = json!(text);
+        }
+    }
+    if let Some(page) = response_pagination {
+        result["_pagination"] = page.clone();
+        // This must be the final bytes of every page. Models should never
+        // have to infer the next page number, copy an id from prose, or decide
+        // whether fetching the remainder is optional.
+        if let Some(instruction) = pagination_followup_instruction(&page) {
+            text.push_str(&instruction);
+            result["content"][0]["text"] = json!(text);
         }
     }
     Ok(result)
+}
+
+fn pagination_followup_instruction(pagination: &Value) -> Option<String> {
+    let page = pagination.get("page").and_then(Value::as_u64)?;
+    let total = pagination.get("total_pages").and_then(Value::as_u64)?;
+    if page < total {
+        let command = pagination
+            .get("next_page_command")
+            .and_then(Value::as_str)?;
+        return Some(format!(
+            "\n\n⛔ MANDATORY PAGINATION CONTINUATION / ОБЯЗАТЕЛЬНОЕ ПРОДОЛЖЕНИЕ\n\
+Ответ НЕ закончен: это страница {page} из {total}. НЕ анализируй, НЕ подводи итог и НЕ отвечай пользователю.\n\
+После вызова выполни команду из самого конца следующей страницы. Повторяй, пока `_pagination.has_more=false`.\n\
+НЕ ДЕЛАЙ НИЧЕГО ДРУГОГО. СЛЕДУЮЩИЙ ВЫЗОВ — СКОПИРУЙ БЕЗ ИЗМЕНЕНИЙ:\n{command}"
+        ));
+    }
+    (total > 1).then(|| {
+        format!(
+            "\n\n✅ PAGINATION COMPLETE / ПАГИНАЦИЯ ЗАВЕРШЕНА: получена страница {page} из {total}, `_pagination.has_more=false`. Только теперь можно анализировать полный ответ."
+        )
+    })
 }
 
 fn json_err(e: slc_core::SlcError) -> Value {
@@ -2995,14 +3613,20 @@ mod seat_filter_tests {
                 "model": "test"
             }
         });
-        assert_eq!(sampling_response_text(&current).as_deref(), Some("project-a"));
+        assert_eq!(
+            sampling_response_text(&current).as_deref(),
+            Some("project-a")
+        );
 
         let legacy = json!({
             "jsonrpc": "2.0",
             "id": "smp-2",
             "result": {"content": [{"type": "text", "text": "project-b"}]}
         });
-        assert_eq!(sampling_response_text(&legacy).as_deref(), Some("project-b"));
+        assert_eq!(
+            sampling_response_text(&legacy).as_deref(),
+            Some("project-b")
+        );
     }
 
     #[test]
@@ -3036,16 +3660,16 @@ mod seat_filter_tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-slc-pagination", "disabled".parse().unwrap());
         headers.insert("x-slc-page-token-limit", "25000".parse().unwrap());
-        headers.insert(
-            "x-slc-context-token-limit",
-            "100000".parse().unwrap(),
-        );
+        headers.insert("x-slc-context-token-limit", "100000".parse().unwrap());
         let policy = pagination_policy_from_request(&headers);
         assert!(!policy.enabled);
         assert_eq!(policy.page_token_limit, Some(25_000));
         assert_eq!(policy.context_token_limit, Some(100_000));
 
-        assert_eq!(effective_context_token_limit(Some(300_000), 100_000), 300_000);
+        assert_eq!(
+            effective_context_token_limit(Some(300_000), 100_000),
+            300_000
+        );
         assert_eq!(effective_context_token_limit(None, 100_000), 100_000);
 
         headers.insert("x-slc-pagination", "enabled".parse().unwrap());
@@ -3053,6 +3677,390 @@ mod seat_filter_tests {
         let policy = pagination_policy_from_request(&headers);
         assert!(policy.enabled);
         assert_eq!(policy.page_token_limit, Some(350_000));
+    }
+
+    #[tokio::test]
+    async fn update_context_recursively_loads_active_document_dependencies() {
+        let store: Arc<dyn slc_core::StorageBackend> =
+            Arc::new(slc_core::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let mut config = slc_core::SlcConfig::default();
+        config
+            .principal_policy_documents
+            .insert("worker".into(), "role_policy".into());
+        let engine = SlcEngine::with(
+            store,
+            Arc::new(slc_core::MockLlm::new(vec![])),
+            config,
+        );
+        let mut global = Document::new(
+            "global_policy",
+            DocumentCategory::System,
+            "GLOBAL_POLICY_MARKER",
+            DocMeta::default(),
+            vec![],
+            Some("manager".into()),
+        );
+        engine.add_document(&mut global).await.unwrap();
+        let mut role = Document::new(
+            "role_policy",
+            DocumentCategory::System,
+            "ROLE_POLICY_MARKER",
+            DocMeta::default(),
+            vec![],
+            Some("manager".into()),
+        );
+        role.auto_load = vec!["global_policy".into()];
+        engine.add_document(&mut role).await.unwrap();
+        let mut private = Document::new(
+            "private_secret",
+            DocumentCategory::Custom,
+            "PRIVATE_SECRET_MARKER",
+            DocMeta::default(),
+            vec![],
+            Some("other-seat".into()),
+        );
+        engine.add_document(&mut private).await.unwrap();
+        let mut task = Document::new(
+            "active_task",
+            DocumentCategory::Task,
+            "ACTIVE_TASK_MARKER",
+            DocMeta::default(),
+            vec![],
+            Some("worker".into()),
+        );
+        task.auto_load = vec!["private_secret".into(), "role_policy".into()];
+        engine.add_document(&mut task).await.unwrap();
+        engine.ensure_seat("worker").await.unwrap();
+        engine.document_activate("worker", "active_task").await.unwrap();
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let context = call_tool(
+            &engine,
+            "worker",
+            "update_context",
+            &json!({"include_base_docs": false}),
+            &events,
+            PaginationPolicy {
+                enabled: false,
+                page_token_limit: None,
+                context_token_limit: Some(100_000),
+            },
+        )
+        .await
+        .unwrap()
+        .to_string();
+        assert!(context.contains("ACTIVE_TASK_MARKER"), "{context}");
+        assert!(context.contains("ROLE_POLICY_MARKER"), "{context}");
+        assert!(context.contains("GLOBAL_POLICY_MARKER"), "{context}");
+        assert!(!context.contains("PRIVATE_SECRET_MARKER"), "{context}");
+    }
+
+    #[tokio::test]
+    async fn large_external_state_lists_remain_machine_parseable() {
+        let store: Arc<dyn slc_core::StorageBackend> =
+            Arc::new(slc_core::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let engine = SlcEngine::with(
+            store,
+            Arc::new(slc_core::MockLlm::new(vec![])),
+            slc_core::SlcConfig::default(),
+        );
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let seat = "external-state-client";
+        for index in 0..8 {
+            let key = format!("skill-{index}-{}", "x".repeat(400));
+            call_tool(
+                &engine,
+                seat,
+                "state_put",
+                &json!({
+                    "namespace": "hermes-skills",
+                    "key": key,
+                    "content": "content",
+                }),
+                &events,
+                PaginationPolicy {
+                    enabled: false,
+                    page_token_limit: Some(1),
+                    context_token_limit: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let listed = call_tool(
+            &engine,
+            seat,
+            "state_list",
+            &json!({"namespace": "hermes-skills", "limit": 1000}),
+            &events,
+            PaginationPolicy {
+                enabled: true,
+                page_token_limit: Some(1),
+                context_token_limit: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(listed.get("_pagination").is_none());
+        assert!(listed.get("structuredContent").is_none());
+        let text = listed["content"][0]["text"].as_str().unwrap();
+        assert!(text.chars().count() > 2_000);
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["count"], 8);
+        assert_eq!(parsed["objects"].as_array().unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn terminal_report_does_not_invite_assignee_to_start_successor() {
+        use slc_core::storage::sqlite::SqliteStore;
+        use slc_core::{MockLlm, SlcConfig, StorageBackend};
+        use std::collections::{HashMap, HashSet};
+
+        let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
+        let config = SlcConfig {
+            principal_seats: HashMap::from([
+                ("manager".into(), "seat-manager".into()),
+                ("worker".into(), "seat-worker".into()),
+            ]),
+            task_assign_acl: HashMap::from([("manager".into(), HashSet::from(["worker".into()]))]),
+            ..Default::default()
+        };
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let policy = PaginationPolicy {
+            enabled: false,
+            page_token_limit: None,
+            context_token_limit: None,
+        };
+
+        let first = call_tool(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            &json!({"assignee":"worker","name":"first","idempotency_key":"assign-1"}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let first: Value =
+            serde_json::from_str(first["content"][0]["text"].as_str().unwrap()).unwrap();
+        let first_id = first["task"]["task_id"].as_str().unwrap();
+        call_tool(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            &json!({"assignee":"worker","name":"second","idempotency_key":"assign-2"}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        call_tool(
+            &engine,
+            "seat-worker",
+            "start_task",
+            &json!({"task_id":first_id,"idempotency_key":"start-1"}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let reported = call_tool(
+            &engine,
+            "seat-worker",
+            "report_task",
+            &json!({
+                "task_id":first_id,
+                "status":"completed",
+                "summary":"done",
+                "idempotency_key":"report-1"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let reported: Value =
+            serde_json::from_str(reported["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(reported["success"], true);
+        assert_eq!(reported["wake_recommended"], true);
+        assert!(reported.get("next_ready_task").is_none());
+        assert!(reported.get("next_delivery").is_none());
+        assert_eq!(reported["delivery"]["recipient"], "manager");
+    }
+
+    #[tokio::test]
+    async fn manager_portfolio_terminal_report_is_polled_without_transport_wake() {
+        use slc_core::storage::sqlite::SqliteStore;
+        use slc_core::{MockLlm, SlcConfig, StorageBackend};
+        use std::collections::{HashMap, HashSet};
+
+        let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
+        let config = SlcConfig {
+            principal_seats: HashMap::from([
+                ("manager".into(), "seat-manager".into()),
+                ("worker".into(), "seat-worker".into()),
+            ]),
+            task_assign_acl: HashMap::from([("manager".into(), HashSet::from(["worker".into()]))]),
+            ..Default::default()
+        };
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let policy = PaginationPolicy {
+            enabled: false,
+            page_token_limit: None,
+            context_token_limit: None,
+        };
+
+        let assigned = call_tool(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            &json!({
+                "assignee":"worker",
+                "name":"portfolio build",
+                "project_id":"leads_mass_redesign",
+                "idempotency_key":"assign-portfolio"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let assigned: Value =
+            serde_json::from_str(assigned["content"][0]["text"].as_str().unwrap()).unwrap();
+        let task_id = assigned["task"]["task_id"].as_str().unwrap();
+        call_tool(
+            &engine,
+            "seat-worker",
+            "start_task",
+            &json!({"task_id":task_id,"idempotency_key":"start-portfolio"}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let reported = call_tool(
+            &engine,
+            "seat-worker",
+            "report_task",
+            &json!({
+                "task_id":task_id,
+                "status":"completed",
+                "summary":"done",
+                "idempotency_key":"report-portfolio"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let reported: Value =
+            serde_json::from_str(reported["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(reported["success"], true);
+        assert_eq!(reported["wake_recommended"], false);
+        assert!(reported["delivery"].is_null());
+        assert!(reported.get("next_ready_task").is_none());
+        assert!(reported.get("next_delivery").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_document_pages_end_with_the_exact_next_tool_call() {
+        let store: Arc<dyn slc_core::StorageBackend> =
+            Arc::new(slc_core::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let engine = SlcEngine::with(
+            store,
+            Arc::new(slc_core::MockLlm::new(vec![])),
+            slc_core::SlcConfig::default(),
+        );
+        engine.ensure_seat("small-model").await.unwrap();
+        let content = format!(
+            "DOCUMENT_START_MARKER\n{}\nDOCUMENT_END_MARKER",
+            "абвгд ".repeat(6000)
+        );
+        let mut document = Document::new(
+            "large_document",
+            DocumentCategory::Custom,
+            content,
+            DocMeta::default(),
+            vec!["non-empty-tag".to_string()],
+            None,
+        );
+        document.auto_load = vec!["required_context".to_string()];
+        document.references = vec!["source_document".to_string()];
+        engine.add_document(&mut document).await.unwrap();
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let policy = PaginationPolicy {
+            enabled: true,
+            page_token_limit: Some(1_000),
+            context_token_limit: None,
+        };
+
+        let first = call_tool(
+            &engine,
+            "small-model",
+            "get_document",
+            &json!({"document_id": "large_document"}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let pagination = &first["_pagination"];
+        let response_id = pagination["response_id"].as_str().unwrap();
+        let total = pagination["total_pages"].as_u64().unwrap();
+        assert!(total > 2);
+        assert_eq!(pagination["has_more"], true);
+        assert_eq!(pagination["next_page"], 2);
+        let first_text = first["content"][0]["text"].as_str().unwrap();
+        assert!(first_text.contains("DOCUMENT_START_MARKER"));
+        assert!(!first_text.contains("DOCUMENT_END_MARKER"));
+        assert!(first_text.contains(&format!(
+            "mcp__slc__get_page({{\"response_id\":\"{response_id}\",\"page\":2}})"
+        )));
+        assert!(first_text.ends_with(&format!(
+            "mcp__slc__get_page({{\"response_id\":\"{response_id}\",\"page\":2}})"
+        )));
+
+        let second = call_tool(
+            &engine,
+            "small-model",
+            "get_page",
+            &json!({"response_id": response_id, "page": 2}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["_pagination"]["next_page"], 3);
+        let second_text = second["content"][0]["text"].as_str().unwrap();
+        assert!(second_text.contains(&format!(
+            "mcp__slc__get_page({{\"response_id\":\"{response_id}\",\"page\":3}})"
+        )));
+        assert!(second_text.ends_with(&format!(
+            "mcp__slc__get_page({{\"response_id\":\"{response_id}\",\"page\":3}})"
+        )));
+
+        let last = call_tool(
+            &engine,
+            "small-model",
+            "get_page",
+            &json!({"response_id": response_id, "page": total}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(last["_pagination"]["has_more"], false);
+        assert!(last["_pagination"]["next_page"].is_null());
+        let last_text = last["content"][0]["text"].as_str().unwrap();
+        assert!(last_text.ends_with(
+            "`_pagination.has_more=false`. Только теперь можно анализировать полный ответ."
+        ));
     }
 
     #[test]
@@ -3107,5 +4115,25 @@ mod seat_filter_tests {
         );
         assert!(state_namespace(&json!({"namespace": "../escape"})).is_err());
         assert!(state_namespace(&json!({"namespace": ""})).is_err());
+    }
+
+    #[test]
+    fn workflow_delivery_is_content_free_and_transport_neutral() {
+        let delivery = workflow_delivery(
+            Some("dev-junior-0"),
+            "task_example",
+            Some("event_example"),
+            "message",
+        );
+
+        assert_eq!(delivery["recipient"], "dev-junior-0");
+        assert_eq!(delivery["correlation_id"], "task_example");
+        assert_eq!(delivery["idempotency_key"], "event_example");
+        assert_eq!(delivery.as_object().unwrap().len(), 4);
+        let serialized = delivery.to_string();
+        assert!(!serialized.contains("canonical task body"));
+        assert!(!serialized.contains("private report"));
+        assert!(serialized.contains("list_task_events"));
+
     }
 }

@@ -34,9 +34,266 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const GIT_INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
+const GIT_COMMIT_DEBOUNCE: Duration = Duration::from_secs(5);
+const GIT_MAINTENANCE_CHECK_INTERVAL: u64 = 16;
+const GIT_MAINTENANCE_LOOSE_OBJECT_LIMIT: u64 = 1024;
+const GIT_MAINTENANCE_LOOSE_KIB_LIMIT: u64 = 128 * 1024;
+static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static GIT_COMMITS_SINCE_START: AtomicU64 = AtomicU64::new(0);
+// Git's automatic maintenance can intentionally detach a `git` child after
+// commits. It is then reparented to the SLC container's PID 1, which has no
+// generic child reaper, leaving an exited maintenance process as a zombie.
+// Vault snapshots are already scheduled by SLC; disable overlapping Git work.
+const GIT_NO_BACKGROUND_MAINTENANCE: &[&str] = &[
+    "-c",
+    "maintenance.auto=false",
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "gc.autoDetach=false",
+];
+
+/// Replace a vault file without truncating the inode a concurrent `git add`
+/// may already have mmaped. Truncating that inode can terminate Git with
+/// SIGBUS, leave index.lock behind, and stall all later snapshots. Temporary
+/// files live under `.git` when available so Git never stages an in-flight
+/// write; rename is atomic because both paths remain on the vault filesystem.
+fn atomic_replace(temp_dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(temp_dir)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "invalid vault file name"))?;
+    for _ in 0..32 {
+        let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = temp_dir.join(format!(
+            "{file_name}.{}.{}",
+            std::process::id(),
+            sequence
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = file.write_all(bytes).and_then(|_| file.flush()) {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        drop(file);
+        if let Err(error) = std::fs::rename(&temporary, path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        "could not allocate a unique vault temporary file",
+    ))
+}
+fn quarantine_git_index_lock(
+    root: &Path,
+    now: SystemTime,
+    minimum_age: Duration,
+) -> std::io::Result<Option<PathBuf>> {
+    let lock = root.join(".git/index.lock");
+    let metadata = match std::fs::symlink_metadata(&lock) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+    let modified = metadata.modified()?;
+    let age = now.duration_since(modified).unwrap_or_default();
+    if age < minimum_age {
+        return Ok(None);
+    }
+
+    let quarantine_dir = root.join(".git/slc-stale-index-locks");
+    std::fs::create_dir_all(&quarantine_dir)?;
+    let timestamp = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let quarantined = quarantine_dir.join(format!("index.lock.{timestamp}"));
+    std::fs::rename(&lock, &quarantined)?;
+    Ok(Some(quarantined))
+}
+
+/// Preserve an abandoned Git index lock once it is old enough that it cannot
+/// belong to this store's bounded Git worker. The worker coalescer guarantees
+/// one in-process Git sequence at a time; the age guard avoids disrupting a
+/// short-lived external Git command operating on the same vault.
+fn quarantine_stale_git_index_lock(
+    root: &Path,
+    now: SystemTime,
+) -> std::io::Result<Option<PathBuf>> {
+    quarantine_git_index_lock(root, now, GIT_INDEX_LOCK_STALE_AFTER)
+}
+
+fn parse_git_count_objects(output: &str) -> Option<(u64, u64)> {
+    let mut count = None;
+    let mut size_kib = None;
+    for line in output.lines() {
+        let Some((key, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = raw_value.trim().parse::<u64>().ok();
+        match key.trim() {
+            "count" => count = value,
+            "size" => size_kib = value,
+            _ => {}
+        }
+    }
+    count.zip(size_kib)
+}
+
+/// Run one coalesced Git snapshot for the vault. This is intentionally invoked
+/// only by the coalesced worker below: the storage write path must never queue
+/// one Git process per document or seat update.
+fn run_vault_git_commit(root: &Path, author: &str) {
+    let author_name = author
+        .split('<')
+        .next()
+        .unwrap_or("slc-mcp")
+        .trim()
+        .to_string();
+    let author_email = author
+        .split_once('<')
+        .and_then(|(_, email)| email.strip_suffix('>'))
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .unwrap_or("slc-mcp@local")
+        .to_string();
+    match quarantine_stale_git_index_lock(root, SystemTime::now()) {
+        Ok(Some(path)) => tracing::warn!(
+            path = %path.display(),
+            "vault git: quarantined abandoned index lock"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!("vault git lock recovery error: {error}"),
+    }
+    let run = |args: Vec<&str>| {
+        // The coalesced worker is deliberately detached from request handling,
+        // so direct Git waiting cannot stall SLC. Avoid an external `timeout`
+        // wrapper here: it can orphan/reparent `git` under a long-lived PID 1
+        // and leak zombies after a cancelled snapshot.
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(GIT_NO_BACKGROUND_MAINTENANCE)
+            .args(&args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", &author_name)
+            .env("GIT_AUTHOR_EMAIL", &author_email)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+    };
+    let failed = |out: &std::process::Output| {
+        tracing::warn!(
+            "vault git: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    };
+    match run(vec!["add", "-A"]) {
+        Ok(out) if out.status.success() => {
+            // A read-only lifecycle call may still persist operational
+            // metadata. Avoid manufacturing empty commits when the vault
+            // representation did not actually change.
+            match run(vec!["diff", "--cached", "--quiet"]) {
+                Ok(diff) if diff.status.success() => return,
+                Ok(diff) if diff.status.code() == Some(1) => {}
+                Ok(diff) => {
+                    failed(&diff);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!("vault git diff error: {error}");
+                    return;
+                }
+            }
+            let commit = run(vec!["commit", "-m", "slc: vault update"]);
+            match &commit {
+                Ok(commit) if commit.status.success() => {
+                    // Push the vault to its upstream (best-effort) — configured
+                    // remote only, silent otherwise.
+                    if let Ok(push) = run(vec!["push", "-q"]) {
+                        if !push.status.success() {
+                            tracing::debug!(
+                                "vault push: {}",
+                                String::from_utf8_lossy(&push.stderr).trim()
+                            );
+                        }
+                    }
+                    let committed = GIT_COMMITS_SINCE_START.fetch_add(1, Ordering::Relaxed) + 1;
+                    if committed == 1 || committed % GIT_MAINTENANCE_CHECK_INTERVAL == 0 {
+                        match run(vec!["count-objects", "-v"]) {
+                            Ok(count_objects) if count_objects.status.success() => {
+                                let summary = String::from_utf8_lossy(&count_objects.stdout);
+                                if let Some((loose_count, loose_kib)) =
+                                    parse_git_count_objects(&summary)
+                                {
+                                    if loose_count >= GIT_MAINTENANCE_LOOSE_OBJECT_LIMIT
+                                        || loose_kib >= GIT_MAINTENANCE_LOOSE_KIB_LIMIT
+                                    {
+                                        tracing::info!(
+                                            loose_count,
+                                            loose_kib,
+                                            "vault git: compacting loose objects"
+                                        );
+                                        match run(vec!["gc", "--prune=2.weeks.ago"]) {
+                                            Ok(gc) if gc.status.success() => {}
+                                            Ok(gc) => failed(&gc),
+                                            Err(error) => {
+                                                tracing::warn!("vault git gc error: {error}")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(count_objects) => failed(&count_objects),
+                            Err(error) => {
+                                tracing::warn!("vault git count-objects error: {error}")
+                            }
+                        }
+                    }
+                }
+                Ok(commit) => failed(commit),
+                Err(error) => tracing::warn!("vault git commit error: {error}"),
+            }
+        }
+        Ok(out) => failed(&out),
+        Err(error) => tracing::warn!("vault git add error: {error}"),
+    }
+}
+
+/// Return whether the sole coalesced worker should immediately run another
+/// pass. The post-release recheck closes the race where a write arrives after
+/// the first idle observation but before a new worker can be scheduled.
+fn finish_git_commit_worker(dirty: &AtomicBool, worker_active: &AtomicBool) -> bool {
+    if dirty.swap(false, Ordering::AcqRel) {
+        return true;
+    }
+    worker_active.store(false, Ordering::Release);
+    dirty.load(Ordering::Acquire)
+        && worker_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+}
 
 /// Human-readable file name from a unique document id.
 /// Keeps letters/digits/`-`/`_`/`.`/space; path-hostile chars → `-`.
@@ -94,6 +351,8 @@ pub struct IndexEntry {
     pub seat_id: Option<String>,
     pub doc_level: Option<String>,
     pub doc_type: Option<String>,
+    #[serde(default)]
+    pub extra_strings: BTreeMap<String, String>,
     pub archived: Option<bool>,
     pub consolidated: Option<bool>,
     pub compression_batch_id: Option<String>,
@@ -122,6 +381,16 @@ impl IndexEntry {
             seat_id: doc.seat_id.clone(),
             doc_level: doc.metadata.doc_level.map(|l| l.as_str().to_string()),
             doc_type: doc.metadata.doc_type.clone(),
+            extra_strings: doc
+                .metadata
+                .extra
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (key.clone(), value.to_string()))
+                })
+                .collect(),
             archived: doc.metadata.archived,
             consolidated: doc.metadata.consolidated,
             compression_batch_id: doc.metadata.compression_batch_id.clone(),
@@ -167,6 +436,18 @@ impl IndexEntry {
             if self.doc_type.as_deref() != Some(dt.as_str()) {
                 return false;
             }
+        }
+        if f.extra_strings.iter().any(|(key, expected)| {
+            self.extra_strings.get(key) != Some(expected)
+        }) {
+            return false;
+        }
+        if f.extra_strings_not_in.iter().any(|(key, excluded)| {
+            self.extra_strings
+                .get(key)
+                .is_some_and(|value| excluded.contains(value))
+        }) {
+            return false;
         }
         if let Some(archived) = f.archived {
             if self.archived != Some(archived) {
@@ -230,7 +511,11 @@ pub struct ObsidianVaultStore {
     records: std::sync::Arc<Mutex<HashMap<(String, String), Value>>>,
     auto_git_commit: bool,
     git_author: String,
-    git_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    /// Writes mark the vault dirty. Exactly one coalesced worker drains that
+    /// flag, so high-frequency seat touches cannot build an unbounded queue of
+    /// git add/commit processes.
+    git_commit_dirty: Arc<AtomicBool>,
+    git_commit_worker_active: Arc<AtomicBool>,
 }
 
 impl ObsidianVaultStore {
@@ -250,7 +535,8 @@ impl ObsidianVaultStore {
             auto_git_commit,
             git_author: std::env::var("OBSIDIAN_GIT_AUTHOR")
                 .unwrap_or_else(|_| "slc-mcp <slc-mcp@local>".into()),
-            git_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            git_commit_dirty: Arc::new(AtomicBool::new(false)),
+            git_commit_worker_active: Arc::new(AtomicBool::new(false)),
         };
         store.rebuild_index()?;
         store.load_sidecars()?;
@@ -259,6 +545,17 @@ impl ObsidianVaultStore {
 
     fn slc_dir(&self) -> PathBuf {
         self.root.join(".slc")
+    }
+
+    fn atomic_write(&self, path: &Path, bytes: &[u8]) -> SlcResult<()> {
+        let git_temp = self.root.join(".git/slc-write-tmp");
+        let temp_dir = if self.root.join(".git").is_dir() {
+            git_temp
+        } else {
+            self.slc_dir().join("write-tmp")
+        };
+        atomic_replace(&temp_dir, path, bytes)?;
+        Ok(())
     }
 
     /// Scan the vault and rebuild the document index from file frontmatter
@@ -325,6 +622,20 @@ impl ObsidianVaultStore {
                             .and_then(|m| m.get("doc_type"))
                             .and_then(|v| v.as_str())
                             .map(String::from),
+                        extra_strings: meta
+                            .get("metadata")
+                            .and_then(|v| v.as_object())
+                            .map(|extra| {
+                                extra
+                                    .iter()
+                                    .filter_map(|(key, value)| {
+                                        value
+                                            .as_str()
+                                            .map(|value| (key.clone(), value.to_string()))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         archived: meta
                             .get("metadata")
                             .and_then(|m| m.get("archived"))
@@ -431,22 +742,21 @@ impl ObsidianVaultStore {
     fn persist_index(&self) -> SlcResult<()> {
         let map = self.index.lock().unwrap();
         let text = serde_json::to_string_pretty(&*map)?;
-        std::fs::write(self.slc_dir().join("index.json"), text)?;
+        self.atomic_write(&self.slc_dir().join("index.json"), text.as_bytes())?;
         Ok(())
     }
 
     fn persist_embeddings(&self) -> SlcResult<()> {
         let map = self.embeddings.lock().unwrap();
-        std::fs::write(
-            self.slc_dir().join("embeddings.json"),
-            serde_json::to_string_pretty(&*map)?,
-        )?;
+        let text = serde_json::to_string_pretty(&*map)?;
+        self.atomic_write(&self.slc_dir().join("embeddings.json"), text.as_bytes())?;
         Ok(())
     }
 
     fn persist_timers(&self) -> SlcResult<()> {
         let map = self.timers.lock().unwrap();
-        std::fs::write(self.slc_dir().join("timers.json"), serde_json::to_string_pretty(&*map)?)?;
+        let text = serde_json::to_string_pretty(&*map)?;
+        self.atomic_write(&self.slc_dir().join("timers.json"), text.as_bytes())?;
         Ok(())
     }
 
@@ -456,13 +766,15 @@ impl ObsidianVaultStore {
             .iter()
             .map(|((c, k), v)| (format!("{c}\u{0}{k}"), v.clone()))
             .collect();
-        std::fs::write(self.slc_dir().join("records.json"), serde_json::to_string_pretty(&flat)?)?;
+        let text = serde_json::to_string_pretty(&flat)?;
+        self.atomic_write(&self.slc_dir().join("records.json"), text.as_bytes())?;
         Ok(())
     }
 
     fn persist_seat(&self, seat: &Seat) -> SlcResult<()> {
         let path = self.root.join("seats").join(format!("{}.json", safe_file_name(&seat.seat_id)));
-        std::fs::write(path, serde_json::to_string_pretty(seat)?)?;
+        let text = serde_json::to_string_pretty(seat)?;
+        self.atomic_write(&path, text.as_bytes())?;
         Ok(())
     }
 
@@ -479,7 +791,7 @@ impl ObsidianVaultStore {
             .unwrap_or_else(|| safe_file_name(&doc.document_id));
         let path = dir.join(format!("{file_name}.md"));
         let text = render_doc(doc)?;
-        std::fs::write(path, text)?;
+        self.atomic_write(&path, text.as_bytes())?;
 
         // A full replacement may change category or project binding, which
         // changes the canonical folder. Leaving the old note behind creates
@@ -583,82 +895,47 @@ impl ObsidianVaultStore {
         out.into_iter().cloned().collect()
     }
 
-    async fn git_commit(&self) {
+    /// Fire-and-forget, coalesced vault commit. The write path must NEVER
+    /// block on Git: a stuck index.lock, a hung push, or a slow `git add -A`
+    /// must not stall the MCP request. A burst of writes therefore marks one
+    /// shared dirty flag and is drained by at most one bounded worker instead
+    /// of queuing one Git process per write.
+    fn git_commit(&self) {
         if !self.auto_git_commit {
+            return;
+        }
+        self.git_commit_dirty.store(true, Ordering::Release);
+        if self
+            .git_commit_worker_active
+            .swap(true, Ordering::AcqRel)
+        {
             return;
         }
         let root = self.root.clone();
         let author = self.git_author.clone();
-        let git_lock = self.git_lock.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let Ok(_guard) = git_lock.lock() else { return }; // serialize git index.lock
-            let author_name = author
-                .split('<')
-                .next()
-                .unwrap_or("slc-mcp")
-                .trim()
-                .to_string();
-            let author_email = author
-                .split_once('<')
-                .and_then(|(_, email)| email.strip_suffix('>'))
-                .map(str::trim)
-                .filter(|email| !email.is_empty())
-                .unwrap_or("slc-mcp@local")
-                .to_string();
-            let run = |args: Vec<&str>| {
-                std::process::Command::new("git")
-                    .args(&args)
-                    .current_dir(&root)
-                    .env("GIT_AUTHOR_NAME", &author_name)
-                    .env("GIT_AUTHOR_EMAIL", &author_email)
-                    .output()
-            };
-            let failed = |out: &std::process::Output| {
-                tracing::warn!(
-                    "vault git: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            };
-            match run(vec!["add", "-A"]) {
-                Ok(out) if out.status.success() => {
-                    // A read-only lifecycle call may still persist operational
-                    // metadata. Avoid manufacturing empty commits when the
-                    // vault representation did not actually change.
-                    match run(vec!["diff", "--cached", "--quiet"]) {
-                        Ok(diff) if diff.status.success() => return,
-                        Ok(diff) if diff.status.code() == Some(1) => {}
-                        Ok(diff) => {
-                            failed(&diff);
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::warn!("vault git diff error: {e}");
-                            return;
-                        }
-                    }
-                    let commit = run(vec!["commit", "-m", "slc: vault update"]);
-                    match &commit {
-                        Ok(c) if c.status.success() => {
-                            // Push the vault to its upstream (best-effort) —
-                            // configured remote only, silent otherwise.
-                            if let Ok(p) = run(vec!["push", "-q"]) {
-                                if !p.status.success() {
-                                    tracing::debug!(
-                                        "vault push: {}",
-                                        String::from_utf8_lossy(&p.stderr).trim()
-                                    );
-                                }
-                            }
-                        }
-                        Ok(c) => failed(c),
-                        Err(e) => tracing::warn!("vault git commit error: {e}"),
-                    }
+        let dirty = self.git_commit_dirty.clone();
+        let worker_active = self.git_commit_worker_active.clone();
+        let _ = tokio::task::spawn(async move {
+            loop {
+                tokio::time::sleep(GIT_COMMIT_DEBOUNCE).await;
+                // The current on-disk state covers all writes seen so far.
+                // Any write while Git runs sets this flag again and earns one
+                // follow-up pass after the current snapshot finishes.
+                dirty.store(false, Ordering::Release);
+                let worker_root = root.clone();
+                let worker_author = author.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    run_vault_git_commit(&worker_root, &worker_author);
+                })
+                .await
+                {
+                    tracing::warn!("vault git worker failed: {error}");
                 }
-                Ok(out) => failed(&out),
-                Err(e) => tracing::warn!("vault git add error: {e}"),
+                if !finish_git_commit_worker(&dirty, &worker_active) {
+                    break;
+                }
             }
-        })
-        .await;
+        });
     }
 }
 
@@ -718,7 +995,7 @@ impl StorageBackend for ObsidianVaultStore {
         }
         let doc = doc.clone();
         self.write_note(&doc)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -740,7 +1017,7 @@ impl StorageBackend for ObsidianVaultStore {
         doc.version += 1;
         doc.updated_at = Utc::now();
         self.write_note(&doc)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -761,7 +1038,7 @@ impl StorageBackend for ObsidianVaultStore {
         let exists = self.index.lock().unwrap().contains_key(&doc.document_id);
         let doc = doc.clone();
         self.write_note(&doc)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(exists)
     }
 
@@ -798,7 +1075,7 @@ impl StorageBackend for ObsidianVaultStore {
             self.write_note(&doc)?;
             changed += 1;
         }
-        self.git_commit().await;
+        self.git_commit();
         Ok(changed)
     }
 
@@ -813,7 +1090,7 @@ impl StorageBackend for ObsidianVaultStore {
         doc.deleted_at = Some(Utc::now());
         doc.version += 1;
         self.write_note(&doc)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -828,7 +1105,7 @@ impl StorageBackend for ObsidianVaultStore {
         doc.deleted_at = None;
         doc.version += 1;
         self.write_note(&doc)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -842,7 +1119,7 @@ impl StorageBackend for ObsidianVaultStore {
             let doc = doc.clone();
             self.write_note(&doc)?;
         }
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -872,7 +1149,7 @@ impl StorageBackend for ObsidianVaultStore {
             true
         };
         self.persist_index()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(renamed)
     }
 
@@ -884,7 +1161,7 @@ impl StorageBackend for ObsidianVaultStore {
         let _ = tokio::fs::remove_file(path).await;
         self.delete_embeddings(document_id).await?;
         self.persist_index()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -927,7 +1204,7 @@ impl StorageBackend for ObsidianVaultStore {
         }
         let doc = doc.clone();
         self.write_note(&doc)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -937,7 +1214,7 @@ impl StorageBackend for ObsidianVaultStore {
         }
         if self.index.lock().unwrap().contains_key(&doc.document_id) {
             self.write_note(doc)?;
-            self.git_commit().await;
+            self.git_commit();
             return Ok(true);
         }
         self.episodic_insert(doc).await?;
@@ -977,7 +1254,7 @@ impl StorageBackend for ObsidianVaultStore {
             self.write_note(&doc)?;
             changed += 1;
         }
-        self.git_commit().await;
+        self.git_commit();
         Ok(changed)
     }
 
@@ -988,7 +1265,7 @@ impl StorageBackend for ObsidianVaultStore {
             .join(format!("{}.md", safe_file_name(&e.id)));
         let _ = tokio::fs::remove_file(path).await;
         self.persist_index()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -1002,7 +1279,7 @@ impl StorageBackend for ObsidianVaultStore {
             }
         }
         self.persist_embeddings()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -1038,7 +1315,7 @@ impl StorageBackend for ObsidianVaultStore {
     async fn delete_embeddings(&self, document_id: &str) -> SlcResult<()> {
         self.embeddings.lock().unwrap().remove(document_id);
         self.persist_embeddings()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -1047,7 +1324,7 @@ impl StorageBackend for ObsidianVaultStore {
     async fn insert_seat(&self, seat: &Seat) -> SlcResult<()> {
         self.seats.lock().unwrap().insert(seat.seat_id.clone(), seat.clone());
         self.persist_seat(seat)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -1084,7 +1361,7 @@ impl StorageBackend for ObsidianVaultStore {
             seat.clone()
         };
         self.persist_seat(&seat)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -1096,7 +1373,7 @@ impl StorageBackend for ObsidianVaultStore {
             seat.clone()
         };
         self.persist_seat(&seat)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -1110,7 +1387,7 @@ impl StorageBackend for ObsidianVaultStore {
             seat.clone()
         };
         self.persist_seat(&seat)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -1122,7 +1399,7 @@ impl StorageBackend for ObsidianVaultStore {
             seat.clone()
         };
         self.persist_seat(&seat)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -1145,7 +1422,7 @@ impl StorageBackend for ObsidianVaultStore {
             seat.clone()
         };
         self.persist_seat(&seat)?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(true)
     }
 
@@ -1154,7 +1431,7 @@ impl StorageBackend for ObsidianVaultStore {
     async fn insert_timer(&self, timer: &PersistedTimer) -> SlcResult<()> {
         self.timers.lock().unwrap().insert(timer.timer_id.clone(), timer.clone());
         self.persist_timers()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -1181,7 +1458,7 @@ impl StorageBackend for ObsidianVaultStore {
             }
         }
         self.persist_timers()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -1190,7 +1467,7 @@ impl StorageBackend for ObsidianVaultStore {
     async fn put_record(&self, collection: &str, key: &str, value: &Value) -> SlcResult<()> {
         self.records.lock().unwrap().insert((collection.to_string(), key.to_string()), value.clone());
         self.persist_records()?;
-        self.git_commit().await;
+        self.git_commit();
         Ok(())
     }
 
@@ -1202,7 +1479,7 @@ impl StorageBackend for ObsidianVaultStore {
         let existed = self.records.lock().unwrap().remove(&(collection.to_string(), key.to_string())).is_some();
         if existed {
             self.persist_records()?;
-            self.git_commit().await;
+            self.git_commit();
         }
         Ok(existed)
     }
@@ -1340,6 +1617,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flattened_extra_metadata_filters_survive_index_rebuild() {
+        let root = tmp_vault("extra-filter");
+        let store = ObsidianVaultStore::open(&root, false).unwrap();
+
+        for (id, assignee, status) in [
+            ("task-a", "developer-0", "RUNNING"),
+            ("task-b", "developer-0", "QUEUED"),
+            ("task-c", "developer-1", "QUEUED"),
+        ] {
+            let mut metadata = DocMeta::default();
+            metadata.extra.insert("assignee".into(), json!(assignee));
+            metadata.extra.insert("status".into(), json!(status));
+            store
+                .kb_insert(&Document::new(
+                    id,
+                    DocumentCategory::Task,
+                    id,
+                    metadata,
+                    vec![],
+                    Some("manager".into()),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let mut filter = DocFilter::default();
+        filter.extra_strings.insert("assignee".into(), "developer-0".into());
+        filter
+            .extra_strings_not_in
+            .insert("status".into(), vec!["RUNNING".into()]);
+        let found = store
+            .kb_find(&filter, &DocSort::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|doc| doc.document_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-b"]
+        );
+
+        let reopened = ObsidianVaultStore::open(&root, false).unwrap();
+        let found_after_rebuild = reopened
+            .kb_find(&filter, &DocSort::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            found_after_rebuild
+                .iter()
+                .map(|doc| doc.document_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-b"]
+        );
+    }
+
+    #[tokio::test]
     async fn episodic_compression_queries() {
         let root = tmp_vault("compress");
         let store = ObsidianVaultStore::open(&root, false).unwrap();
@@ -1426,4 +1760,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn atomic_replace_preserves_the_inode_seen_by_a_concurrent_reader() {
+        use std::io::Read as _;
+
+        let root = tmp_vault("atomic-replace");
+        let target = root.join(".slc/index.json");
+        let temp_dir = root.join(".git/slc-write-tmp");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"old-complete-value").unwrap();
+        let mut existing_reader = std::fs::File::open(&target).unwrap();
+
+        atomic_replace(&temp_dir, &target, b"new-complete-value").unwrap();
+
+        let mut old_value = Vec::new();
+        existing_reader.read_to_end(&mut old_value).unwrap();
+        assert_eq!(old_value, b"old-complete-value");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-complete-value");
+        assert_eq!(std::fs::read_dir(&temp_dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_git_index_lock_is_quarantined_but_fresh_lock_is_preserved() {
+        let root = tmp_vault("git-lock-recovery");
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let lock = git_dir.join("index.lock");
+        std::fs::write(&lock, b"stale evidence").unwrap();
+        let modified = std::fs::metadata(&lock).unwrap().modified().unwrap();
+
+        assert!(quarantine_stale_git_index_lock(
+            &root,
+            modified + GIT_INDEX_LOCK_STALE_AFTER - Duration::from_secs(1),
+        )
+        .unwrap()
+        .is_none());
+        assert!(lock.exists());
+
+        let quarantined = quarantine_stale_git_index_lock(
+            &root,
+            modified + GIT_INDEX_LOCK_STALE_AFTER + Duration::from_secs(1),
+        )
+        .unwrap()
+        .expect("stale lock must be quarantined");
+        assert!(!lock.exists());
+        assert_eq!(std::fs::read(quarantined).unwrap(), b"stale evidence");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn coalesced_git_worker_repeats_only_for_writes_during_a_snapshot() {
+        let dirty = AtomicBool::new(true);
+        let worker_active = AtomicBool::new(true);
+
+        assert!(finish_git_commit_worker(&dirty, &worker_active));
+        assert!(!dirty.load(Ordering::Acquire));
+        assert!(worker_active.load(Ordering::Acquire));
+
+        assert!(!finish_git_commit_worker(&dirty, &worker_active));
+        assert!(!worker_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn parses_git_loose_object_summary_for_maintenance_thresholds() {
+        let summary = "count: 2148\nsize: 574904\nin-pack: 2891\nsize-pack: 160460\n";
+        assert_eq!(parse_git_count_objects(summary), Some((2148, 574904)));
+        assert_eq!(parse_git_count_objects("count: nope\nsize: 1\n"), None);
+    }
 }
