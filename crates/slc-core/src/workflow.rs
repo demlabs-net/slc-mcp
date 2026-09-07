@@ -16,7 +16,7 @@ use crate::tasks::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 
 const TASK_EVENTS: &str = "task_events_v1";
@@ -363,11 +363,66 @@ impl SlcEngine {
         owns_document || is_participant || global_coordinator || scoped_operator
     }
 
+    async fn active_task_descends_from(
+        &self,
+        seat_id: &str,
+        ancestor_task_id: &str,
+    ) -> SlcResult<bool> {
+        let principal = self.workflow_principal(seat_id);
+        let Some(active) = self.task_get_active(seat_id).await? else {
+            return Ok(false);
+        };
+        if active.assignee.as_deref() != Some(principal.as_str()) {
+            return Ok(false);
+        }
+
+        let mut current = active.parent_task_id;
+        let mut visited = HashSet::new();
+        for _ in 0..64 {
+            let Some(task_id) = current else {
+                return Ok(false);
+            };
+            if task_id == ancestor_task_id {
+                return Ok(true);
+            }
+            if !visited.insert(task_id.clone()) {
+                return Ok(false);
+            }
+            let Some(doc) = self.store().kb_get(&task_id).await? else {
+                return Ok(false);
+            };
+            if doc.category != DocumentCategory::Task || !is_workflow_task(&doc) {
+                return Ok(false);
+            }
+            current = workflow_string(&doc, "parent_task_id");
+        }
+        Ok(false)
+    }
+
     async fn workflow_task_document(&self, seat_id: &str, task_id: &str) -> SlcResult<Document> {
         let doc = task_document(self.store().kb_get(task_id).await?, task_id)?;
         if !self.task_access_allowed(seat_id, &doc) {
             return Err(SlcError::PermissionDenied(format!(
                 "principal {} cannot access task {task_id}",
+                self.workflow_principal(seat_id)
+            )));
+        }
+        Ok(doc)
+    }
+
+    async fn workflow_read_task_document(
+        &self,
+        seat_id: &str,
+        task_id: &str,
+    ) -> SlcResult<Document> {
+        let doc = task_document(self.store().kb_get(task_id).await?, task_id)?;
+        if !self.task_access_allowed(seat_id, &doc)
+            && !self
+                .active_task_descends_from(seat_id, task_id)
+                .await?
+        {
+            return Err(SlcError::PermissionDenied(format!(
+                "principal {} cannot read task {task_id}",
                 self.workflow_principal(seat_id)
             )));
         }
@@ -1050,7 +1105,7 @@ impl SlcEngine {
     }
 
     pub async fn workflow_get_task(&self, seat_id: &str, task_id: &str) -> SlcResult<TaskInfo> {
-        let doc = self.workflow_task_document(seat_id, task_id).await?;
+        let doc = self.workflow_read_task_document(seat_id, task_id).await?;
         Ok(doc_to_task(&doc))
     }
 
@@ -1621,7 +1676,7 @@ impl SlcEngine {
         task_id: &str,
         limit: usize,
     ) -> SlcResult<Vec<TaskEvent>> {
-        self.workflow_task_document(seat_id, task_id).await?;
+        self.workflow_read_task_document(seat_id, task_id).await?;
         let mut events = self
             .store()
             .list_records(TASK_EVENTS)
@@ -1643,7 +1698,7 @@ mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteStore;
     use crate::{MockLlm, SlcConfig, StorageBackend};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn engine() -> SlcEngine {
@@ -1719,6 +1774,12 @@ mod tests {
                 .is_none(),
             "assignment queues work but must not steal the assignee's active context"
         );
+        assert!(matches!(
+            engine
+                .workflow_get_task("seat-junior", &parent.task_id)
+                .await,
+            Err(SlcError::PermissionDenied(_))
+        ));
 
         let (started, _) = engine
             .workflow_start_task("seat-junior", &child.task_id, "Starting", Some("start-1"))
@@ -1734,6 +1795,27 @@ mod tests {
                 .task_id,
             child.task_id
         );
+        assert_eq!(
+            engine
+                .workflow_get_task("seat-junior", &parent.task_id)
+                .await
+                .unwrap()
+                .task_id,
+            parent.task_id,
+            "an active child assignee must be able to inspect its ancestor context"
+        );
+        assert!(matches!(
+            engine
+                .workflow_cancel_task(
+                    "seat-junior",
+                    &parent.task_id,
+                    "must remain read-only",
+                    json!({}),
+                    Some("ancestor-cancel-denied"),
+                )
+                .await,
+            Err(SlcError::PermissionDenied(_))
+        ));
         engine
             .workflow_task_message(
                 "seat-junior",
