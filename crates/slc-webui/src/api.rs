@@ -36,6 +36,10 @@ fn bad(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
 }
 
+fn forbidden(msg: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, msg.into())
+}
+
 /// Seat-id: заголовок X-Seat-ID → кука slc_seat → сгенерированный
 /// (при генерации ставим Set-Cookie, чтобы UI держал тот же сид).
 fn resolve_seat(headers: &HeaderMap) -> (String, Option<String>) {
@@ -329,6 +333,10 @@ pub async fn update_document(
         Err(e) => return internal(e.to_string()).into_response(),
     };
     let mut doc = doc;
+    if !engine.can_write_document(&seat, &doc) {
+        return forbidden(format!("seat {seat} has no right to update document {id}"))
+            .into_response();
+    }
     if let Some(c) = body.get("content").and_then(|v| v.as_str()) {
         doc.content = c.to_string();
         doc.content_hash = slc_core::content_hash(c);
@@ -348,6 +356,12 @@ pub async fn update_document(
         }
     }
     if let Some(s) = body.get("seat_id").and_then(|v| v.as_str()) {
+        if !s.is_empty() && !engine.can_manage_target(&seat, s) {
+            return forbidden(format!(
+                "seat {seat} has no right to assign document {id} to seat {s}"
+            ))
+            .into_response();
+        }
         doc.seat_id = if s.is_empty() { None } else { Some(s.into()) };
     }
     doc.updated_at = chrono::Utc::now();
@@ -369,6 +383,19 @@ pub async fn delete_document(
 ) -> Response {
     let (seat, cookie) = resolve_seat(&headers);
     let engine = &state.engine;
+    if let Ok(Some(doc)) = engine.get_document(&id).await {
+        if !engine.can_write_document(&seat, &doc) {
+            return forbidden(format!("seat {seat} has no right to delete document {id}"))
+                .into_response();
+        }
+        if slc_core::tasks::is_workflow_task(&doc) {
+            return ApiError(
+                StatusCode::CONFLICT,
+                "workflow tasks cannot be deleted; preserve their event history".into(),
+            )
+            .into_response();
+        }
+    }
     let purge = q.get("purge").map(|v| v == "true").unwrap_or(false);
     let res = if purge {
         engine.store().kb_purge(&id).await

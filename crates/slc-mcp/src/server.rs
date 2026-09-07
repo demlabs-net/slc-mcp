@@ -3005,6 +3005,11 @@ async fn call_tool(
                     json!({"code": -32602, "message": format!("document not found: {id}")}),
                 );
             };
+            if !engine.can_write_document(seat_id, &doc) {
+                return Err(json_err(slc_core::SlcError::PermissionDenied(format!(
+                    "seat {seat_id} has no right to update document {id}"
+                ))));
+            }
             if slc_core::tasks::is_workflow_task(&doc) {
                 return Err(json!({
                     "code": -32602,
@@ -3046,6 +3051,11 @@ async fn call_tool(
                 }
             }
             if let Some(s) = args.get("seat_id").and_then(|v| v.as_str()) {
+                if !s.is_empty() && !engine.can_manage_target(seat_id, s) {
+                    return Err(json_err(slc_core::SlcError::PermissionDenied(format!(
+                        "seat {seat_id} has no right to assign document {id} to seat {s}"
+                    ))));
+                }
                 doc.seat_id = if s.is_empty() { None } else { Some(s.into()) };
             }
             doc.updated_at = chrono::Utc::now();
@@ -3060,13 +3070,18 @@ async fn call_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let purge = args.get("purge").and_then(|v| v.as_bool()).unwrap_or(false);
-            if let Some(doc) = engine.store().kb_get(id).await.map_err(json_err)?
-                && slc_core::tasks::is_workflow_task(&doc)
-            {
-                return Err(json!({
-                    "code": -32602,
-                    "message": "workflow tasks cannot be deleted; preserve their event history"
-                }));
+            if let Some(doc) = engine.store().kb_get(id).await.map_err(json_err)? {
+                if !engine.can_write_document(seat_id, &doc) {
+                    return Err(json_err(slc_core::SlcError::PermissionDenied(format!(
+                        "seat {seat_id} has no right to delete document {id}"
+                    ))));
+                }
+                if slc_core::tasks::is_workflow_task(&doc) {
+                    return Err(json!({
+                        "code": -32602,
+                        "message": "workflow tasks cannot be deleted; preserve their event history"
+                    }));
+                }
             }
             let ok = if purge {
                 engine.store().kb_purge(id).await.map_err(json_err)?

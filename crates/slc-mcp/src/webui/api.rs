@@ -35,6 +35,10 @@ fn bad(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
 }
 
+fn forbidden(msg: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, msg.into())
+}
+
 /// Seat-id запроса.
 /// - full-режим (SLC_AUTH=full): Bearer-JWT → пользователь → сид
 ///   `user_<user_id>` (persistent); без валидного токена — 401.
@@ -437,6 +441,10 @@ pub async fn update_document(
         Err(e) => return internal(e.to_string()).into_response(),
     };
     let mut doc = doc;
+    if !engine.can_write_document(&seat, &doc) {
+        return forbidden(format!("seat {seat} has no right to update document {id}"))
+            .into_response();
+    }
     if slc_core::tasks::is_workflow_task(&doc) {
         return ApiError(
             StatusCode::CONFLICT,
@@ -472,6 +480,12 @@ pub async fn update_document(
         }
     }
     if let Some(s) = body.get("seat_id").and_then(|v| v.as_str()) {
+        if !s.is_empty() && !engine.can_manage_target(&seat, s) {
+            return forbidden(format!(
+                "seat {seat} has no right to assign document {id} to seat {s}"
+            ))
+            .into_response();
+        }
         doc.seat_id = if s.is_empty() { None } else { Some(s.into()) };
     }
     doc.updated_at = chrono::Utc::now();
@@ -506,6 +520,10 @@ pub async fn delete_document(
                 "workflow tasks cannot be deleted; preserve their event history".into(),
             )
             .into_response();
+        }
+        if !engine.can_write_document(&seat, &d) {
+            return forbidden(format!("seat {seat} has no right to delete document {id}"))
+                .into_response();
         }
     }
     let purge = q.get("purge").map(|v| v == "true").unwrap_or(false);

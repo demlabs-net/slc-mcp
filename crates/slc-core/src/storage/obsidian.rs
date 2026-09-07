@@ -46,6 +46,7 @@ const GIT_COMMIT_DEBOUNCE: Duration = Duration::from_secs(5);
 const GIT_MAINTENANCE_CHECK_INTERVAL: u64 = 16;
 const GIT_MAINTENANCE_LOOSE_OBJECT_LIMIT: u64 = 1024;
 const GIT_MAINTENANCE_LOOSE_KIB_LIMIT: u64 = 128 * 1024;
+const DERIVED_SIDECAR_IGNORE_BLOCK: &str = "# SLC derived caches (rebuilt locally; do not version)\n/.slc/index.json\n/.slc/embeddings.json\n";
 static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static GIT_COMMITS_SINCE_START: AtomicU64 = AtomicU64::new(0);
 // Git's automatic maintenance can intentionally detach a `git` child after
@@ -164,6 +165,34 @@ fn parse_git_count_objects(output: &str) -> Option<(u64, u64)> {
     count.zip(size_kib)
 }
 
+/// Keep rebuildable sidecars out of vault history. `index.json` is rebuilt
+/// from Markdown on every open and embeddings are a local search cache; the
+/// authoritative timers and workflow records remain versioned.
+fn ensure_derived_sidecars_ignored(root: &Path) -> std::io::Result<()> {
+    let path = root.join(".gitignore");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let required = ["/.slc/index.json", "/.slc/embeddings.json"];
+    if required
+        .iter()
+        .all(|entry| existing.lines().any(|line| line.trim() == *entry))
+    {
+        return Ok(());
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    if !updated.is_empty() {
+        updated.push('\n');
+    }
+    updated.push_str(DERIVED_SIDECAR_IGNORE_BLOCK);
+    atomic_replace(&root.join(".git/slc-write-tmp"), &path, updated.as_bytes())
+}
+
 /// Run one coalesced Git snapshot for the vault. This is intentionally invoked
 /// only by the coalesced worker below: the storage write path must never queue
 /// one Git process per document or seat update.
@@ -209,6 +238,21 @@ fn run_vault_git_commit(root: &Path, author: &str) {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     };
+    // Existing vaults may already track the derived caches. Removing them
+    // from the index is non-destructive (`--cached`) and, together with the
+    // managed ignore rules, prevents `git add -A` from reintroducing them.
+    match run(vec![
+        "rm",
+        "--cached",
+        "--ignore-unmatch",
+        "--",
+        ".slc/index.json",
+        ".slc/embeddings.json",
+    ]) {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => failed(&out),
+        Err(error) => tracing::warn!("vault git untrack derived sidecars error: {error}"),
+    }
     match run(vec!["add", "-A"]) {
         Ok(out) if out.status.success() => {
             // A read-only lifecycle call may still persist operational
@@ -525,6 +569,9 @@ impl ObsidianVaultStore {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(root.join(".slc"))?;
         std::fs::create_dir_all(root.join("seats"))?;
+        if auto_git_commit && root.join(".git").is_dir() {
+            ensure_derived_sidecars_ignored(&root)?;
+        }
         let store = ObsidianVaultStore {
             root,
             index: std::sync::Arc::new(Mutex::new(HashMap::new())),
@@ -1828,5 +1875,21 @@ mod tests {
         let summary = "count: 2148\nsize: 574904\nin-pack: 2891\nsize-pack: 160460\n";
         assert_eq!(parse_git_count_objects(summary), Some((2148, 574904)));
         assert_eq!(parse_git_count_objects("count: nope\nsize: 1\n"), None);
+    }
+
+    #[test]
+    fn derived_sidecar_ignore_rules_are_idempotent_and_preserve_existing_rules() {
+        let root = tmp_vault("derived-ignore");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), "core\n").unwrap();
+
+        ensure_derived_sidecars_ignored(&root).unwrap();
+        ensure_derived_sidecars_ignored(&root).unwrap();
+
+        let ignored = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(ignored.lines().any(|line| line == "core"));
+        assert_eq!(ignored.matches("/.slc/index.json").count(), 1);
+        assert_eq!(ignored.matches("/.slc/embeddings.json").count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

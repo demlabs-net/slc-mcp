@@ -1061,6 +1061,15 @@ impl SlcEngine {
                 .is_some_and(|owner| self.can_manage_target(seat_id, owner))
     }
 
+    /// Whether a seat may mutate or delete an existing knowledge document.
+    /// Public visibility is deliberately not write authority.
+    pub fn can_write_document(&self, seat_id: &str, doc: &Document) -> bool {
+        match doc.seat_id.as_deref() {
+            Some(owner) => self.can_manage_target(seat_id, owner),
+            None => self.has_operator_role(seat_id) && self.can_manage_seats(seat_id),
+        }
+    }
+
     /// Проверка права: actor может управлять target_seat (свой сид — всегда).
     pub async fn require_seat_manage(&self, actor: &str, target_seat: &str) -> SlcResult<()> {
         if self.can_manage_target(actor, target_seat) {
@@ -1886,6 +1895,43 @@ mod engine_tests {
         assert!(engine.can_manage_target("boss", "worker"));
         assert!(!engine.can_manage_target("boss", "unrelated"));
         assert!(!engine.can_manage_seats("worker"));
+    }
+
+    #[tokio::test]
+    async fn document_write_authority_is_not_inferred_from_visibility() {
+        use crate::roles::SeatRole;
+
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
+        let config = SlcConfig::default()
+            .with_seat_role("boss", SeatRole::Operator)
+            .with_seat_manage_target("boss", "worker")
+            .with_seat_role("unscoped-operator", SeatRole::Operator);
+        let engine = SlcEngine::with(store, llm, config);
+        let owned = Document::new(
+            "owned",
+            DocumentCategory::Custom,
+            "content",
+            DocMeta::default(),
+            vec![],
+            Some("worker".into()),
+        );
+        let public = Document::new(
+            "public",
+            DocumentCategory::System,
+            "content",
+            DocMeta::default(),
+            vec![],
+            None,
+        );
+
+        assert!(engine.can_write_document("worker", &owned));
+        assert!(engine.can_write_document("boss", &owned));
+        assert!(!engine.can_write_document("other", &owned));
+        assert!(engine.can_write_document("boss", &public));
+        assert!(!engine.can_write_document("worker", &public));
+        assert!(!engine.can_write_document("unscoped-operator", &public));
     }
 
     /// Переименование документа: каскад auto_load/references/вики-ссылок/

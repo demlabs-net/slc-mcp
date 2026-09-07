@@ -99,14 +99,19 @@ write-enabled deploy key from `slc-mcp/secrets/`; secrets and the vault itself
 must never be committed to this source repository. With
 `OBSIDIAN_AUTO_GIT_COMMIT=true`, document and operational sidecar writes are
 committed and pushed automatically. Volatile seat access heartbeats are
-coalesced to avoid a push for every read-only MCP request.
+coalesced to avoid a push for every read-only MCP request. Rebuildable
+`.slc/index.json` and `.slc/embeddings.json` caches are kept locally and
+managed in the vault `.gitignore`; authoritative `.slc/records.json`, timers,
+Markdown documents, task events and seat state remain versioned.
 
 ## Seats and lifecycle
 
 The swarm authenticates with `SLC_MCP_AUTH=legacy_seat_id`. Every role sends
 its unique stable seat in the `X-Seat-ID` header. The manager has the
 `operator` role, but cross-seat access remains fail-closed: a target must also
-be listed explicitly in `SLC_SEAT_MANAGE_ACL`.
+be listed explicitly in `SLC_SEAT_MANAGE_ACL`. Public document visibility is
+not write permission: an existing document can be changed or deleted only by
+its owning seat or an explicitly scoped operator.
 
 Hermes hooks call `update_context` before every model iteration and
 `save_context` afterward. Cron runs and delegated subagents use the same
