@@ -443,21 +443,6 @@ async fn mcp_request(
 ) -> (StatusCode, Json<Value>) {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    // A response to one of our sampling requests (client answered via
-    // POST /messages): resolve the pending channel and reply with nothing.
-    // Runs AFTER authentication (any unauthenticated client who learned a
-    // request_id from SSE must not be able to inject text into the
-    // compression pipeline — that would poison the agent's memory).
-    if method.is_empty() && id.is_some() {
-        if let Some(rid) = id.as_ref().and_then(|v| v.as_str()) {
-            if let Some(tx) = state.sampling.lock().unwrap().remove(rid) {
-                let text = sampling_response_text(&req).unwrap_or_default();
-                let _ = tx.try_send(text);
-                return (StatusCode::OK, Json(json!({})));
-            }
-        }
-    }
-
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
     let engine = state.engine.as_ref();
@@ -488,6 +473,17 @@ async fn mcp_request(
                         json!({"jsonrpc":"2.0","id":id,"error":{"code":-32001,"message":e.to_string()}}),
                     ),
                 );
+            }
+        }
+    }
+
+    // Resolve sampling replies only after authenticating the sender.
+    if method.is_empty() && id.is_some() {
+        if let Some(rid) = id.as_ref().and_then(|v| v.as_str()) {
+            if let Some(tx) = state.sampling.lock().unwrap().remove(rid) {
+                let text = sampling_response_text(&req).unwrap_or_default();
+                let _ = tx.try_send(text);
+                return (StatusCode::OK, Json(json!({})));
             }
         }
     }
@@ -1329,6 +1325,88 @@ global authority. Omit `target_seat` for the caller's own state, and use
 `seat_roles` to inspect the effective role and allowed targets.
 "#;
 
+// Bound inspected links (including duplicates/missing targets), not just loaded
+// documents, so wide graphs and cycles cannot cause unbounded work or queues.
+const CONTEXT_AUTO_LOAD_LINK_LIMIT: usize = 256;
+
+fn context_document_tokens(doc: &Document) -> usize {
+    (doc.document_id.chars().count()
+        + doc.category.as_str().chars().count()
+        + doc.content.chars().count())
+    .div_ceil(slc_core::CHARS_PER_TOKEN)
+    .max(1)
+}
+
+fn context_document_block(doc: &Document) -> Value {
+    json!({"id": doc.document_id, "type": doc.category.as_str(),
+           "name": doc.document_id, "content": doc.content})
+}
+
+struct ContextDependencies {
+    docs: Vec<Value>,
+    omitted: Vec<String>,
+    included: std::collections::HashSet<String>,
+    used_tokens: usize,
+    traversal_limited: bool,
+}
+
+async fn context_dependencies(
+    engine: &SlcEngine,
+    seat_id: &str,
+    active: &Document,
+    budget: usize,
+) -> ContextDependencies {
+    use std::collections::{HashSet, VecDeque};
+    let mut result = ContextDependencies {
+        docs: Vec::new(),
+        omitted: Vec::new(),
+        included: HashSet::from([active.document_id.clone()]),
+        used_tokens: 0,
+        traversal_limited: false,
+    };
+    let mut seen = result.included.clone();
+    let mut queue = VecDeque::new();
+    let mut inspected = 0;
+    let configured_policy = engine.config.principal_policy_documents
+        .get(&engine.workflow_principal(seat_id)).cloned();
+    let active_is_policy = configured_policy.as_deref() == Some(active.document_id.as_str());
+    // FIFO preserves link order. Only the configured policy chain inherits
+    // upstream's trusted-policy access; ordinary dependencies require read ACLs.
+    let mut enqueue = |links: &[String], trusted: bool, queue: &mut VecDeque<(String, bool)>| {
+        for id in links {
+            if inspected == CONTEXT_AUTO_LOAD_LINK_LIMIT {
+                return true;
+            }
+            inspected += 1;
+            if seen.insert(id.clone()) {
+                queue.push_back((id.clone(), trusted || configured_policy.as_deref() == Some(id.as_str())));
+            }
+        }
+        false
+    };
+    result.traversal_limited |= enqueue(&active.auto_load, active_is_policy, &mut queue);
+    while let Some((id, trusted_policy_chain)) = queue.pop_front() {
+        let Ok(Some(doc)) = engine.get_document(&id).await else {
+            continue;
+        };
+        if !trusted_policy_chain && !engine.can_read_document(seat_id, &doc) {
+            continue;
+        }
+        let tokens = context_document_tokens(&doc);
+        if tokens <= budget.saturating_sub(result.used_tokens) {
+            result.used_tokens += tokens;
+            result.included.insert(doc.document_id.clone());
+            result.docs.push(context_document_block(&doc));
+        } else {
+            // Only readable IDs may appear in omission diagnostics.
+            result.omitted.push(doc.document_id.clone());
+        }
+        // A large parent need not exclude a small, useful child.
+        result.traversal_limited |= enqueue(&doc.auto_load, trusted_policy_chain, &mut queue);
+    }
+    result
+}
+
 async fn build_context(
     engine: &SlcEngine,
     seat_id: &str,
@@ -1411,65 +1489,15 @@ async fn build_context(
     let to_tokens = |chars: usize| chars.div_ceil(slc_core::CHARS_PER_TOKEN).max(1);
     let mut used_tokens = 0usize;
 
-    // Blocks in priority order: active document FIRST (never dropped), its
-    // recursive auto_load contract, then focuses, profiles, and base docs.
-    let mut active_block: Option<Value> = None;
-    let mut auto_load_blocks: Vec<Value> = Vec::new();
-    if let Ok(Some(d)) = engine.document_get_active(seat_id).await {
-        let active_document_id = d.document_id.clone();
-        let configured_policy = engine
-            .config
-            .principal_policy_documents
-            .get(&engine.workflow_principal(seat_id))
-            .cloned();
-        let active_is_policy = configured_policy.as_deref() == Some(active_document_id.as_str());
-        used_tokens += to_tokens(
-            d.document_id.chars().count()
-                + d.category.as_str().chars().count()
-                + d.content.chars().count(),
-        );
-        active_block = Some(
-            json!({"id": d.document_id, "type": d.category.as_str(), "name": d.document_id, "content": d.content}),
-        );
-        let mut seen = HashSet::from([active_document_id]);
-        let mut pending = d
-            .auto_load
-            .into_iter()
-            .map(|document_id| {
-                let trusted = active_is_policy
-                    || configured_policy.as_deref() == Some(document_id.as_str());
-                (document_id, trusted)
-            })
-            .collect::<VecDeque<_>>();
-        while let Some((document_id, trusted_policy_chain)) = pending.pop_front() {
-            if seen.len() >= 64 || !seen.insert(document_id.clone()) {
-                continue;
-            }
-            if let Ok(Some(linked)) = engine.get_document(&document_id).await {
-                if !trusted_policy_chain && !engine.can_read_document(seat_id, &linked) {
-                    continue;
-                }
-                used_tokens += to_tokens(
-                    linked.document_id.chars().count()
-                        + linked.category.as_str().chars().count()
-                        + linked.content.chars().count(),
-                );
-                pending.extend(
-                    linked
-                        .auto_load
-                        .iter()
-                        .cloned()
-                        .map(|child| (child, trusted_policy_chain)),
-                );
-                auto_load_blocks.push(json!({
-                    "id": linked.document_id,
-                    "type": linked.category.as_str(),
-                    "name": linked.document_id,
-                    "content": linked.content,
-                }));
-            }
-        }
-    }
+    // Preserve active document and focuses, then prioritize working
+    // dependencies over optional profiles/base docs. Recheck the anchor's
+    // permissions: its ownership may have changed since activation.
+    let active = engine.document_get_active(seat_id).await.ok().flatten()
+        .filter(|d| engine.can_read_document(seat_id, d));
+    let active_block = active.as_ref().map(|d| {
+        used_tokens += context_document_tokens(d);
+        context_document_block(d)
+    });
     let mut focus_block: Option<Value> = None;
     if let Ok(items) = engine.focus_list(seat_id, None).await {
         if !items.is_empty() {
@@ -1478,6 +1506,15 @@ async fn build_context(
                 Some(json!({"id": "active_focuses", "type": "focuses", "count": items.len()}));
         }
     }
+    let dependencies = if let Some(active) = &active {
+        Some(context_dependencies(engine, seat_id, active,
+            limit_tokens.saturating_sub(used_tokens)).await)
+    } else {
+        None
+    };
+    let traversal_limited = dependencies.as_ref().is_some_and(|d| d.traversal_limited);
+    let mut omitted = dependencies.as_ref().map(|d| d.omitted.clone()).unwrap_or_default();
+    used_tokens += dependencies.as_ref().map_or(0, |d| d.used_tokens);
     let mut profile_blocks: Vec<Value> = Vec::new();
     if let Ok(Some((content, _))) = engine.get_seat_profile(seat_id).await {
         used_tokens += to_tokens(content.chars().count());
@@ -1497,7 +1534,13 @@ async fn build_context(
             "core_methodology",
             "core_slc_best_practice",
         ] {
+            if dependencies.as_ref().is_some_and(|d| d.included.contains(base)) {
+                continue;
+            }
             if let Ok(Some(d)) = engine.get_document(base).await {
+                if !engine.can_read_document(seat_id, &d) {
+                    continue;
+                }
                 used_tokens += to_tokens(d.content.chars().count());
                 base_blocks.push(json!({"id": base, "type": "base", "content": d.content}));
             }
@@ -1508,7 +1551,6 @@ async fn build_context(
     // fits — по одному, начиная с наименее важных (последних), чтобы
     // манифест и стандарты остались в контексте даже при жёстком лимите.
     let overflow = |used_tokens: usize| -> bool { used_tokens > limit_tokens };
-    let mut omitted: Vec<String> = Vec::new();
     let mut drop_while_overflow = |blocks: &mut Vec<Value>, omitted: &mut Vec<String>| {
         while overflow(used_tokens) {
             match blocks.pop() {
@@ -1528,14 +1570,16 @@ async fn build_context(
     // Приоритет дропа: профили → base-документы (с наименее важных).
     drop_while_overflow(&mut profile_blocks, &mut omitted);
     drop_while_overflow(&mut base_blocks, &mut omitted);
-    let compressed = !omitted.is_empty();
+    let compressed = !omitted.is_empty() || traversal_limited;
 
     if let Some(b) = active_block {
         docs.push(b);
     }
-    docs.extend(auto_load_blocks);
     if let Some(b) = focus_block {
         docs.push(b);
+    }
+    if let Some(dependencies) = dependencies {
+        docs.extend(dependencies.docs);
     }
     docs.extend(profile_blocks);
     docs.extend(base_blocks);
@@ -1575,6 +1619,9 @@ async fn build_context(
     // Warn the model about the compression (never silent).
     let warning = if compressed || !llm_compressed.is_empty() {
         let mut parts = Vec::new();
+        if traversal_limited {
+            parts.push(format!("auto_load traversal limited to {CONTEXT_AUTO_LOAD_LINK_LIMIT} links"));
+        }
         if !omitted.is_empty() {
             parts.push(format!("whole blocks omitted: {}", omitted.join(", ")));
         }
@@ -3677,6 +3724,108 @@ mod seat_filter_tests {
         let policy = pagination_policy_from_request(&headers);
         assert!(policy.enabled);
         assert_eq!(policy.page_token_limit, Some(350_000));
+    }
+
+    async fn context_test_engine() -> SlcEngine {
+        let store = Arc::new(slc_core::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let engine = SlcEngine::with(store, Arc::new(slc_core::MockLlm::new(vec![])),
+            slc_core::SlcConfig::default());
+        engine.ensure_seat("reader").await.unwrap();
+        engine
+    }
+
+    async fn context_test_doc(engine: &SlcEngine, id: &str, content: &str,
+        owner: Option<&str>, links: &[&str]) -> Document {
+        let mut doc = Document::new(id, DocumentCategory::Custom, content,
+            DocMeta::default(), vec!["test".into()], owner.map(str::to_string));
+        doc.auto_load = links.iter().map(|s| s.to_string()).collect();
+        engine.add_document(&mut doc).await.unwrap();
+        doc
+    }
+
+    async fn test_context(engine: &SlcEngine, limit: usize, summary: &str, base: bool) -> Value {
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        build_context(engine, "reader", summary, &[], &[], &[], base, Some(limit), &events)
+            .await.unwrap()
+    }
+
+    fn context_ids(context: &Value) -> Vec<&str> {
+        context["docs"].as_array().unwrap().iter()
+            .map(|d| d["id"].as_str().unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn context_auto_load_chains_cycles_duplicates_and_base_overlap() {
+        let engine = context_test_engine().await;
+        context_test_doc(&engine, "anchor", "active", None,
+            &["b", "c", "b", "core_slc_manifest"]).await;
+        context_test_doc(&engine, "b", "second", None, &["d", "anchor"]).await;
+        context_test_doc(&engine, "c", "third", Some("reader"), &["d"]).await;
+        context_test_doc(&engine, "d", "fourth", None, &["b"]).await;
+        context_test_doc(&engine, "core_slc_manifest", "manifest", None, &[]).await;
+        engine.document_activate("reader", "anchor").await.unwrap();
+        let updated = test_context(&engine, 10000, "", true).await;
+        assert_eq!(context_ids(&updated), ["anchor", "b", "c", "core_slc_manifest", "d"]);
+        let saved = test_context(&engine, 10000, "checkpoint", true).await;
+        assert_eq!(updated["docs"], saved["docs"]);
+        assert!(updated["save_info"].is_null());
+        assert_eq!(saved["save_info"]["success"], true);
+    }
+
+    #[tokio::test]
+    async fn context_auto_load_missing_private_and_stale_anchor_do_not_leak() {
+        let engine = context_test_engine().await;
+        context_test_doc(&engine, "anchor", "active", None, &["missing", "private", "own"]).await;
+        context_test_doc(&engine, "private", "SECRET_CONTENT", Some("other"), &["hidden_child"]).await;
+        context_test_doc(&engine, "hidden_child", "SECRET_DESCENDANT", None, &[]).await;
+        context_test_doc(&engine, "own", "readable", Some("reader"), &[]).await;
+        context_test_doc(&engine, "core_slc_manifest", "SECRET_BASE", Some("other"), &[]).await;
+        engine.document_activate("reader", "anchor").await.unwrap();
+        let context = test_context(&engine, 10000, "", true).await;
+        assert_eq!(context_ids(&context), ["anchor", "own"]);
+        let text = context.to_string();
+        for secret in ["SECRET", "private", "missing", "hidden_child"] {
+            assert!(!text.contains(secret));
+        }
+        // Simulate a pointer whose target became private after activation.
+        engine.store().set_seat_active_document("reader", Some("private")).await.unwrap();
+        let stale = test_context(&engine, 10000, "", true).await;
+        assert!(context_ids(&stale).is_empty());
+        assert!(!stale.to_string().contains("SECRET"));
+    }
+
+    #[tokio::test]
+    async fn context_auto_load_budget_omits_whole_docs_but_keeps_active_and_small_children() {
+        let engine = context_test_engine().await;
+        let active = context_test_doc(&engine, "anchor", "active", None, &["large"]).await;
+        context_test_doc(&engine, "large", &"large".repeat(500), None, &["small"]).await;
+        let small = context_test_doc(&engine, "small", "useful", None, &[]).await;
+        engine.document_activate("reader", "anchor").await.unwrap();
+        let limit = context_document_tokens(&active) + context_document_tokens(&small);
+        let context = test_context(&engine, limit, "", false).await;
+        assert_eq!(context_ids(&context), ["anchor", "small"]);
+        assert_eq!(context["used_tokens"], limit);
+        assert_eq!(context["compressed"], true);
+        assert!(context["warning"].as_str().unwrap().contains("large"));
+        let tiny = test_context(&engine, 1, "", false).await;
+        assert_eq!(context_ids(&tiny), ["anchor"]);
+        assert_eq!(tiny["docs"][0]["content"], active.content);
+    }
+
+    #[tokio::test]
+    async fn context_auto_load_bounds_inspected_links_even_duplicates_and_missing() {
+        let engine = context_test_engine().await;
+        let mut active = context_test_doc(&engine, "anchor", "active", None, &[]).await;
+        context_test_doc(&engine, "beyond_limit", "not loaded", None, &[]).await;
+        for duplicate in [true, false] {
+            active.auto_load = (0..CONTEXT_AUTO_LOAD_LINK_LIMIT)
+                .map(|i| if duplicate { "missing".into() } else { format!("missing_{i}") }).collect();
+            active.auto_load.push("beyond_limit".into());
+            let deps = context_dependencies(&engine, "reader", &active, 10000).await;
+            assert!(deps.traversal_limited);
+            assert!(deps.docs.is_empty());
+            assert!(deps.omitted.is_empty());
+        }
     }
 
     #[tokio::test]

@@ -1742,6 +1742,27 @@ mod engine_tests {
         assert!(out2.len() > 5, "no manual truncation: {out2}");
     }
 
+    #[tokio::test]
+    async fn operator_and_explicit_target_are_both_required() {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
+        let config = SlcConfig::default()
+            .with_seat_role("role-only", roles::SeatRole::Operator)
+            .with_seat_manage_target("acl-only", "worker")
+            .with_seat_role("boss", roles::SeatRole::Operator)
+            .with_seat_manage_target("boss", "worker");
+        let engine = SlcEngine::with(store, llm, config);
+        assert!(!engine.can_manage_target("role-only", "worker"));
+        assert!(!engine.can_manage_target("acl-only", "worker"));
+        assert!(engine.can_manage_target("boss", "worker"));
+        assert!(!engine.can_manage_target("boss", "unlisted"));
+        assert!(engine.can_manage_target("worker", "worker"));
+        assert!(engine.require_seat_manage("role-only", "worker").await.is_err());
+        assert!(engine.require_seat_manage("acl-only", "worker").await.is_err());
+        assert!(engine.require_seat_manage("boss", "worker").await.is_ok());
+    }
+
     /// Роли сидов: operator управляет контекстом другого сида, обычный
     /// сид — нет (SlcError::PermissionDenied).
     #[tokio::test]
