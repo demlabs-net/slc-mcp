@@ -725,6 +725,29 @@ fn tools() -> Vec<Value> {
             },"required":["assignee","name","idempotency_key"]}
         }),
         json!({
+            "name": "assign_portfolio_task",
+            "description": "Manager-only assignment for the leads_mass_redesign conveyor. Portfolio identity is expressed as required top-level fields and SLC writes the canonical structured metadata; use this instead of assign_task for every manager-issued DESIGN, BUILD, TEST, or DEPLOY task in this portfolio.",
+            "inputSchema": {
+                "type":"object",
+                "properties":{
+                    "assignee": {"type":"string","description":"stable workflow principal"},
+                    "name": {"type":"string","minLength":1},
+                    "description": {"type":"string","default":""},
+                    "parent_task_id": {"type":"string"},
+                    "auto_load": {"type":"array","items":{"type":"string"}},
+                    "slug": {"type":"string","minLength":1,"description":"exact canonical slug from the deterministic monitor"},
+                    "stage": {"type":"string","enum":["DESIGN","BUILD","TEST","DEPLOY"]},
+                    "artifact_root": {"type":"string","minLength":1,"description":"absolute /work/shared path"},
+                    "attempt": {"type":"integer","minimum":1},
+                    "artifact_revision": {"type":"string"},
+                    "tester_verdict": {"type":"string"},
+                    "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
+                },
+                "required":["assignee","name","slug","stage","artifact_root","attempt","idempotency_key"],
+                "additionalProperties":false
+            }
+        }),
+        json!({
             "name": "create_task",
             "description": "Create a private task for the current seat. Use assign_task for delegated/shared workflow work.",
             "inputSchema": {"type":"object","properties":{
@@ -2188,6 +2211,93 @@ async fn call_tool(
                 "wake_recommended": wake_recommended,
             })
         }
+        "assign_portfolio_task" => {
+            let actor = engine.workflow_principal(seat_id);
+            if actor != "manager" {
+                return Err(json_err(slc_core::SlcError::PermissionDenied(
+                    "assign_portfolio_task is restricted to the manager principal".into(),
+                )));
+            }
+            let assignee = args.get("assignee").and_then(Value::as_str).unwrap_or("");
+            let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+            let description = args
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let parent_task_id = args
+                .get("parent_task_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let auto_load = str_array(args, "auto_load");
+            let mut metadata = json!({
+                "pipeline": "leads_mass_redesign",
+                "slug": args.get("slug").and_then(Value::as_str).unwrap_or(""),
+                "stage": args.get("stage").and_then(Value::as_str).unwrap_or(""),
+                "artifact_root": args.get("artifact_root").and_then(Value::as_str).unwrap_or(""),
+                "attempt": args.get("attempt").and_then(Value::as_u64).unwrap_or(0),
+            });
+            if let Some(value) = args
+                .get("artifact_revision")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                metadata["artifact_revision"] = json!(value);
+            }
+            if let Some(value) = args
+                .get("tester_verdict")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                metadata["tester_verdict"] = json!(value);
+            }
+            let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
+            let task = engine
+                .workflow_assign_task(
+                    seat_id,
+                    assignee,
+                    name,
+                    description,
+                    parent_task_id,
+                    Some("leads_mass_redesign"),
+                    &auto_load,
+                    &metadata,
+                    idempotency_key,
+                )
+                .await
+                .map_err(json_err)?;
+            let queue = engine
+                .workflow_reconcile_task_queue(seat_id, assignee)
+                .await
+                .map_err(json_err)?;
+            let wake_recommended = task.queue_state.as_deref()
+                == Some(slc_core::workflow::QUEUE_STATE_READY)
+                && queue.ready_task_id.as_deref() == Some(task.task_id.as_str());
+            let delivery = wake_recommended.then(|| {
+                workflow_delivery(
+                    Some(assignee),
+                    &task.task_id,
+                    task.queue_ready_event_id.as_deref(),
+                    "ready",
+                )
+            });
+            if let Some(target_seat) = engine.workflow_seat(assignee) {
+                let _ = events.send(json!({
+                    "type": "task_assigned",
+                    "seat_id": target_seat,
+                    "task_id": task.task_id,
+                    "issuer": task.issuer,
+                    "assignee": task.assignee,
+                    "queue_state": task.queue_state,
+                }));
+            }
+            json!({
+                "success": true,
+                "task": task,
+                "queue": queue,
+                "delivery": delivery,
+                "wake_recommended": wake_recommended,
+            })
+        }
         "create_task" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let description = args
@@ -3605,6 +3715,80 @@ mod seat_filter_tests {
                 .unwrap()
                 .contains("never send an empty object")
         );
+    }
+
+    #[tokio::test]
+    async fn manager_portfolio_assignment_builds_canonical_metadata_from_required_fields() {
+        use slc_core::storage::sqlite::SqliteStore;
+        use slc_core::{MockLlm, SlcConfig, StorageBackend};
+        use std::collections::{HashMap, HashSet};
+
+        let portfolio = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "assign_portfolio_task")
+            .expect("assign_portfolio_task tool");
+        let required = portfolio["inputSchema"]["required"]
+            .as_array()
+            .expect("required fields");
+        for field in [
+            "assignee",
+            "name",
+            "slug",
+            "stage",
+            "artifact_root",
+            "attempt",
+            "idempotency_key",
+        ] {
+            assert!(required.iter().any(|value| value == field), "{field}");
+        }
+
+        let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
+        let config = SlcConfig {
+            principal_seats: HashMap::from([
+                ("manager".into(), "seat-manager".into()),
+                ("worker".into(), "seat-worker".into()),
+            ]),
+            task_assign_acl: HashMap::from([("manager".into(), HashSet::from(["worker".into()]))]),
+            ..Default::default()
+        };
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let policy = PaginationPolicy {
+            enabled: false,
+            page_token_limit: None,
+            context_token_limit: None,
+        };
+        let assigned = call_tool(
+            &engine,
+            "seat-manager",
+            "assign_portfolio_task",
+            &json!({
+                "assignee":"worker",
+                "name":"bounded build",
+                "slug":"exact-slug",
+                "stage":"BUILD",
+                "artifact_root":"/work/shared/leads-mass-redesign/exact-slug/layout",
+                "attempt":2,
+                "artifact_revision":"rev-2",
+                "idempotency_key":"portfolio-assign-1"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let assigned: Value =
+            serde_json::from_str(assigned["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(assigned["task"]["project_id"], "leads_mass_redesign");
+        assert_eq!(
+            assigned["task"]["metadata"]["pipeline"],
+            "leads_mass_redesign"
+        );
+        assert_eq!(assigned["task"]["metadata"]["slug"], "exact-slug");
+        assert_eq!(assigned["task"]["metadata"]["stage"], "BUILD");
+        assert_eq!(assigned["task"]["metadata"]["attempt"], 2);
+        assert_eq!(assigned["task"]["metadata"]["artifact_revision"], "rev-2");
     }
 
     #[test]
