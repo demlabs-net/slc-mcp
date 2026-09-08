@@ -194,6 +194,46 @@ fn validate_manager_portfolio_metadata(
     Ok(())
 }
 
+fn inherit_parent_portfolio_metadata(
+    parent: &Document,
+    child_metadata: &mut Map<String, Value>,
+) -> SlcResult<()> {
+    let Some(parent_metadata) = parent
+        .metadata
+        .extra
+        .get("workflow_metadata")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    if parent_metadata.get("pipeline").and_then(Value::as_str) != Some(LEADS_PORTFOLIO_PROJECT) {
+        return Ok(());
+    }
+
+    for field in [
+        "pipeline",
+        "slug",
+        "stage",
+        "artifact_root",
+        "attempt",
+        "artifact_revision",
+    ] {
+        let Some(parent_value) = parent_metadata.get(field) else {
+            continue;
+        };
+        if let Some(child_value) = child_metadata.get(field) {
+            if child_value != parent_value {
+                return Err(SlcError::InvalidInput(format!(
+                    "child metadata.{field} must match its portfolio parent"
+                )));
+            }
+        } else {
+            child_metadata.insert(field.into(), parent_value.clone());
+        }
+    }
+    Ok(())
+}
+
 fn idempotency_key(actor: &str, supplied: &str) -> String {
     content_hash(&format!("{actor}\0{supplied}"))
 }
@@ -916,7 +956,7 @@ impl SlcEngine {
         })?;
         self.seats.ensure_seat(&target_seat).await?;
         let clean_name = clean_required(name, "name", 500)?;
-        let caller_metadata = metadata
+        let mut caller_metadata = metadata
             .as_object()
             .cloned()
             .ok_or_else(|| SlcError::InvalidInput("metadata must be a JSON object".into()))?;
@@ -1066,6 +1106,9 @@ impl SlcEngine {
         } else {
             None
         };
+        if let Some(parent) = parent.as_ref() {
+            inherit_parent_portfolio_metadata(parent, &mut caller_metadata)?;
+        }
         let root_task_id = parent.as_ref().map(|doc| {
             workflow_string(doc, "root_task_id").unwrap_or_else(|| doc.document_id.clone())
         });
@@ -1818,6 +1861,68 @@ mod tests {
             .unwrap();
 
         assert_eq!(task.metadata["slug"], "valid-identity");
+    }
+
+    #[tokio::test]
+    async fn portfolio_child_inherits_parent_identity() {
+        let engine = engine();
+        let parent = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "senior",
+                "Build inherited identity",
+                "Parent owns the exact portfolio slug",
+                None,
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &json!({
+                    "pipeline": LEADS_PORTFOLIO_PROJECT,
+                    "slug": "inherited-identity",
+                    "stage": "BUILD",
+                    "artifact_root": "/work/shared/leads-mass-redesign/inherited-identity/layout",
+                    "attempt": 1,
+                    "artifact_revision": "abc123",
+                }),
+                Some("portfolio-parent-inheritance"),
+            )
+            .await
+            .unwrap();
+
+        let child = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Patch one inherited component",
+                "Bounded child work",
+                Some(&parent.task_id),
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &json!({"component":"services"}),
+                Some("portfolio-child-inheritance"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(child.metadata["slug"], "inherited-identity");
+        assert_eq!(child.metadata["stage"], "BUILD");
+        assert_eq!(child.metadata["artifact_revision"], "abc123");
+        assert_eq!(child.metadata["component"], "services");
+
+        let error = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Patch wrong portfolio slug",
+                "This must not escape the parent scope",
+                Some(&parent.task_id),
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &json!({"slug":"different-slug"}),
+                Some("portfolio-child-mismatch"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("must match its portfolio parent"));
     }
 
     #[tokio::test]
