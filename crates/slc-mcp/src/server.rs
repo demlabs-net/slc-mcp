@@ -3972,6 +3972,13 @@ mod seat_filter_tests {
                 "assignee":"worker",
                 "name":"portfolio build",
                 "project_id":"leads_mass_redesign",
+                "metadata":{
+                    "pipeline":"leads_mass_redesign",
+                    "slug":"portfolio-build",
+                    "stage":"BUILD",
+                    "artifact_root":"/work/shared/leads-mass-redesign/portfolio-build/layout",
+                    "attempt":1
+                },
                 "idempotency_key":"assign-portfolio"
             }),
             &events,

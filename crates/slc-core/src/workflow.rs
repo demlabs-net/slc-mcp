@@ -23,6 +23,7 @@ const TASK_EVENTS: &str = "task_events_v1";
 const TASK_EVENT_IDEMPOTENCY: &str = "task_event_idempotency_v1";
 const TASK_ASSIGN_IDEMPOTENCY: &str = "task_assign_idempotency_v1";
 const MAX_ASSIGNEE_QUEUE_DEPTH: usize = 5_000;
+const LEADS_PORTFOLIO_PROJECT: &str = "leads_mass_redesign";
 
 pub const QUEUE_STATE_QUEUED: &str = "queued";
 pub const QUEUE_STATE_READY: &str = "ready";
@@ -141,6 +142,56 @@ fn clean_required(value: &str, field: &str, max_chars: usize) -> SlcResult<Strin
         )));
     }
     Ok(value.to_string())
+}
+
+fn validate_manager_portfolio_metadata(
+    actor: &str,
+    project_id: Option<&str>,
+    metadata: &Map<String, Value>,
+) -> SlcResult<()> {
+    if actor != "manager" || project_id != Some(LEADS_PORTFOLIO_PROJECT) {
+        return Ok(());
+    }
+
+    for field in ["pipeline", "slug", "stage", "artifact_root"] {
+        if metadata
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(SlcError::InvalidInput(format!(
+                "manager-issued {LEADS_PORTFOLIO_PROJECT} tasks require non-empty metadata.{field}"
+            )));
+        }
+    }
+    if metadata.get("pipeline").and_then(Value::as_str) != Some(LEADS_PORTFOLIO_PROJECT) {
+        return Err(SlcError::InvalidInput(format!(
+            "metadata.pipeline must equal {LEADS_PORTFOLIO_PROJECT}"
+        )));
+    }
+    if !matches!(
+        metadata.get("stage").and_then(Value::as_str),
+        Some("DESIGN" | "BUILD" | "TEST" | "DEPLOY")
+    ) {
+        return Err(SlcError::InvalidInput(
+            "metadata.stage must be DESIGN, BUILD, TEST, or DEPLOY".into(),
+        ));
+    }
+    if metadata.get("attempt").and_then(Value::as_u64).unwrap_or(0) < 1 {
+        return Err(SlcError::InvalidInput(
+            "manager-issued leads_mass_redesign tasks require metadata.attempt >= 1".into(),
+        ));
+    }
+    if !metadata
+        .get("artifact_root")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.starts_with('/'))
+    {
+        return Err(SlcError::InvalidInput(
+            "metadata.artifact_root must be an absolute path".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn idempotency_key(actor: &str, supplied: &str) -> String {
@@ -869,6 +920,7 @@ impl SlcEngine {
             .as_object()
             .cloned()
             .ok_or_else(|| SlcError::InvalidInput("metadata must be a JSON object".into()))?;
+        validate_manager_portfolio_metadata(&actor, project_id, &caller_metadata)?;
 
         let fingerprint = content_hash(&serde_json::to_string(&json!({
             "issuer": actor,
@@ -1721,6 +1773,51 @@ mod tests {
             ..Default::default()
         };
         SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config)
+    }
+
+    #[tokio::test]
+    async fn manager_portfolio_assignment_requires_structured_identity() {
+        let engine = engine();
+        let error = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "senior",
+                "Build missing identity",
+                "Identity exists only in prose",
+                None,
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &json!({}),
+                Some("missing-portfolio-identity"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SlcError::InvalidInput(_)));
+        assert!(error.to_string().contains("metadata.pipeline"));
+
+        let task = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "senior",
+                "Build valid identity",
+                "Structured identity is authoritative",
+                None,
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &json!({
+                    "pipeline": LEADS_PORTFOLIO_PROJECT,
+                    "slug": "valid-identity",
+                    "stage": "BUILD",
+                    "artifact_root": "/work/shared/leads-mass-redesign/valid-identity/layout",
+                    "attempt": 1,
+                }),
+                Some("valid-portfolio-identity"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(task.metadata["slug"], "valid-identity");
     }
 
     #[tokio::test]
