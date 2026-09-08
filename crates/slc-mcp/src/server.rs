@@ -748,6 +748,11 @@ fn tools() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "portfolio_index",
+            "description": "Manager-only compact scheduler index for leads_mass_redesign. Returns exact workflow status counts and every manager-owned historical root grouped by (slug, stage), including max_attempt and whether any root is BLOCKED. Deterministic monitors must follow all pagination pages and use max_attempt + 1 instead of guessing an attempt.",
+            "inputSchema": {"type":"object","properties":{},"required":[],"additionalProperties":false}
+        }),
+        json!({
             "name": "create_task",
             "description": "Create a private task for the current seat. Use assign_task for delegated/shared workflow work.",
             "inputSchema": {"type":"object","properties":{
@@ -2298,6 +2303,15 @@ async fn call_tool(
                 "wake_recommended": wake_recommended,
             })
         }
+        "portfolio_index" => {
+            let index = engine
+                .workflow_portfolio_index(seat_id)
+                .await
+                .map_err(json_err)?;
+            serde_json::to_value(index).map_err(|error| {
+                json!({"code": -32603, "message": format!("portfolio index serialization failed: {error}")})
+            })?
+        }
         "create_task" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let description = args
@@ -3741,6 +3755,11 @@ mod seat_filter_tests {
         ] {
             assert!(required.iter().any(|value| value == field), "{field}");
         }
+        assert!(
+            tools()
+                .into_iter()
+                .any(|tool| tool["name"] == "portfolio_index")
+        );
 
         let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
         let config = SlcConfig {

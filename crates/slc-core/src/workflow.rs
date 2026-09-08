@@ -107,6 +107,23 @@ pub struct TaskQueueSnapshot {
     pub entries: Vec<TaskQueueEntry>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PortfolioRootIndexEntry {
+    pub slug: String,
+    pub stage: String,
+    pub max_attempt: u64,
+    pub root_count: usize,
+    pub blocked: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PortfolioIndexSnapshot {
+    pub project_id: String,
+    pub task_count: usize,
+    pub status_counts: BTreeMap<String, usize>,
+    pub roots: Vec<PortfolioRootIndexEntry>,
+}
+
 impl TaskQueueSnapshot {
     pub fn ready_task(&self) -> Option<TaskInfo> {
         self.entries
@@ -1287,6 +1304,109 @@ impl SlcEngine {
         Ok(doc_to_task(&doc))
     }
 
+    /// Return the compact, complete scheduler index for the redesign portfolio.
+    ///
+    /// General task listings intentionally carry descriptions and evidence and
+    /// are therefore paginated by the MCP transport. The deterministic
+    /// conveyor only needs status totals plus the immutable root identity
+    /// history used to choose the next attempt and suppress blocked slugs.
+    pub async fn workflow_portfolio_index(
+        &self,
+        seat_id: &str,
+    ) -> SlcResult<PortfolioIndexSnapshot> {
+        if self.workflow_principal(seat_id) != "manager" {
+            return Err(SlcError::PermissionDenied(
+                "portfolio_index is restricted to the manager principal".into(),
+            ));
+        }
+        let docs = self
+            .store()
+            .kb_find(
+                &DocFilter {
+                    category: Some(DocumentCategory::Task),
+                    extra_strings: BTreeMap::from([(
+                        "project".to_string(),
+                        LEADS_PORTFOLIO_PROJECT.to_string(),
+                    )]),
+                    ..Default::default()
+                },
+                &DocSort::by_created(SortDir::Asc),
+                MAX_ASSIGNEE_QUEUE_DEPTH,
+            )
+            .await?;
+        let mut status_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut roots: BTreeMap<(String, String), PortfolioRootIndexEntry> = BTreeMap::new();
+        let mut task_count = 0;
+        for doc in docs {
+            if !is_workflow_task(&doc) {
+                continue;
+            }
+            task_count += 1;
+            let status = workflow_string(&doc, "status")
+                .unwrap_or_else(|| STATUS_PENDING.to_string());
+            *status_counts.entry(status.clone()).or_default() += 1;
+            if workflow_string(&doc, "issuer").as_deref() != Some("manager")
+                || workflow_string(&doc, "parent_task_id").is_some()
+            {
+                continue;
+            }
+            let Some(metadata) = doc
+                .metadata
+                .extra
+                .get("workflow_metadata")
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            if metadata.get("pipeline").and_then(Value::as_str)
+                != Some(LEADS_PORTFOLIO_PROJECT)
+            {
+                continue;
+            }
+            let Some(slug) = metadata
+                .get("slug")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(stage) = metadata
+                .get("stage")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let attempt = metadata
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            if attempt == 0 {
+                continue;
+            }
+            let entry = roots
+                .entry((slug.to_string(), stage.to_string()))
+                .or_insert_with(|| PortfolioRootIndexEntry {
+                    slug: slug.to_string(),
+                    stage: stage.to_string(),
+                    max_attempt: 0,
+                    root_count: 0,
+                    blocked: false,
+                });
+            entry.max_attempt = entry.max_attempt.max(attempt);
+            entry.root_count += 1;
+            entry.blocked |= status == STATUS_BLOCKED;
+        }
+        Ok(PortfolioIndexSnapshot {
+            project_id: LEADS_PORTFOLIO_PROJECT.to_string(),
+            task_count,
+            status_counts,
+            roots: roots.into_values().collect(),
+        })
+    }
+
     pub async fn workflow_list_tasks(
         &self,
         seat_id: &str,
@@ -2030,6 +2150,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replacement.metadata["attempt"], 2);
+    }
+
+    #[tokio::test]
+    async fn portfolio_index_reports_blockers_and_next_attempt_inputs() {
+        let engine = engine();
+        let first = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "senior",
+                "First design attempt",
+                "Bounded design",
+                None,
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &json!({
+                    "pipeline": LEADS_PORTFOLIO_PROJECT,
+                    "slug": "indexed-slug",
+                    "stage": "DESIGN",
+                    "artifact_root": "/work/shared/leads-mass-redesign/indexed-slug/design",
+                    "attempt": 1,
+                }),
+                Some("indexed-design-a1"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-senior",
+                &first.task_id,
+                "Checking",
+                Some("indexed-start"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_report_task(
+                "seat-senior",
+                &first.task_id,
+                "blocked",
+                "Missing source authority",
+                json!({}),
+                Some("indexed-blocked"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_assign_task(
+                "seat-manager",
+                "senior",
+                "Second design attempt",
+                "Authorized recovery",
+                None,
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &json!({
+                    "pipeline": LEADS_PORTFOLIO_PROJECT,
+                    "slug": "indexed-slug",
+                    "stage": "DESIGN",
+                    "artifact_root": "/work/shared/leads-mass-redesign/indexed-slug/design",
+                    "attempt": 2,
+                }),
+                Some("indexed-design-a2"),
+            )
+            .await
+            .unwrap();
+
+        let index = engine
+            .workflow_portfolio_index("seat-manager")
+            .await
+            .unwrap();
+        assert_eq!(index.task_count, 2);
+        assert_eq!(index.status_counts[STATUS_BLOCKED], 1);
+        assert_eq!(index.status_counts[STATUS_PENDING], 1);
+        assert_eq!(index.roots.len(), 1);
+        assert_eq!(index.roots[0].slug, "indexed-slug");
+        assert_eq!(index.roots[0].stage, "DESIGN");
+        assert_eq!(index.roots[0].max_attempt, 2);
+        assert_eq!(index.roots[0].root_count, 2);
+        assert!(index.roots[0].blocked);
+
+        let denied = engine
+            .workflow_portfolio_index("seat-senior")
+            .await
+            .unwrap_err();
+        assert!(matches!(denied, SlcError::PermissionDenied(_)));
     }
 
     #[tokio::test]
