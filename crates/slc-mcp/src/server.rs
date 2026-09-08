@@ -707,7 +707,20 @@ fn tools() -> Vec<Value> {
                 "parent_task_id": {"type":"string"},
                 "project_id": {"type":"string"},
                 "auto_load": {"type":"array","items":{"type":"string"}},
-                "metadata": {"type":"object"},
+                "metadata": {
+                    "type":"object",
+                    "description":"Structured task identity and evidence. For leads_mass_redesign assignments never send an empty object: include pipeline, exact slug, stage, absolute artifact_root, attempt, and artifact_revision when known; do not move these fields into description prose.",
+                    "properties": {
+                        "pipeline": {"type":"string"},
+                        "slug": {"type":"string"},
+                        "stage": {"type":"string","enum":["DESIGN","BUILD","TEST","DEPLOY"]},
+                        "artifact_root": {"type":"string"},
+                        "attempt": {"type":"integer","minimum":1},
+                        "artifact_revision": {"type":"string"},
+                        "tester_verdict": {"type":"string"}
+                    },
+                    "additionalProperties": true
+                },
                 "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
             },"required":["assignee","name","idempotency_key"]}
         }),
@@ -3572,6 +3585,27 @@ fn ping_result() -> Value {
 mod seat_filter_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn assign_task_advertises_structured_portfolio_metadata() {
+        let assign = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "assign_task")
+            .expect("assign_task tool");
+        let metadata = &assign["inputSchema"]["properties"]["metadata"];
+
+        assert_eq!(metadata["type"], "object");
+        assert_eq!(metadata["additionalProperties"], true);
+        for field in ["pipeline", "slug", "stage", "artifact_root", "attempt"] {
+            assert!(metadata["properties"].get(field).is_some(), "{field}");
+        }
+        assert!(
+            metadata["description"]
+                .as_str()
+                .unwrap()
+                .contains("never send an empty object")
+        );
+    }
 
     #[test]
     fn seat_filter_is_deny_by_default() {
