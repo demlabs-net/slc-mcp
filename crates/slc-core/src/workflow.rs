@@ -985,17 +985,19 @@ impl SlcEngine {
                 .get_record(TASK_ASSIGN_IDEMPOTENCY, key)
                 .await?
             {
-                if existing.get("fingerprint").and_then(Value::as_str) != Some(&fingerprint) {
-                    return Err(SlcError::InvalidInput(
-                        "idempotency_key was already used for a different task assignment".into(),
-                    ));
-                }
                 let task_id = existing
                     .get("task_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
                         SlcError::Storage("task assignment idempotency record is corrupt".into())
                     })?;
+                if existing.get("fingerprint").and_then(Value::as_str) != Some(&fingerprint) {
+                    return Err(SlcError::InvalidInput(
+                        format!(
+                            "idempotency_key already belongs to task {task_id} with different assignment fields; retry the exact original request or use a new logical task attempt and key"
+                        ),
+                    ));
+                }
                 // Idempotency survives terminal closure. Terminal tasks are no
                 // longer present in the runnable FIFO, but replaying the
                 // original assignment must still return the original task
@@ -1108,6 +1110,87 @@ impl SlcEngine {
         };
         if let Some(parent) = parent.as_ref() {
             inherit_parent_portfolio_metadata(parent, &mut caller_metadata)?;
+        }
+        // A manager-owned portfolio root is identified by its structured
+        // pipeline/slug/stage/attempt tuple, not by its generated document ID
+        // or caller-selected idempotency key. Without this guard a model could
+        // work around an idempotency collision by changing the task name/key
+        // and create a second historical attempt for the same site stage.
+        // Senior-owned component children deliberately share their parent's
+        // tuple and are therefore excluded by actor/parent checks.
+        if actor == "manager"
+            && project_id == Some(LEADS_PORTFOLIO_PROJECT)
+            && parent_task_id.is_none()
+        {
+            let requested_slug = caller_metadata
+                .get("slug")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let requested_stage = caller_metadata
+                .get("stage")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let requested_attempt = caller_metadata
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let portfolio_tasks = self
+                .store()
+                .kb_find(
+                    &DocFilter {
+                        category: Some(DocumentCategory::Task),
+                        extra_strings: BTreeMap::from([(
+                            "project".to_string(),
+                            LEADS_PORTFOLIO_PROJECT.to_string(),
+                        )]),
+                        ..Default::default()
+                    },
+                    &DocSort::by_created(SortDir::Asc),
+                    MAX_ASSIGNEE_QUEUE_DEPTH,
+                )
+                .await?;
+            let mut max_attempt = 0;
+            let mut existing_identity: Option<&Document> = None;
+            for doc in &portfolio_tasks {
+                if !is_workflow_task(doc)
+                    || workflow_string(doc, "issuer").as_deref() != Some("manager")
+                    || workflow_string(doc, "parent_task_id").is_some()
+                {
+                    continue;
+                }
+                let Some(metadata) = doc
+                    .metadata
+                    .extra
+                    .get("workflow_metadata")
+                    .and_then(Value::as_object)
+                else {
+                    continue;
+                };
+                if metadata.get("pipeline").and_then(Value::as_str)
+                    != Some(LEADS_PORTFOLIO_PROJECT)
+                    || metadata.get("slug").and_then(Value::as_str) != Some(requested_slug)
+                    || metadata.get("stage").and_then(Value::as_str) != Some(requested_stage)
+                {
+                    continue;
+                }
+                let attempt = metadata
+                    .get("attempt")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                max_attempt = max_attempt.max(attempt);
+                if attempt == requested_attempt {
+                    existing_identity = Some(doc);
+                }
+            }
+            if let Some(existing) = existing_identity {
+                let status = workflow_string(existing, "status")
+                    .unwrap_or_else(|| STATUS_PENDING.to_string());
+                return Err(SlcError::InvalidInput(format!(
+                    "portfolio identity slug={requested_slug}, stage={requested_stage}, attempt={requested_attempt} already belongs to task {} (status {status}); inspect that task and either replay its exact original assignment or create a genuine replacement root with attempt {} and a new key",
+                    existing.document_id,
+                    max_attempt.saturating_add(1),
+                )));
+            }
         }
         let root_task_id = parent.as_ref().map(|doc| {
             workflow_string(doc, "root_task_id").unwrap_or_else(|| doc.document_id.clone())
@@ -1861,6 +1944,92 @@ mod tests {
             .unwrap();
 
         assert_eq!(task.metadata["slug"], "valid-identity");
+    }
+
+    #[tokio::test]
+    async fn manager_portfolio_root_identity_cannot_be_recreated_with_a_new_key() {
+        let engine = engine();
+        let metadata = json!({
+            "pipeline": LEADS_PORTFOLIO_PROJECT,
+            "slug": "unique-root",
+            "stage": "DESIGN",
+            "artifact_root": "/work/shared/leads-mass-redesign/unique-root",
+            "attempt": 1,
+        });
+        let first = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "senior",
+                "Design unique root",
+                "First assignment",
+                None,
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &metadata,
+                Some("unique-root-original"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-senior",
+                &first.task_id,
+                "Starting",
+                Some("unique-root-start"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_report_task(
+                "seat-senior",
+                &first.task_id,
+                "completed",
+                "Design gate recorded",
+                json!({}),
+                Some("unique-root-report"),
+            )
+            .await
+            .unwrap();
+
+        let error = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "junior",
+                "Renamed design root",
+                "Trying another assignee and idempotency key",
+                None,
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &metadata,
+                Some("unique-root-bypass"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already belongs to task"));
+        assert!(error.to_string().contains(&first.task_id));
+        assert!(error.to_string().contains("attempt 2"));
+
+        let replacement = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "junior",
+                "Design unique root retry",
+                "A genuine replacement root",
+                None,
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &json!({
+                    "pipeline": LEADS_PORTFOLIO_PROJECT,
+                    "slug": "unique-root",
+                    "stage": "DESIGN",
+                    "artifact_root": "/work/shared/leads-mass-redesign/unique-root",
+                    "attempt": 2,
+                }),
+                Some("unique-root-attempt-2"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replacement.metadata["attempt"], 2);
     }
 
     #[tokio::test]

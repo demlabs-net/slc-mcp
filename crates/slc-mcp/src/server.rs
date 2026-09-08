@@ -726,7 +726,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "assign_portfolio_task",
-            "description": "Manager-only assignment for the leads_mass_redesign conveyor. Portfolio identity is expressed as required top-level fields and SLC writes the canonical structured metadata; use this instead of assign_task for every manager-issued DESIGN, BUILD, TEST, or DEPLOY task in this portfolio.",
+            "description": "Manager-only assignment for the leads_mass_redesign conveyor. Portfolio identity is expressed as required top-level fields and SLC writes the canonical structured metadata; use this instead of assign_task for every manager-issued DESIGN, BUILD, TEST, or DEPLOY task in this portfolio. Each historical root (slug, stage, attempt) is unique even after terminal state: inspect the existing task named by a collision and never bypass it by changing name, assignee, or idempotency key; only a genuine replacement uses the reported next attempt as a new root.",
             "inputSchema": {
                 "type":"object",
                 "properties":{
