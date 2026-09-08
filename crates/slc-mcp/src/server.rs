@@ -2540,7 +2540,16 @@ async fn call_tool(
                 .require_seat_manage(seat_id, target)
                 .await
                 .map_err(json_err)?;
-            match engine.task_get_active(target).await.map_err(json_err)? {
+            let active = engine.task_get_active(target).await.map_err(json_err)?;
+            let active = if let Some(task) = active {
+                match engine.get_document(&task.task_id).await.map_err(json_err)? {
+                    Some(doc) if engine.can_read_document(seat_id, &doc) => Some(task),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match active {
                 Some(t) => {
                     json!({"success": true, "has_active_task": true, "target_seat": target, "task_id": t.task_id, "name": t.name, "description": t.description, "status": t.status, "project_id": t.project_id})
                 }
@@ -2595,7 +2604,8 @@ async fn call_tool(
                 .require_seat_manage(seat_id, target)
                 .await
                 .map_err(json_err)?;
-            match engine.document_get_active(target).await.map_err(json_err)? {
+            match engine.document_get_active(target).await.map_err(json_err)?
+                .filter(|doc| engine.can_read_document(seat_id, doc)) {
                 Some(d) => {
                     json!({"success": true, "has_active_document": true, "target_seat": target, "document_id": d.document_id, "category": d.category.as_str(), "content": d.content, "tags": d.tags})
                 }

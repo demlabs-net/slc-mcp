@@ -1343,12 +1343,18 @@ impl SlcEngine {
         let Some(id) = self.store.get_seat_active_document(seat_id).await? else {
             return Ok(None);
         };
-        self.get_document(&id).await
+        Ok(self.get_document(&id).await?.filter(|doc| self.can_read_document(seat_id, doc)))
     }
 
     pub async fn task_get_active(&self, seat_id: &str) -> SlcResult<Option<tasks::TaskInfo>> {
         let m = tasks::WorkItemManager::new(self.store.clone());
-        m.get_active_task(seat_id).await
+        let Some(task) = m.get_active_task(seat_id).await? else {
+            return Ok(None);
+        };
+        match self.get_document(&task.task_id).await? {
+            Some(doc) if self.can_read_document(seat_id, &doc) => Ok(Some(task)),
+            _ => Ok(None),
+        }
     }
 
     pub async fn project_create(
@@ -1740,6 +1746,28 @@ mod engine_tests {
             .await
             .unwrap();
         assert!(out2.len() > 5, "no manual truncation: {out2}");
+    }
+
+    #[tokio::test]
+    async fn active_anchors_do_not_disclose_foreign_private_documents() {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
+        let engine = SlcEngine::with(store, llm, SlcConfig::default());
+        engine.ensure_seat("reader").await.unwrap();
+        engine.ensure_seat("owner").await.unwrap();
+        for (id, owner, visible) in [("private", Some("owner"), false), ("own", Some("reader"), true), ("public", None, true)] {
+            let mut doc = Document::new(id, DocumentCategory::Custom, "content", DocMeta::default(), vec![], owner.map(str::to_string));
+            engine.add_document(&mut doc).await.unwrap();
+            // Simulate an old pointer written before activation ACL enforcement.
+            engine.seats.set_active_document("reader", Some(id)).await.unwrap();
+            assert_eq!(engine.document_get_active("reader").await.unwrap().is_some(), visible, "{id}");
+        }
+        let task = engine.task_create("owner", "private task", "private content", None, &[], &json!({})).await.unwrap();
+        engine.seats.set_active_document("reader", None).await.unwrap();
+        engine.seats.set_active_task("reader", Some(&task.task_id), None).await.unwrap();
+        assert!(engine.task_get_active("reader").await.unwrap().is_none());
+        assert!(engine.document_get_active("reader").await.unwrap().is_none());
     }
 
     #[tokio::test]
