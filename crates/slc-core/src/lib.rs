@@ -925,6 +925,23 @@ impl SlcEngine {
         m.get_task(seat_id, task_id).await
     }
 
+    /// Update a task with full manager semantics.
+    ///
+    /// Authorization: the caller may update its own (or public) tasks, or —
+    /// as a manager (`operator` role with an explicit `SLC_SEAT_MANAGE_ACL`
+    /// target) — tasks of every managed seat. A genuinely unknown id is an
+    /// explicit [`SlcError::NotFound`]; an existing task of a non-managed seat
+    /// is an explicit [`SlcError::PermissionDenied`] (never a fake
+    /// "not found").
+    ///
+    /// Workflow tasks (see [`crate::tasks::is_workflow_task`]) stay
+    /// append-only for their participants and owners — those keep the legacy
+    /// `InvalidInput` guidance (use `task_message`/`report_task`/…). Only a
+    /// manager of the task owner seat may edit them: the edit is persisted
+    /// canonically through the workflow event store
+    /// ([`Self::workflow_update_task`]) which appends a durable
+    /// `update` audit event and refreshes the projection — never a silent
+    /// no-op and never a rewrite behind the event stream.
     pub async fn task_update(
         &self,
         seat_id: &str,
@@ -936,10 +953,52 @@ impl SlcEngine {
         auto_load: Option<&[String]>,
         status: Option<&str>,
         metadata: Option<&serde_json::Value>,
-    ) -> SlcResult<Option<tasks::TaskInfo>> {
+    ) -> SlcResult<tasks::TaskInfo> {
+        let Some(doc) = self.get_document(task_id).await? else {
+            return Err(SlcError::NotFound(format!("task not found: {task_id}")));
+        };
+        if doc.category != DocumentCategory::Task {
+            return Err(SlcError::NotFound(format!("task not found: {task_id}")));
+        }
+        let actor_owns = doc.is_kb_visible(seat_id);
+        let actor_manages = doc
+            .seat_id
+            .as_deref()
+            .filter(|owner| *owner != seat_id)
+            .is_some_and(|owner| self.can_manage_target(seat_id, owner));
+        if !actor_owns && !actor_manages {
+            return Err(SlcError::PermissionDenied(format!(
+                "task {task_id} belongs to another seat; only its owner or a manager (operator role with an SLC_SEAT_MANAGE_ACL target for that seat) may update it"
+            )));
+        }
+        if tasks::is_workflow_task(&doc) {
+            // The owner/participant stays on the append-only contract.
+            if !actor_manages {
+                return Err(SlcError::InvalidInput(
+                    "workflow tasks are append-only; use task_message, report_task, or cancel_task"
+                        .into(),
+                ));
+            }
+            return self
+                .workflow_update_task(
+                    seat_id,
+                    task_id,
+                    name,
+                    description,
+                    description_patch,
+                    project_id,
+                    auto_load,
+                    status,
+                    metadata,
+                )
+                .await;
+        }
         let m = tasks::WorkItemManager::new(self.store.clone());
+        // Plain (non-workflow) task: the document owner is the effective CRUD
+        // seat (public tasks are edited as their acting seat).
+        let effective_seat = doc.seat_id.clone().unwrap_or_else(|| seat_id.to_string());
         m.update_task(
-            seat_id,
+            &effective_seat,
             task_id,
             name,
             description,
@@ -949,12 +1008,40 @@ impl SlcEngine {
             status,
             metadata,
         )
-        .await
+        .await?
+        .ok_or_else(|| SlcError::NotFound(format!("task not found: {task_id}")))
     }
 
+    /// Delete a task with full manager semantics: the owner (or public task)
+    /// deletes its own plain tasks; a manager deletes plain tasks of every
+    /// managed seat. An unknown id is an idempotent `Ok(false)`; an existing
+    /// task of a non-managed seat is an explicit
+    /// [`SlcError::PermissionDenied`]. Workflow tasks are never deletable —
+    /// their event history is preserved ([`SlcError::InvalidInput`]).
     pub async fn task_delete(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
-        let m = tasks::WorkItemManager::new(self.store.clone());
-        m.delete_task(seat_id, task_id).await
+        let Some(doc) = self.get_document(task_id).await? else {
+            return Ok(false);
+        };
+        if doc.category != DocumentCategory::Task {
+            return Ok(false);
+        }
+        let actor_owns = doc.is_kb_visible(seat_id);
+        let actor_manages = doc
+            .seat_id
+            .as_deref()
+            .filter(|owner| *owner != seat_id)
+            .is_some_and(|owner| self.can_manage_target(seat_id, owner));
+        if !actor_owns && !actor_manages {
+            return Err(SlcError::PermissionDenied(format!(
+                "task {task_id} belongs to another seat; only its owner or a manager (operator role with an SLC_SEAT_MANAGE_ACL target for that seat) may delete it"
+            )));
+        }
+        if tasks::is_workflow_task(&doc) {
+            return Err(SlcError::InvalidInput(
+                "workflow tasks cannot be deleted; preserve their event history".into(),
+            ));
+        }
+        self.store().kb_purge(task_id).await
     }
 
     pub async fn task_list(
@@ -1721,7 +1808,7 @@ pub unsafe extern "C" fn slc_free_string(ptr: *mut std::os::raw::c_char) {
 #[cfg(test)]
 mod engine_tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[tokio::test]
     async fn summarize_text_uses_llm_and_falls_back() {
@@ -1935,6 +2022,384 @@ mod engine_tests {
         assert!(engine.can_manage_target("boss", "worker"));
         assert!(!engine.can_manage_target("boss", "unrelated"));
         assert!(!engine.can_manage_seats("worker"));
+    }
+
+    /// Менеджер (operator + SLC_SEAT_MANAGE_ACL) обновляет workflow-задачу
+    /// контактора в IN_WORK: правка персистится каноническим маршрутом через
+    /// workflow-хранилище (durable update-событие) и переживает перезагрузку.
+    #[tokio::test]
+    async fn manager_updates_workflow_task_of_managed_seat_with_durable_event() {
+        use crate::roles::SeatRole;
+        use crate::tasks::STATUS_ACTIVE;
+        use crate::workflow::{QUEUE_STATE_RUNNING, TaskEventKind};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let store: Arc<dyn StorageBackend> =
+            Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let config = SlcConfig::default()
+            .with_seat_role("seat-manager", SeatRole::Operator)
+            .with_seat_manage_target("seat-manager", "seat-contactor")
+            .with_seat_manage_target("seat-manager", "seat-analyst");
+        let mut config = config;
+        config.principal_seats = HashMap::from([
+            ("manager".into(), "seat-manager".into()),
+            ("contactor".into(), "seat-contactor".into()),
+            ("analyst".into(), "seat-analyst".into()),
+        ]);
+        config.task_assign_acl = HashMap::from([("manager".into(), HashSet::from(["*".into()]))]);
+        let engine = SlcEngine::with(store.clone(), Arc::new(MockLlm::new(vec![])), config);
+
+        let assigned = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "contactor",
+                "Prepare pitch",
+                "initial body",
+                None,
+                None,
+                &[],
+                &json!({"customer": "acme"}),
+                Some("assign-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(assigned.issuer.as_deref(), Some("manager"));
+        assert_eq!(assigned.assignee.as_deref(), Some("contactor"));
+        engine
+            .workflow_start_task("seat-contactor", &assigned.task_id, "Starting", Some("start-1"))
+            .await
+            .unwrap();
+
+        // Менеджер правит workflow-задачу контактора, пока та IN_WORK:
+        // имя + append-дифф к телу + auto_load + project + metadata.
+        let updated = engine
+            .task_update(
+                "seat-manager",
+                &assigned.task_id,
+                Some("Prepare pitch v2"),
+                None,
+                Some(&json!([{"op":"append","content":"## Правки менеджера\nуточнено"}])),
+                Some(Some("lead_gen")),
+                Some(&["swarm_policy_contactor".to_string()]),
+                Some("IN_WORK"),
+                Some(&json!({"priority": "high"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.name, "Prepare pitch v2");
+        assert!(updated.description.contains("уточнено"));
+        assert_eq!(updated.status, STATUS_ACTIVE);
+        assert_eq!(updated.queue_state.as_deref(), Some(QUEUE_STATE_RUNNING));
+        assert_eq!(updated.project_id.as_deref(), Some("lead_gen"));
+        assert!(updated.auto_load.contains(&"swarm_policy_contactor".to_string()));
+        assert_eq!(updated.metadata["priority"], json!("high"));
+
+        // Перезагрузка: новая engine-инстанция на том же хранилище видит
+        // правку и с сида контактора, и с сида менеджера.
+        let engine2 = SlcEngine::with(store.clone(), Arc::new(MockLlm::new(vec![])), {
+            let mut c = SlcConfig::default()
+                .with_seat_role("seat-manager", SeatRole::Operator)
+                .with_seat_manage_target("seat-manager", "seat-contactor");
+            c.principal_seats = HashMap::from([
+                ("manager".into(), "seat-manager".into()),
+                ("contactor".into(), "seat-contactor".into()),
+            ]);
+            c.task_assign_acl = HashMap::from([("manager".into(), HashSet::from(["*".into()]))]);
+            c
+        });
+        let from_owner = engine2
+            .workflow_get_task("seat-contactor", &assigned.task_id)
+            .await
+            .unwrap();
+        assert_eq!(from_owner.name, "Prepare pitch v2");
+        assert!(from_owner.description.contains("уточнено"));
+        let from_manager = engine2
+            .workflow_get_task("seat-manager", &assigned.task_id)
+            .await
+            .unwrap();
+        assert_eq!(from_manager.name, "Prepare pitch v2");
+        // Тождественность и очередь не тронуты.
+        let raw = store.kb_get(&assigned.task_id).await.unwrap().unwrap();
+        assert_eq!(
+            raw.metadata.extra.get("workflow_version").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            raw.metadata.extra.get("queue_state").and_then(Value::as_str),
+            Some(QUEUE_STATE_RUNNING)
+        );
+        assert!(raw.content.contains("уточнено"));
+
+        // Аудит: durable update-событие с полями изменений.
+        let events = engine2
+            .workflow_task_events("seat-manager", &assigned.task_id, 50)
+            .await
+            .unwrap();
+        let update_event = events
+            .iter()
+            .find(|event| event.kind == TaskEventKind::Update)
+            .expect("manager update must append a durable update event");
+        assert_eq!(update_event.actor, "manager");
+        assert!(update_event.message.contains("updated by manager"));
+        let fields = update_event.metadata["fields_changed"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for field in ["name", "description", "auto_load", "project_id", "metadata"] {
+            assert!(fields.contains(&field), "fields_changed must include {field}: {fields:?}");
+        }
+
+        // Статус workflow-задачи событиями не переписывается — явная ошибка.
+        let status_err = engine
+            .task_update(
+                "seat-manager",
+                &assigned.task_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("COMPLETED"),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(status_err, SlcError::InvalidInput(_)), "{status_err}");
+        assert!(status_err.to_string().contains("event-governed"));
+
+        // Владелец (контактор) остаётся на append-only контракте.
+        let owner_err = engine
+            .task_update(
+                "seat-contactor",
+                &assigned.task_id,
+                Some("hijacked"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(owner_err.to_string().contains("append-only"), "{owner_err}");
+    }
+
+    /// Чужие задачи (обычные и workflow) не обновляются и не удаляются
+    /// не-менеджером: явный PermissionDenied вместо ложного «не найдено».
+    #[tokio::test]
+    async fn non_manager_cannot_update_or_delete_tasks_of_other_seats() {
+        use crate::roles::SeatRole;
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let store: Arc<dyn StorageBackend> =
+            Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let config = SlcConfig::default()
+            .with_seat_role("seat-manager", SeatRole::Operator)
+            .with_seat_manage_target("seat-manager", "seat-contactor")
+            .with_seat_manage_target("seat-manager", "seat-analyst");
+        let mut config = config;
+        config.principal_seats = HashMap::from([
+            ("manager".into(), "seat-manager".into()),
+            ("contactor".into(), "seat-contactor".into()),
+            ("analyst".into(), "seat-analyst".into()),
+        ]);
+        config.task_assign_acl = HashMap::from([("manager".into(), HashSet::from(["*".into()]))]);
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        engine.ensure_seat("seat-outsider").await.unwrap();
+
+        let plain = engine
+            .task_create("seat-contactor", "private plan", "", None, &[], &json!({}))
+            .await
+            .unwrap();
+        let workflow = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "contactor",
+                "Call campaign",
+                "call list",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("deny-assign"),
+            )
+            .await
+            .unwrap();
+
+        // Не-менеджер не обновляет чужую обычную задачу.
+        let err = engine
+            .task_update(
+                "seat-outsider",
+                &plain.task_id,
+                Some("rewritten"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
+        assert!(err.to_string().contains("SLC_SEAT_MANAGE_ACL"));
+        // Аналитик тоже не владеет задачей контактора.
+        assert!(matches!(
+            engine
+                .task_update(
+                    "seat-analyst",
+                    &plain.task_id,
+                    Some("rewritten"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await,
+            Err(SlcError::PermissionDenied(_))
+        ));
+        // Чужую workflow-задачу не удалить…
+        let err = engine.task_delete("seat-outsider", &workflow.task_id).await.unwrap_err();
+        assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
+        // …и не обновить.
+        let err = engine
+            .task_update(
+                "seat-outsider",
+                &workflow.task_id,
+                Some("x"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
+        // Чужую обычную задачу не удалить.
+        let err = engine.task_delete("seat-analyst", &plain.task_id).await.unwrap_err();
+        assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
+        // Владелец свою обычную задачу удаляет.
+        assert!(engine.task_delete("seat-contactor", &plain.task_id).await.unwrap());
+        assert!(engine.get_document(&plain.task_id).await.unwrap().is_none());
+        // Существующая workflow-задача для владельца неудаляема (история событий).
+        let err = engine.task_delete("seat-contactor", &workflow.task_id).await.unwrap_err();
+        assert!(err.to_string().contains("cannot be deleted"), "{err}");
+    }
+
+    /// Менеджер видит/читает/удаляет задачи всех управляемых сидов
+    /// (обычные и workflow, включая IN_WORK); неизвестный id — NotFound,
+    /// workflow-задачи — не удаляются.
+    #[tokio::test]
+    async fn manager_get_list_delete_semantics_cover_all_managed_seats() {
+        use crate::roles::SeatRole;
+        use crate::workflow::TaskListScope;
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let store: Arc<dyn StorageBackend> =
+            Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let config = SlcConfig::default()
+            .with_seat_role("seat-manager", SeatRole::Operator)
+            .with_seat_manage_target("seat-manager", "seat-contactor")
+            .with_seat_manage_target("seat-manager", "seat-analyst");
+        let mut config = config;
+        config.principal_seats = HashMap::from([
+            ("manager".into(), "seat-manager".into()),
+            ("contactor".into(), "seat-contactor".into()),
+            ("analyst".into(), "seat-analyst".into()),
+        ]);
+        config.task_assign_acl = HashMap::from([("manager".into(), HashSet::from(["*".into()]))]);
+        let engine = SlcEngine::with(store.clone(), Arc::new(MockLlm::new(vec![])), config);
+
+        let plain_contactor = engine
+            .task_create("seat-contactor", "contactor todo", "", None, &[], &json!({}))
+            .await
+            .unwrap();
+        let plain_analyst = engine
+            .task_create("seat-analyst", "analyst todo", "", None, &[], &json!({}))
+            .await
+            .unwrap();
+        let workflow = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "contactor",
+                "Cold list",
+                "call them",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("list-assign"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task("seat-contactor", &workflow.task_id, "go", Some("list-start"))
+            .await
+            .unwrap();
+
+        // get: менеджер читает задачи каждого управляемого сида (включая
+        // IN_WORK workflow-задачу), владелец — свою.
+        let via_manager = engine
+            .workflow_get_task("seat-manager", &plain_analyst.task_id)
+            .await
+            .unwrap();
+        assert_eq!(via_manager.task_id, plain_analyst.task_id);
+        let in_work = engine
+            .workflow_get_task("seat-manager", &workflow.task_id)
+            .await
+            .unwrap();
+        assert_eq!(in_work.status, crate::tasks::STATUS_ACTIVE);
+        assert_eq!(in_work.queue_state.as_deref(), Some(crate::workflow::QUEUE_STATE_RUNNING));
+
+        // list (Visible scope): workflow-задачи всех управляемых сидов
+        // (включая IN_WORK) видны менеджеру одним вызовом.
+        let visible = engine
+            .workflow_list_tasks("seat-manager", TaskListScope::Visible, None, None, None, None, 50)
+            .await
+            .unwrap();
+        assert!(
+            visible.iter().any(|t| t.task_id == workflow.task_id),
+            "manager Visible list must include the IN_WORK workflow task: {:?}",
+            visible.iter().map(|t| &t.task_id).collect::<Vec<_>>()
+        );
+        // По-сидовый list покрывает и обычные задачи каждого управляемого
+        // сида (legacy target_seat семантика менеджера).
+        let per_seat_contactor = engine.task_list("seat-contactor", None, None, 50).await.unwrap();
+        let contactor_ids: HashSet<String> =
+            per_seat_contactor.iter().map(|t| t.task_id.clone()).collect();
+        assert!(contactor_ids.contains(&plain_contactor.task_id));
+        assert!(contactor_ids.contains(&workflow.task_id));
+        let per_seat_analyst = engine.task_list("seat-analyst", None, None, 50).await.unwrap();
+        assert!(per_seat_analyst.iter().any(|t| t.task_id == plain_analyst.task_id));
+        // Аутсайдер ничего чужого в Visible не видит.
+        let outsider_visible = engine
+            .workflow_list_tasks("seat-outsider", TaskListScope::Visible, None, None, None, None, 50)
+            .await
+            .unwrap();
+        assert!(outsider_visible.is_empty());
+
+        // delete: менеджер удаляет обычную задачу управляемого сида…
+        assert!(engine.task_delete("seat-manager", &plain_analyst.task_id).await.unwrap());
+        assert!(engine.get_document(&plain_analyst.task_id).await.unwrap().is_none());
+        // …но не workflow-задачу (история событий сохраняется).
+        let err = engine.task_delete("seat-manager", &workflow.task_id).await.unwrap_err();
+        assert!(err.to_string().contains("cannot be deleted"), "{err}");
+        assert!(engine.get_document(&workflow.task_id).await.unwrap().is_some());
+
+        // Неизвестный id — честный NotFound, не «скрытый» ответ.
+        let err = engine
+            .task_update("seat-manager", "task_no_such_id", None, None, None, None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SlcError::NotFound(_)), "{err}");
     }
 
     /// Переименование документа: каскад auto_load/references/вики-ссылок/

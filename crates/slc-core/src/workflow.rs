@@ -11,7 +11,8 @@ use crate::model::{Document, DocumentCategory, content_hash};
 use crate::storage::{DocFilter, DocSort, SortDir};
 use crate::tasks::{
     STATUS_ACTIVE, STATUS_BLOCKED, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED,
-    STATUS_PENDING, TaskInfo, doc_to_task, is_workflow_task, normalize_task_status,
+    STATUS_PENDING, TaskInfo, apply_description_patch, doc_to_task, is_workflow_task,
+    normalize_task_status,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,11 @@ pub enum TaskEventKind {
     Report,
     StatusChanged,
     Transport,
+    /// Authorized manager edit of a workflow task (canonical `update_task`
+    /// route for managed seats). Workflow task content remains append-only for
+    /// its participants; a manager with an explicit manage ACL over the task
+    /// owner seat edits through this durable event, never behind the stream.
+    Update,
 }
 
 impl TaskEventKind {
@@ -53,6 +59,7 @@ impl TaskEventKind {
             Self::Report => "report",
             Self::StatusChanged => "status_changed",
             Self::Transport => "transport",
+            Self::Update => "update",
         }
     }
 }
@@ -1613,6 +1620,208 @@ impl SlcEngine {
         self.touch_task_projection(task_id, &event, None, None)
             .await?;
         Ok(event)
+    }
+
+    /// Canonical manager update of a workflow task.
+    ///
+    /// Workflow task documents are append-only: legacy CRUD refuses to rewrite
+    /// their identity, lineage, queue state, status, or canonical content
+    /// behind the event stream (see [`crate::tasks::is_workflow_task`]). The
+    /// sanctioned exception is a manager — an `operator` seat with an explicit
+    /// `SLC_SEAT_MANAGE_ACL` target covering the task owner seat. This method
+    /// persists such an update through the workflow store: a durable `update`
+    /// event is appended first (actor, changed fields, timestamp — the audit
+    /// trail), then the task projection is refreshed. Nothing requested is
+    /// silently dropped; unknown statuses and unsupported fields are explicit
+    /// errors. Status transitions stay event-governed (`start_task`,
+    /// `report_task`, `cancel_task`) and are refused here whenever the
+    /// requested status differs from the current one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn workflow_update_task(
+        &self,
+        seat_id: &str,
+        task_id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        description_patch: Option<&Value>,
+        project_id: Option<Option<&str>>,
+        auto_load: Option<&[String]>,
+        status: Option<&str>,
+        metadata: Option<&Value>,
+    ) -> SlcResult<TaskInfo> {
+        let _workflow_guard = self.workflow_lock.lock().await;
+        let task_id = clean_required(task_id, "task_id", 500)?;
+        let doc = task_document(self.store().kb_get(&task_id).await?, &task_id)?;
+        if !is_workflow_task(&doc) {
+            return Err(SlcError::InvalidInput(format!(
+                "task {task_id} is not a workflow task; use the regular task update path"
+            )));
+        }
+        let owner = doc.seat_id.clone().ok_or_else(|| {
+            SlcError::InvalidInput(format!("workflow task {task_id} has no owner seat"))
+        })?;
+        let actor = self.workflow_principal(seat_id);
+        // Only a manager of the OWNER seat may route through the event store:
+        // the owner itself (actor seat == owner seat) stays on the append-only
+        // contract and reports through the dedicated event APIs.
+        if owner == seat_id || !self.can_manage_target(seat_id, &owner) {
+            return Err(SlcError::PermissionDenied(format!(
+                "workflow task {task_id} content may only be updated by a manager (operator role with an SLC_SEAT_MANAGE_ACL target) of seat {owner}; participants use task_message, report_task, start_task, or cancel_task"
+            )));
+        }
+
+        let mut doc = doc;
+        let current_status = workflow_string(&doc, "status")
+            .unwrap_or_else(|| STATUS_PENDING.to_string());
+        if let Some(raw) = status {
+            let normalized = normalize_task_status(raw).ok_or_else(|| {
+                SlcError::InvalidInput(format!("unsupported task status: {raw}"))
+            })?;
+            if normalized != current_status {
+                return Err(SlcError::InvalidInput(format!(
+                    "workflow task status is event-governed and cannot be switched from {current_status} to {normalized} through update_task; the assignee reports through report_task, start_task is assignee-only, and cancel_task handles queued/ready tasks"
+                )));
+            }
+        }
+
+        let mut changed_fields: Vec<&'static str> = Vec::new();
+        if let Some(n) = name {
+            if doc
+                .metadata
+                .extra
+                .get("name")
+                .and_then(Value::as_str)
+                != Some(n)
+            {
+                doc.metadata.extra.insert("name".into(), json!(n));
+                changed_fields.push("name");
+            }
+        }
+        if description.is_some() && description_patch.is_some() {
+            return Err(SlcError::InvalidInput(
+                "pass either full-replacement description or diff/description_patch, not both"
+                    .into(),
+            ));
+        }
+        if let Some(d) = description {
+            if doc.content != d {
+                doc.content = d.into();
+                doc.content_hash = content_hash(&doc.content);
+                changed_fields.push("description");
+            }
+        }
+        if let Some(patch) = description_patch {
+            let next =
+                apply_description_patch(&doc.content, patch).map_err(SlcError::InvalidInput)?;
+            if next != doc.content {
+                doc.content = next;
+                doc.content_hash = content_hash(&doc.content);
+                changed_fields.push("description");
+            }
+        }
+        if let Some(al) = auto_load {
+            let al = al.to_vec();
+            if doc.auto_load != al {
+                doc.auto_load = al;
+                changed_fields.push("auto_load");
+            }
+        }
+        if let Some(pid) = project_id {
+            let has_project = doc
+                .metadata
+                .extra
+                .get("project")
+                .and_then(Value::as_str)
+                .is_some()
+                || doc
+                    .metadata
+                    .extra
+                    .get("project_id")
+                    .and_then(Value::as_str)
+                    .is_some();
+            match pid {
+                Some(p) => {
+                    if doc
+                        .metadata
+                        .extra
+                        .get("project")
+                        .and_then(Value::as_str)
+                        != Some(p)
+                    {
+                        doc.metadata.extra.insert("project".into(), json!(p));
+                        doc.metadata.extra.remove("project_id");
+                        changed_fields.push("project_id");
+                    }
+                }
+                None => {
+                    if has_project {
+                        doc.metadata.extra.remove("project");
+                        doc.metadata.extra.remove("project_id");
+                        changed_fields.push("project_id");
+                    }
+                }
+            }
+        }
+        if let Some(obj) = metadata.and_then(Value::as_object) {
+            // Manager-owned structured task data stays isolated in
+            // `workflow_metadata`, away from SLC projection fields.
+            let sub = doc
+                .metadata
+                .extra
+                .entry("workflow_metadata".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            let mut sub_map = match sub {
+                Value::Object(map) => map.clone(),
+                _ => Map::new(),
+            };
+            let mut changed = false;
+            for (key, value) in obj {
+                if sub_map.get(key) != Some(value) {
+                    sub_map.insert(key.clone(), value.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                *sub = Value::Object(sub_map);
+                changed_fields.push("metadata");
+            }
+        }
+        if changed_fields.is_empty() {
+            return Err(SlcError::InvalidInput(format!(
+                "nothing to update for task {task_id}: no requested field differs from the current projection"
+            )));
+        }
+
+        // Durable audit event first — the event stream remains the canonical
+        // record of every authorized manager edit.
+        let assignee = workflow_string(&doc, "assignee");
+        let message = format!(
+            "Task {task_id} updated by {actor}: {}",
+            changed_fields.join(", ")
+        );
+        let event = self
+            .append_task_event(
+                &task_id,
+                TaskEventKind::Update,
+                &actor,
+                assignee.as_deref(),
+                None,
+                &message,
+                json!({
+                    "fields_changed": changed_fields,
+                    "manager_seat": seat_id,
+                }),
+                None,
+            )
+            .await?;
+
+        // Refresh the projection under the same workflow lock so reads
+        // (`get_task`, queue snapshots) see the persisted edit immediately.
+        doc.updated_at = Utc::now();
+        doc.version += 1;
+        self.store().kb_replace(&doc).await?;
+        let task = self.touch_task_projection(&task_id, &event, None, None).await?;
+        Ok(task)
     }
 
     pub async fn workflow_task_events(
