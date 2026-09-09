@@ -17,8 +17,14 @@ use crate::storage::StorageBackend;
 const CORE_DOCS: [(&str, &[&str]); 4] = [
     ("core_slc_manifest", &["manifest", "slc", "system", "core"]),
     ("core_ai_behavior", &["ai", "behavior", "rules", "core"]),
-    ("core_methodology", &["methodology", "process", "workflow", "core"]),
-    ("core_slc_best_practice", &["best-practice", "guide", "patterns", "core"]),
+    (
+        "core_methodology",
+        &["methodology", "process", "workflow", "core"],
+    ),
+    (
+        "core_slc_best_practice",
+        &["best-practice", "guide", "patterns", "core"],
+    ),
 ];
 
 /// Текущая версия сида. bump = перезапись системных core-документов.
@@ -54,10 +60,13 @@ pub async fn ensure_core_documents(store: &dyn StorageBackend) -> SlcResult<usiz
         if up_to_date {
             continue;
         }
-        let Some(content) = embedded_content(id) else { continue };
+        let Some(content) = embedded_content(id) else {
+            continue;
+        };
         let mut meta = DocMeta::default();
         meta.doc_type = Some("core".into());
-        meta.extra.insert("seed_version".into(), serde_json::json!(SEED_VERSION));
+        meta.extra
+            .insert("seed_version".into(), serde_json::json!(SEED_VERSION));
         let doc = Document::new(
             id.to_string(),
             DocumentCategory::Core,
@@ -148,13 +157,26 @@ mod tests {
         let n = ensure_core_documents(store.as_ref()).await.unwrap();
         assert_eq!(n, 4, "v1 docs replaced by the current seed");
         let manifest = store.kb_get("core_slc_manifest").await.unwrap().unwrap();
-        assert!(!manifest.content.contains("V1MARKER"), "v1 content replaced");
+        assert!(
+            !manifest.content.contains("V1MARKER"),
+            "v1 content replaced"
+        );
         assert_eq!(
-            manifest.metadata.extra.get("seed_version").and_then(|v| v.as_i64()),
+            manifest
+                .metadata
+                .extra
+                .get("seed_version")
+                .and_then(|v| v.as_i64()),
             Some(SEED_VERSION)
         );
         // Легаси-документ ушёл в graveyard (мягкое удаление).
-        assert!(store.kb_get("core_reflection_system").await.unwrap().is_none());
+        assert!(
+            store
+                .kb_get("core_reflection_system")
+                .await
+                .unwrap()
+                .is_none()
+        );
         // Повторный прогон — идемпотентен.
         assert_eq!(ensure_core_documents(store.as_ref()).await.unwrap(), 0);
     }

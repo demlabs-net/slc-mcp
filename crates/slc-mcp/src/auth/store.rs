@@ -61,7 +61,10 @@ impl AuthStore {
     fn save_users(&self) -> Result<()> {
         let users = self.users.lock().unwrap();
         let data = serde_json::json!({ "users": &*users });
-        atomic_write(&self.dir.join("users.json"), &serde_json::to_vec_pretty(&data)?)
+        atomic_write(
+            &self.dir.join("users.json"),
+            &serde_json::to_vec_pretty(&data)?,
+        )
     }
 
     pub fn list_users(&self) -> Vec<User> {
@@ -69,15 +72,31 @@ impl AuthStore {
     }
 
     pub fn get_user(&self, user_id: &str) -> Result<Option<User>> {
-        Ok(self.users.lock().unwrap().iter().find(|u| u.user_id == user_id).cloned())
+        Ok(self
+            .users
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|u| u.user_id == user_id)
+            .cloned())
     }
 
     pub fn find_by_username(&self, username: &str) -> Option<User> {
-        self.users.lock().unwrap().iter().find(|u| u.username == username).cloned()
+        self.users
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|u| u.username == username)
+            .cloned()
     }
 
     pub fn find_by_email(&self, email: &str) -> Option<User> {
-        self.users.lock().unwrap().iter().find(|u| u.email == email).cloned()
+        self.users
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|u| u.email == email)
+            .cloned()
     }
 
     pub fn find_by_oauth(&self, provider: &str, oauth_id: &str) -> Option<User> {
@@ -85,7 +104,10 @@ impl AuthStore {
             .lock()
             .unwrap()
             .iter()
-            .find(|u| u.oauth_provider.as_deref() == Some(provider) && u.oauth_id.as_deref() == Some(oauth_id))
+            .find(|u| {
+                u.oauth_provider.as_deref() == Some(provider)
+                    && u.oauth_id.as_deref() == Some(oauth_id)
+            })
             .cloned()
     }
 
@@ -110,7 +132,10 @@ impl AuthStore {
     fn save_rules(&self) -> Result<()> {
         let rules = self.rules.lock().unwrap();
         let data = serde_json::json!({ "rules": &*rules });
-        atomic_write(&self.dir.join("oauth_rules.json"), &serde_json::to_vec_pretty(&data)?)
+        atomic_write(
+            &self.dir.join("oauth_rules.json"),
+            &serde_json::to_vec_pretty(&data)?,
+        )
     }
 
     pub fn list_rules(&self) -> Vec<OAuthAccessRule> {

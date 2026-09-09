@@ -148,7 +148,10 @@ pub fn parse_principal_policy_documents_env() -> HashMap<String, String> {
         Ok(mapping)
             if mapping.iter().all(|(principal, document)| {
                 !principal.trim().is_empty() && !document.trim().is_empty()
-            }) => mapping,
+            }) =>
+        {
+            mapping
+        }
         Ok(_) => {
             tracing::warn!(
                 "SLC_PRINCIPAL_POLICY_DOCUMENTS contains an empty principal or document; ignoring it"

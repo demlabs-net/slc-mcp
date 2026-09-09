@@ -14,10 +14,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration as StdDuration;
-
 
 /// A timer handler — called when the timer fires.
 #[async_trait]
@@ -87,9 +86,8 @@ impl TimerRegistry {
             timer_type,
             interval_seconds,
             last_fired_at: None,
-            next_fire_at: next_fire_at.unwrap_or_else(|| {
-                now + chrono::Duration::seconds(interval_seconds.unwrap_or(0))
-            }),
+            next_fire_at: next_fire_at
+                .unwrap_or_else(|| now + chrono::Duration::seconds(interval_seconds.unwrap_or(0))),
             is_active: true,
             metadata: metadata.as_object().cloned().unwrap_or_default(),
             created_at: now,
@@ -112,7 +110,9 @@ impl TimerRegistry {
             if interval <= 0 {
                 continue;
             }
-            let id = self.register(t, seat_id, Some(interval), None, Value::Null).await?;
+            let id = self
+                .register(t, seat_id, Some(interval), None, Value::Null)
+                .await?;
             created.push(id);
         }
         Ok(created)
@@ -149,7 +149,13 @@ impl TimerRegistry {
 
     /// Cancel all active timers for a seat whose metadata key == value
     /// (e.g. `reminder_id`). Returns the number cancelled.
-    pub async fn cancel_by_metadata(&self, seat_id: &str, timer_type: TimerType, key: &str, value: &str) -> SlcResult<usize> {
+    pub async fn cancel_by_metadata(
+        &self,
+        seat_id: &str,
+        timer_type: TimerType,
+        key: &str,
+        value: &str,
+    ) -> SlcResult<usize> {
         let timers = self.store.active_timers(Some(seat_id)).await?;
         let mut cancelled = 0;
         for timer in timers {
@@ -184,7 +190,9 @@ impl TimerRegistry {
             loop {
                 let now = Utc::now();
                 if timer.next_fire_at > now {
-                    let dur = (timer.next_fire_at - now).to_std().unwrap_or(StdDuration::ZERO);
+                    let dur = (timer.next_fire_at - now)
+                        .to_std()
+                        .unwrap_or(StdDuration::ZERO);
                     tokio::time::sleep(dur).await;
                 }
                 let _ = store.set_timer_fired(&timer.timer_id, Utc::now()).await;
@@ -193,7 +201,11 @@ impl TimerRegistry {
                 let handler = handlers.read().unwrap().get(&timer.timer_type).cloned();
                 if let Some(handler) = handler {
                     if let Err(e) = handler.handle(&timer).await {
-                        tracing::warn!("timer {} ({}) handler error: {e}", timer.timer_id, timer.timer_type.as_str());
+                        tracing::warn!(
+                            "timer {} ({}) handler error: {e}",
+                            timer.timer_id,
+                            timer.timer_type.as_str()
+                        );
                     }
                 }
                 match timer.interval_seconds.filter(|i| *i > 0) {
@@ -247,7 +259,11 @@ pub struct AsyncFnHandler<F> {
 
 impl<F> AsyncFnHandler<F>
 where
-    F: Fn(&PersistedTimer) -> std::pin::Pin<Box<dyn std::future::Future<Output = SlcResult<()>> + Send>> + Send + Sync,
+    F: Fn(
+            &PersistedTimer,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SlcResult<()>> + Send>>
+        + Send
+        + Sync,
 {
     pub fn new(f: F) -> Self {
         AsyncFnHandler { f }
@@ -257,7 +273,11 @@ where
 #[async_trait]
 impl<F> TimerHandler for AsyncFnHandler<F>
 where
-    F: Fn(&PersistedTimer) -> std::pin::Pin<Box<dyn std::future::Future<Output = SlcResult<()>> + Send>> + Send + Sync,
+    F: Fn(
+            &PersistedTimer,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SlcResult<()>> + Send>>
+        + Send
+        + Sync,
 {
     async fn handle(&self, timer: &PersistedTimer) -> SlcResult<()> {
         (self.f)(timer).await
@@ -329,7 +349,10 @@ mod tests {
         assert!(fired.load(Ordering::Relaxed) >= 2, "rescheduled fire");
 
         assert!(registry.cancel(&tid).await.unwrap());
-        assert!(registry.list(Some("seat_t")).await.unwrap().is_empty(), "cancelled → inactive");
+        assert!(
+            registry.list(Some("seat_t")).await.unwrap().is_empty(),
+            "cancelled → inactive"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -349,7 +372,13 @@ mod tests {
             })),
         );
         let _ = registry
-            .register(TimerType::Reminder, "seat_o", None, Some(Utc::now() - chrono::Duration::seconds(1)), Value::Null)
+            .register(
+                TimerType::Reminder,
+                "seat_o",
+                None,
+                Some(Utc::now() - chrono::Duration::seconds(1)),
+                Value::Null,
+            )
             .await
             .unwrap();
         let _ = registry.start().await;

@@ -103,7 +103,10 @@ mod tests {
     #[test]
     fn write_normalization() {
         assert_eq!(normalize_write_mind_type(None).unwrap(), MindType::Shared);
-        assert_eq!(normalize_write_mind_type(Some("critic")).unwrap(), MindType::Critic);
+        assert_eq!(
+            normalize_write_mind_type(Some("critic")).unwrap(),
+            MindType::Critic
+        );
         assert!(normalize_write_mind_type(Some("all")).is_err());
         assert!(normalize_write_mind_type(Some("x")).is_err());
     }

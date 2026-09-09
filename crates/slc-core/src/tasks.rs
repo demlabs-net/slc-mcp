@@ -802,7 +802,11 @@ mod tests {
         let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
         assert_eq!(active.document_id, t.task_id);
 
-        assert!(!m.set_active_task("seat_a", "task_a_expanded").await.unwrap());
+        assert!(
+            !m.set_active_task("seat_a", "task_a_expanded")
+                .await
+                .unwrap()
+        );
         let active = engine.document_get_active("seat_a").await.unwrap().unwrap();
         assert_eq!(active.document_id, t.task_id);
     }

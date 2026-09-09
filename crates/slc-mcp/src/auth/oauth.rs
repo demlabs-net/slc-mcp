@@ -46,7 +46,14 @@ impl YandexOAuth {
         let allowed_users = csv_env("YANDEX_ALLOWED_USERS");
         let allowed_groups = csv_env("YANDEX_ALLOWED_GROUPS");
         let y360 = Yandex360Client::from_env();
-        Self { client_id, client_secret, org_id, allowed_users, allowed_groups, y360 }
+        Self {
+            client_id,
+            client_secret,
+            org_id,
+            allowed_users,
+            allowed_groups,
+            y360,
+        }
     }
 
     pub fn is_configured(&self) -> bool {
@@ -72,7 +79,11 @@ impl YandexOAuth {
         format!("{YANDEX_AUTHORIZE_URL}?{query}")
     }
 
-    pub async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<YandexTokenResponse> {
+    pub async fn exchange_code(
+        &self,
+        code: &str,
+        redirect_uri: &str,
+    ) -> Result<YandexTokenResponse> {
         let mut params = vec![
             ("grant_type", "authorization_code".to_string()),
             ("code", code.to_string()),
@@ -116,15 +127,23 @@ impl YandexOAuth {
     pub fn is_user_allowed(&self, info: &YandexUserInfo) -> bool {
         let login = info.login.clone().unwrap_or_default();
         let email = info.default_email.clone().unwrap_or_default();
-        if self.allowed_users.is_empty() && self.allowed_groups.is_empty() && self.org_id.is_empty() {
+        if self.allowed_users.is_empty() && self.allowed_groups.is_empty() && self.org_id.is_empty()
+        {
             return true;
         }
         if !self.allowed_users.is_empty() {
-            if self.allowed_users.iter().any(|u| *u == login || *u == email) {
+            if self
+                .allowed_users
+                .iter()
+                .any(|u| *u == login || *u == email)
+            {
                 return true;
             }
         }
-        if !self.org_id.is_empty() && self.allowed_users.is_empty() && self.allowed_groups.is_empty() {
+        if !self.org_id.is_empty()
+            && self.allowed_users.is_empty()
+            && self.allowed_groups.is_empty()
+        {
             return true;
         }
         false
@@ -142,8 +161,15 @@ impl YandexOAuth {
             return None;
         }
         let login = info.login.clone().unwrap_or_default().to_lowercase();
-        let email = info.default_email.clone().unwrap_or_default().to_lowercase();
-        let domain = email.rsplit_once('@').map(|(_, d)| d.to_string()).unwrap_or_default();
+        let email = info
+            .default_email
+            .clone()
+            .unwrap_or_default()
+            .to_lowercase();
+        let domain = email
+            .rsplit_once('@')
+            .map(|(_, d)| d.to_string())
+            .unwrap_or_default();
         let y360 = self.y360.as_ref();
         for rule in rules {
             let value = rule.value.to_lowercase();
@@ -157,19 +183,17 @@ impl YandexOAuth {
                 "email" => email == value,
                 "domain" => domain == value,
                 "ya360_org" => match y360 {
-                    Some(c) if c.is_configured() => {
-                        match c.is_user_in_org(&login, &email).await {
-                            Ok(true) => true,
-                            _ => {
-                                tracing::warn!(
-                                    "ya360_org rule: org check failed for {login} — deny"
-                                );
-                                false
-                            }
+                    Some(c) if c.is_configured() => match c.is_user_in_org(&login, &email).await {
+                        Ok(true) => true,
+                        _ => {
+                            tracing::warn!("ya360_org rule: org check failed for {login} — deny");
+                            false
                         }
-                    }
+                    },
                     _ => {
-                        tracing::warn!("ya360_org rule: Y360 не настроен (YANDEX_360_ADMIN_TOKEN + YANDEX_360_ORG_ID)");
+                        tracing::warn!(
+                            "ya360_org rule: Y360 не настроен (YANDEX_360_ADMIN_TOKEN + YANDEX_360_ORG_ID)"
+                        );
                         false
                     }
                 },
@@ -244,7 +268,12 @@ impl Yandex360Client {
         if admin_token.is_empty() && client_id.is_empty() && org_id.is_empty() {
             return None;
         }
-        Some(Self { admin_token, client_id, client_secret, org_id })
+        Some(Self {
+            admin_token,
+            client_id,
+            client_secret,
+            org_id,
+        })
     }
 
     pub fn is_configured(&self) -> bool {
@@ -292,12 +321,27 @@ impl Yandex360Client {
         let mut page = 1;
         loop {
             let data = self
-                .get(&format!("/org/{}/users", self.org_id), &[("page", &page.to_string()), ("perPage", "100")])
+                .get(
+                    &format!("/org/{}/users", self.org_id),
+                    &[("page", &page.to_string()), ("perPage", "100")],
+                )
                 .await?;
-            let users = data.get("users").and_then(|u| u.as_array()).cloned().unwrap_or_default();
+            let users = data
+                .get("users")
+                .and_then(|u| u.as_array())
+                .cloned()
+                .unwrap_or_default();
             for u in &users {
-                let nick = u.get("nickname").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                let mail = u.get("email").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                let nick = u
+                    .get("nickname")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let mail = u
+                    .get("email")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
                 if nick == login_nick || (!email_lower.is_empty() && mail == email_lower) {
                     return Ok(true);
                 }
@@ -320,10 +364,22 @@ impl Yandex360Client {
                 &[],
             )
             .await?;
-        let users = data.get("users").and_then(|u| u.as_array()).cloned().unwrap_or_default();
+        let users = data
+            .get("users")
+            .and_then(|u| u.as_array())
+            .cloned()
+            .unwrap_or_default();
         for u in users {
-            let nick = u.get("nickname").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-            let mail = u.get("email").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let nick = u
+                .get("nickname")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let mail = u
+                .get("email")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
             if nick == login_nick || (!email_lower.is_empty() && mail == email_lower) {
                 return Ok(true);
             }
@@ -335,8 +391,15 @@ impl Yandex360Client {
     #[allow(dead_code)]
     pub async fn list_groups(&self) -> Result<Vec<serde_json::Value>> {
         let data = self
-            .get(&format!("/org/{}/groups", self.org_id), &[("page", "1"), ("perPage", "200")])
+            .get(
+                &format!("/org/{}/groups", self.org_id),
+                &[("page", "1"), ("perPage", "200")],
+            )
             .await?;
-        Ok(data.get("groups").and_then(|g| g.as_array()).cloned().unwrap_or_default())
+        Ok(data
+            .get("groups")
+            .and_then(|g| g.as_array())
+            .cloned()
+            .unwrap_or_default())
     }
 }

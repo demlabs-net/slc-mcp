@@ -9,7 +9,7 @@
 
 use crate::error::SlcResult;
 use crate::llm::LlmClient;
-use crate::model::{content_hash, DocLevel, DocMeta, Document, DocumentCategory};
+use crate::model::{DocLevel, DocMeta, Document, DocumentCategory, content_hash};
 use crate::storage::{DocFilter, DocSort, MetaPatch, SortDir, StorageBackend};
 use chrono::{Duration, Timelike, Utc};
 
@@ -63,7 +63,9 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
     async fn compress_l1_to_l2(&self, seat_id: &str, batch_id: &str) -> SlcResult<usize> {
         let now = Utc::now();
         let yesterday_start = now
-            .with_hour(0).and_then(|d| d.with_minute(0)).and_then(|d| d.with_second(0))
+            .with_hour(0)
+            .and_then(|d| d.with_minute(0))
+            .and_then(|d| d.with_second(0))
             .map(|d| d - Duration::days(1))
             .unwrap_or_else(|| now - Duration::days(1));
         let yesterday_end = yesterday_start + Duration::days(1);
@@ -123,7 +125,11 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
                     document_ids: Some(consumed),
                     ..Default::default()
                 },
-                &MetaPatch { set_archived: Some(true), set_compression_batch_id: Some(batch_id.into()), ..Default::default() },
+                &MetaPatch {
+                    set_archived: Some(true),
+                    set_compression_batch_id: Some(batch_id.into()),
+                    ..Default::default()
+                },
             )
             .await?;
         Ok(l1.len())
@@ -137,7 +143,10 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
             archived: Some(false),
             ..Default::default()
         };
-        let l2 = self.store.episodic_find(&filter, &DocSort::by_created(SortDir::Asc), 100).await?;
+        let l2 = self
+            .store
+            .episodic_find(&filter, &DocSort::by_created(SortDir::Asc), 100)
+            .await?;
         if l2.len() < 7 {
             return Ok(0);
         }
@@ -150,7 +159,11 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
             return Ok(0);
         };
 
-        let week_id = batch[0].metadata.date.clone().unwrap_or_else(|| "unknown".into());
+        let week_id = batch[0]
+            .metadata
+            .date
+            .clone()
+            .unwrap_or_else(|| "unknown".into());
         let mut meta = DocMeta::default();
         meta.doc_type = Some("EPISODIC".into());
         meta.doc_level = Some(DocLevel::L3);
@@ -176,7 +189,11 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
                     document_ids: Some(ids),
                     ..Default::default()
                 },
-                &MetaPatch { set_archived: Some(true), set_compression_batch_id: Some(batch_id.into()), ..Default::default() },
+                &MetaPatch {
+                    set_archived: Some(true),
+                    set_compression_batch_id: Some(batch_id.into()),
+                    ..Default::default()
+                },
             )
             .await?;
         Ok(batch.len())
@@ -190,7 +207,10 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
             archived: Some(false),
             ..Default::default()
         };
-        let l3 = self.store.episodic_find(&filter, &DocSort::by_created(SortDir::Asc), 100).await?;
+        let l3 = self
+            .store
+            .episodic_find(&filter, &DocSort::by_created(SortDir::Asc), 100)
+            .await?;
         if l3.len() < 4 {
             return Ok(0);
         }
@@ -202,7 +222,11 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
         let existing = self
             .store
             .episodic_find(
-                &DocFilter { seat_id: Some(seat_id.into()), doc_type: Some("EPISODIC".into()), ..Default::default() },
+                &DocFilter {
+                    seat_id: Some(seat_id.into()),
+                    doc_type: Some("EPISODIC".into()),
+                    ..Default::default()
+                },
                 &DocSort::default(),
                 100,
             )
@@ -251,7 +275,11 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
                     document_ids: Some(consumed),
                     ..Default::default()
                 },
-                &MetaPatch { set_archived: Some(true), set_compression_batch_id: Some(batch_id.into()), ..Default::default() },
+                &MetaPatch {
+                    set_archived: Some(true),
+                    set_compression_batch_id: Some(batch_id.into()),
+                    ..Default::default()
+                },
             )
             .await?;
         Ok(batch.len())
@@ -300,7 +328,10 @@ impl<S: StorageBackend, L: LlmClient> MemoryConsolidator<S, L> {
         }
 
         let combined: Vec<String> = sources.iter().map(|d| truncate(&d.content, 500)).collect();
-        let prompt = CONSOLIDATION_PROMPT.replace("{summaries}", &truncate(&combined.join("\n\n"), PROMPT_CHARS));
+        let prompt = CONSOLIDATION_PROMPT.replace(
+            "{summaries}",
+            &truncate(&combined.join("\n\n"), PROMPT_CHARS),
+        );
         let Ok(raw) = self.llm.reason_for(seat_id, &prompt).await else {
             return Ok(ConsolidationReport::default());
         };
@@ -324,14 +355,24 @@ impl<S: StorageBackend, L: LlmClient> MemoryConsolidator<S, L> {
             let ids: Vec<String> = sources.iter().map(|d| d.document_id.clone()).collect();
             self.store
                 .episodic_patch_meta(
-                    &DocFilter { seat_id: Some(seat_id.into()), ..Default::default() },
-                    &MetaPatch { set_consolidated: Some(true), ..Default::default() },
+                    &DocFilter {
+                        seat_id: Some(seat_id.into()),
+                        ..Default::default()
+                    },
+                    &MetaPatch {
+                        set_consolidated: Some(true),
+                        ..Default::default()
+                    },
                 )
                 .await?;
             let _ = ids;
         }
 
-        Ok(ConsolidationReport { sources: sources.len(), facts_added: added, facts_total: facts.len() })
+        Ok(ConsolidationReport {
+            sources: sources.len(),
+            facts_added: added,
+            facts_total: facts.len(),
+        })
     }
 
     async fn is_duplicate(&self, fact: &str) -> SlcResult<bool> {
@@ -339,7 +380,10 @@ impl<S: StorageBackend, L: LlmClient> MemoryConsolidator<S, L> {
             Ok(v) => v,
             Err(_) => return Ok(false), // can't check — treat as new
         };
-        let records = self.store.all_embeddings(crate::model::EmbeddingScope::Public, None).await?;
+        let records = self
+            .store
+            .all_embeddings(crate::model::EmbeddingScope::Public, None)
+            .await?;
         for r in records {
             if r.document_id.starts_with("learned_fact_")
                 && r.embedding_dimension == qv.len()
@@ -409,7 +453,9 @@ pub struct ConsolidationReport {
 pub fn parse_facts(raw: &str) -> Vec<String> {
     let start = raw.find('[');
     let end = raw.rfind(']');
-    let (Some(s), Some(e)) = (start, end) else { return Vec::new() };
+    let (Some(s), Some(e)) = (start, end) else {
+        return Vec::new();
+    };
     if e <= s {
         return Vec::new();
     }
@@ -417,7 +463,13 @@ pub fn parse_facts(raw: &str) -> Vec<String> {
         return Vec::new();
     };
     json.as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).take(10).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(String::from)
+                .take(10)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -477,7 +529,10 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         let seat = "seat_t";
         for i in 1..=3 {
-            store.episodic_insert(&l1_doc(seat, i, &format!("worked on task {i}"))).await.unwrap();
+            store
+                .episodic_insert(&l1_doc(seat, i, &format!("worked on task {i}")))
+                .await
+                .unwrap();
         }
         // Scripted summary from the "LLM".
         let llm = MockLlm::new(vec!["- did tasks 1..3".into()]);
@@ -488,7 +543,11 @@ mod tests {
         // L2 daily summary exists; sources archived + batch-marked.
         let l2 = store
             .episodic_find(
-                &DocFilter { seat_id: Some(seat.into()), doc_level: Some(DocLevel::L2), ..Default::default() },
+                &DocFilter {
+                    seat_id: Some(seat.into()),
+                    doc_level: Some(DocLevel::L2),
+                    ..Default::default()
+                },
                 &DocSort::default(),
                 10,
             )
@@ -499,7 +558,11 @@ mod tests {
         assert_eq!(l2[0].metadata.doc_type.as_deref(), Some("EPISODIC"));
 
         let remaining = store
-            .episodic_count(&DocFilter { seat_id: Some(seat.into()), has_compression_batch: Some(false), ..Default::default() })
+            .episodic_count(&DocFilter {
+                seat_id: Some(seat.into()),
+                has_compression_batch: Some(false),
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(remaining, 0, "all L1 sources consumed");
@@ -525,7 +588,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let llm = MockLlm::new(vec!["[\"The team uses Rust for audio\", \"Prefer metal for STT\"]".into()]);
+        let llm = MockLlm::new(vec![
+            "[\"The team uses Rust for audio\", \"Prefer metal for STT\"]".into(),
+        ]);
         let consolidator = MemoryConsolidator::new(store.clone(), llm);
         let report = consolidator.consolidate(seat).await.unwrap();
         assert_eq!(report.facts_added, 2);
@@ -534,23 +599,39 @@ mod tests {
         // Facts are KB docs with LEARNED_FACT type + embeddings.
         let facts = store
             .kb_find(
-                &DocFilter { seat_id: Some(seat.into()), doc_type: Some("LEARNED_FACT".into()), ..Default::default() },
+                &DocFilter {
+                    seat_id: Some(seat.into()),
+                    doc_type: Some("LEARNED_FACT".into()),
+                    ..Default::default()
+                },
                 &DocSort::default(),
                 10,
             )
             .await
             .unwrap();
         assert_eq!(facts.len(), 2);
-        assert!(store.get_embedding(&facts[0].document_id).await.unwrap().is_some());
+        assert!(
+            store
+                .get_embedding(&facts[0].document_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         // Second run: sources marked consolidated → nothing new.
         let report2 = consolidator.consolidate(seat).await.unwrap();
-        assert_eq!(report2.sources, 0, "consolidated flag must prevent re-harvesting");
+        assert_eq!(
+            report2.sources, 0,
+            "consolidated flag must prevent re-harvesting"
+        );
     }
 
     #[test]
     fn parse_facts_handles_plain_and_malformed() {
-        assert_eq!(parse_facts("[\"a\", \"b\"]"), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            parse_facts("[\"a\", \"b\"]"),
+            vec!["a".to_string(), "b".to_string()]
+        );
         assert_eq!(parse_facts("Here: [\"x\"] done"), vec!["x".to_string()]);
         assert_eq!(parse_facts("no array here"), Vec::<String>::new());
         assert_eq!(parse_facts("[]"), Vec::<String>::new());
@@ -564,7 +645,10 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         let seat = "seat_today";
         // One YESTERDAY event (in the window) + one TODAY event (not in it).
-        store.episodic_insert(&l1_doc(seat, 1, "yesterday work")).await.unwrap();
+        store
+            .episodic_insert(&l1_doc(seat, 1, "yesterday work"))
+            .await
+            .unwrap();
         let mut today = l1_doc(seat, 2, "today work");
         today.created_at = Utc::now().with_hour(15).unwrap();
         today.document_id = "evt-today".into();
@@ -578,7 +662,10 @@ mod tests {
         // The today event must STILL be unmarked (available for tomorrow).
         let today_doc = store
             .episodic_find(
-                &DocFilter { document_ids: Some(vec!["evt-today".into()]), ..Default::default() },
+                &DocFilter {
+                    document_ids: Some(vec!["evt-today".into()]),
+                    ..Default::default()
+                },
                 &DocSort::default(),
                 10,
             )
@@ -594,5 +681,4 @@ mod tests {
             today_doc.metadata
         );
     }
-
 }

@@ -9,7 +9,7 @@
 
 use crate::error::{SlcError, SlcResult};
 use crate::model::{Reminder, TimerType};
-use crate::proactivity::{mind_matches, normalize_write_mind_type, MindType};
+use crate::proactivity::{MindType, mind_matches, normalize_write_mind_type};
 use crate::storage::StorageBackend;
 use crate::timer::TimerRegistry;
 use chrono::{DateTime, Utc};
@@ -70,15 +70,26 @@ impl<S: StorageBackend> ReminderManager<S> {
         self.put(&reminder).await?;
 
         let mut meta = serde_json::Map::new();
-        meta.insert("reminder_id".into(), serde_json::Value::String(reminder_id.clone()));
+        meta.insert(
+            "reminder_id".into(),
+            serde_json::Value::String(reminder_id.clone()),
+        );
         self.registry
-            .register(TimerType::Reminder, seat_id, None, Some(remind_at), serde_json::Value::Object(meta))
+            .register(
+                TimerType::Reminder,
+                seat_id,
+                None,
+                Some(remind_at),
+                serde_json::Value::Object(meta),
+            )
             .await?;
         Ok(reminder)
     }
 
     pub async fn cancel(&self, reminder_id: &str, seat_id: Option<&str>) -> SlcResult<bool> {
-        let Some(mut r) = self.get(reminder_id, seat_id).await? else { return Ok(false) };
+        let Some(mut r) = self.get(reminder_id, seat_id).await? else {
+            return Ok(false);
+        };
         if r.status != "pending" {
             return Ok(false);
         }
@@ -90,8 +101,14 @@ impl<S: StorageBackend> ReminderManager<S> {
         Ok(true)
     }
 
-    pub async fn get(&self, reminder_id: &str, seat_id: Option<&str>) -> SlcResult<Option<Reminder>> {
-        let Some(val) = self.store.get_record(COLLECTION, reminder_id).await? else { return Ok(None) };
+    pub async fn get(
+        &self,
+        reminder_id: &str,
+        seat_id: Option<&str>,
+    ) -> SlcResult<Option<Reminder>> {
+        let Some(val) = self.store.get_record(COLLECTION, reminder_id).await? else {
+            return Ok(None);
+        };
         let r: Reminder = serde_json::from_value(val)?;
         if let Some(s) = seat_id {
             if r.seat_id != s {
@@ -101,7 +118,12 @@ impl<S: StorageBackend> ReminderManager<S> {
         Ok(Some(r))
     }
 
-    pub async fn list(&self, seat_id: &str, status: Option<&str>, mind_type: Option<MindType>) -> SlcResult<Vec<Reminder>> {
+    pub async fn list(
+        &self,
+        seat_id: &str,
+        status: Option<&str>,
+        mind_type: Option<MindType>,
+    ) -> SlcResult<Vec<Reminder>> {
         let mut out = Vec::new();
         for (_, val) in self.store.list_records(COLLECTION).await? {
             if let Ok(r) = serde_json::from_value::<Reminder>(val) {
@@ -119,7 +141,9 @@ impl<S: StorageBackend> ReminderManager<S> {
 
     /// Mark a reminder as `fired` (called by the REMINDER timer handler).
     pub async fn mark_fired(&self, reminder_id: &str, seat_id: Option<&str>) -> SlcResult<bool> {
-        let Some(mut r) = self.get(reminder_id, seat_id).await? else { return Ok(false) };
+        let Some(mut r) = self.get(reminder_id, seat_id).await? else {
+            return Ok(false);
+        };
         if r.status != "pending" {
             return Ok(false);
         }
@@ -146,13 +170,20 @@ pub fn parse_remind_at(text: &str) -> SlcResult<DateTime<Utc>> {
         if utc > Utc::now() {
             return Ok(utc);
         }
-        return Err(SlcError::InvalidInput(format!("Time is in the past: {utc}")));
+        return Err(SlcError::InvalidInput(format!(
+            "Time is in the past: {utc}"
+        )));
     }
     // Naive forms (assume UTC, mirror legacy default timezone).
-    for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"] {
-        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(text, fmt)
-            .or_else(|_| chrono::NaiveDate::parse_from_str(text, fmt).map(|d| d.and_hms_opt(0, 0, 0).unwrap()))
-        {
+    for fmt in [
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(text, fmt).or_else(|_| {
+            chrono::NaiveDate::parse_from_str(text, fmt).map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+        }) {
             let dt = naive.and_utc();
             if dt > Utc::now() {
                 return Ok(dt);
@@ -160,7 +191,9 @@ pub fn parse_remind_at(text: &str) -> SlcResult<DateTime<Utc>> {
             return Err(SlcError::InvalidInput(format!("Time is in the past: {dt}")));
         }
     }
-    Err(SlcError::InvalidInput(format!("Cannot parse time: {text:?}")))
+    Err(SlcError::InvalidInput(format!(
+        "Cannot parse time: {text:?}"
+    )))
 }
 
 #[cfg(test)]
@@ -169,8 +202,12 @@ mod tests {
     use crate::storage::sqlite::SqliteStore;
     use chrono::Duration;
 
-    fn manager() -> (ReminderManager<std::sync::Arc<dyn StorageBackend>>, std::sync::Arc<dyn StorageBackend>) {
-        let store: std::sync::Arc<dyn StorageBackend> = std::sync::Arc::new(SqliteStore::in_memory().unwrap());
+    fn manager() -> (
+        ReminderManager<std::sync::Arc<dyn StorageBackend>>,
+        std::sync::Arc<dyn StorageBackend>,
+    ) {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(SqliteStore::in_memory().unwrap());
         let registry = TimerRegistry::new(store.clone());
         (ReminderManager::new(store.clone(), registry), store)
     }
@@ -182,35 +219,80 @@ mod tests {
     #[tokio::test]
     async fn create_list_cancel() {
         let (m, _) = manager();
-        let r = m.create("seat_r", "call dmitriy", future(30), None, None, false, None).await.unwrap();
+        let r = m
+            .create(
+                "seat_r",
+                "call dmitriy",
+                future(30),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
         assert!(r.reminder_id.starts_with("rem_"));
-        assert_eq!(m.list("seat_r", Some("pending"), None).await.unwrap().len(), 1);
+        assert_eq!(
+            m.list("seat_r", Some("pending"), None).await.unwrap().len(),
+            1
+        );
 
         assert!(m.cancel(&r.reminder_id, None).await.unwrap());
-        assert_eq!(m.list("seat_r", Some("pending"), None).await.unwrap().len(), 0);
-        assert_eq!(m.list("seat_r", Some("cancelled"), None).await.unwrap().len(), 1);
+        assert_eq!(
+            m.list("seat_r", Some("pending"), None).await.unwrap().len(),
+            0
+        );
+        assert_eq!(
+            m.list("seat_r", Some("cancelled"), None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn rejects_past_and_limit() {
         let (m, _) = manager();
         let past = Utc::now() - Duration::seconds(10);
-        let err = m.create("seat_x", "in the past", past, None, None, false, None).await.unwrap_err();
+        let err = m
+            .create("seat_x", "in the past", past, None, None, false, None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("past"), "{err}");
 
         for i in 0..MAX_REMINDERS_PER_SEAT {
-            m.create("seat_l", &format!("r{i}"), future(60), None, None, false, None).await.unwrap();
+            m.create(
+                "seat_l",
+                &format!("r{i}"),
+                future(60),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
         }
-        let err = m.create("seat_l", "overflow", future(60), None, None, false, None).await.unwrap_err();
+        let err = m
+            .create("seat_l", "overflow", future(60), None, None, false, None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("limit"), "{err}");
     }
 
     #[tokio::test]
     async fn mark_fired_transitions() {
         let (m, _) = manager();
-        let r = m.create("seat_f", "do it", future(10), None, None, false, None).await.unwrap();
+        let r = m
+            .create("seat_f", "do it", future(10), None, None, false, None)
+            .await
+            .unwrap();
         assert!(m.mark_fired(&r.reminder_id, None).await.unwrap());
-        assert_eq!(m.get(&r.reminder_id, None).await.unwrap().unwrap().status, "fired");
+        assert_eq!(
+            m.get(&r.reminder_id, None).await.unwrap().unwrap().status,
+            "fired"
+        );
         assert!(!m.mark_fired(&r.reminder_id, None).await.unwrap());
     }
 

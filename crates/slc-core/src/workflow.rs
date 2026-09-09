@@ -11,7 +11,8 @@ use crate::model::{Document, DocumentCategory, content_hash};
 use crate::storage::{DocFilter, DocSort, SortDir};
 use crate::tasks::{
     STATUS_ACTIVE, STATUS_BLOCKED, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED,
-    STATUS_PENDING, TaskInfo, doc_to_task, is_workflow_task, normalize_task_status,
+    STATUS_PENDING, TaskInfo, apply_description_patch, doc_to_task, is_workflow_task,
+    normalize_task_status,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,11 @@ pub enum TaskEventKind {
     Report,
     StatusChanged,
     Transport,
+    /// Authorized manager edit of a workflow task (canonical `update_task`
+    /// route for managed seats). Workflow task content remains append-only for
+    /// its participants; a manager with an explicit manage ACL over the task
+    /// owner seat edits through this durable event, never behind the stream.
+    Update,
 }
 
 impl TaskEventKind {
@@ -54,6 +60,7 @@ impl TaskEventKind {
             Self::Report => "report",
             Self::StatusChanged => "status_changed",
             Self::Transport => "transport",
+            Self::Update => "update",
         }
     }
 }
@@ -525,9 +532,7 @@ impl SlcEngine {
     ) -> SlcResult<Document> {
         let doc = task_document(self.store().kb_get(task_id).await?, task_id)?;
         if !self.task_access_allowed(seat_id, &doc)
-            && !self
-                .active_task_descends_from(seat_id, task_id)
-                .await?
+            && !self.active_task_descends_from(seat_id, task_id).await?
         {
             return Err(SlcError::PermissionDenied(format!(
                 "principal {} cannot read task {task_id}",
@@ -546,25 +551,18 @@ impl SlcEngine {
     /// global queue here: callers must have explicitly activated the task (or
     /// have started it already), and a missing pointer remains a clear input
     /// error rather than silently selecting unrelated work.
-    async fn workflow_task_id_or_active(
-        &self,
-        seat_id: &str,
-        task_id: &str,
-    ) -> SlcResult<String> {
+    async fn workflow_task_id_or_active(&self, seat_id: &str, task_id: &str) -> SlcResult<String> {
         let task_id = task_id.trim();
         if !task_id.is_empty() {
             return Ok(task_id.to_string());
         }
 
         let actor = self.workflow_principal(seat_id);
-        let active = self
-            .task_get_active(seat_id)
-            .await?
-            .ok_or_else(|| {
-                SlcError::InvalidInput(
-                    "task_id must not be empty (no active SLC task to resolve)".into(),
-                )
-            })?;
+        let active = self.task_get_active(seat_id).await?.ok_or_else(|| {
+            SlcError::InvalidInput(
+                "task_id must not be empty (no active SLC task to resolve)".into(),
+            )
+        })?;
         if active.assignee.as_deref() != Some(actor.as_str()) {
             return Err(SlcError::PermissionDenied(
                 "the active SLC task is not assigned to the caller".into(),
@@ -642,8 +640,8 @@ impl SlcEngine {
         let incoming_event_at = DateTime::parse_from_rfc3339(&event.created_at).ok();
         let stale_event = same_event
             || current_event_at
-            .zip(incoming_event_at)
-            .is_some_and(|(current, incoming)| current >= incoming);
+                .zip(incoming_event_at)
+                .is_some_and(|(current, incoming)| current >= incoming);
         let mut changed = false;
         if !stale_event {
             doc.metadata
@@ -659,8 +657,8 @@ impl SlcEngine {
         // backend transaction. A retry therefore merges the intended state
         // transition even when a newer message already owns `last_event_*`.
         // Statuses only move forward: PENDING -> IN_WORK -> terminal.
-        let current_status = workflow_string(&doc, "status")
-            .unwrap_or_else(|| STATUS_PENDING.to_string());
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
         let mut resulting_status = current_status.clone();
         if let Some(status) = status {
             let apply_status = current_status != status
@@ -740,10 +738,7 @@ impl SlcEngine {
                 &DocFilter {
                     category: Some(DocumentCategory::Task),
                     seat_id: Some(assignee_seat),
-                    extra_strings: BTreeMap::from([(
-                        "assignee".to_string(),
-                        assignee.to_string(),
-                    )]),
+                    extra_strings: BTreeMap::from([("assignee".to_string(), assignee.to_string())]),
                     extra_strings_not_in: BTreeMap::from([(
                         "status".to_string(),
                         vec![
@@ -779,10 +774,7 @@ impl SlcEngine {
 
     /// Reconcile one principal's FIFO while the caller holds `workflow_lock`.
     /// Exactly one non-terminal task may reserve the lane as ready/running.
-    async fn reconcile_task_queue_locked(
-        &self,
-        assignee: &str,
-    ) -> SlcResult<TaskQueueSnapshot> {
+    async fn reconcile_task_queue_locked(&self, assignee: &str) -> SlcResult<TaskQueueSnapshot> {
         let mut docs = self.assignee_queue_documents(assignee).await?;
         let running = docs
             .iter()
@@ -855,12 +847,8 @@ impl SlcEngine {
                 .await?;
             self.touch_task_projection(&task_id, &event, None, None)
                 .await?;
-            self.set_task_queue_projection(
-                &task_id,
-                QUEUE_STATE_READY,
-                Some(&event.event_id),
-            )
-            .await?;
+            self.set_task_queue_projection(&task_id, QUEUE_STATE_READY, Some(&event.event_id))
+                .await?;
             docs = self.assignee_queue_documents(assignee).await?;
         }
 
@@ -902,11 +890,7 @@ impl SlcEngine {
             .filter(|doc| Some(doc.document_id.as_str()) != reserved_id.as_deref())
         {
             let task = self
-                .set_task_queue_projection(
-                    &doc.document_id,
-                    QUEUE_STATE_QUEUED,
-                    None,
-                )
+                .set_task_queue_projection(&doc.document_id, QUEUE_STATE_QUEUED, None)
                 .await?;
             entries.push(TaskQueueEntry {
                 position: queued_position,
@@ -1009,11 +993,9 @@ impl SlcEngine {
                         SlcError::Storage("task assignment idempotency record is corrupt".into())
                     })?;
                 if existing.get("fingerprint").and_then(Value::as_str) != Some(&fingerprint) {
-                    return Err(SlcError::InvalidInput(
-                        format!(
-                            "idempotency_key already belongs to task {task_id} with different assignment fields; retry the exact original request or use a new logical task attempt and key"
-                        ),
-                    ));
+                    return Err(SlcError::InvalidInput(format!(
+                        "idempotency_key already belongs to task {task_id} with different assignment fields; retry the exact original request or use a new logical task attempt and key"
+                    )));
                 }
                 // Idempotency survives terminal closure. Terminal tasks are no
                 // longer present in the runnable FIFO, but replaying the
@@ -1183,8 +1165,7 @@ impl SlcEngine {
                 else {
                     continue;
                 };
-                if metadata.get("pipeline").and_then(Value::as_str)
-                    != Some(LEADS_PORTFOLIO_PROJECT)
+                if metadata.get("pipeline").and_then(Value::as_str) != Some(LEADS_PORTFOLIO_PROJECT)
                     || metadata.get("slug").and_then(Value::as_str) != Some(requested_slug)
                     || metadata.get("stage").and_then(Value::as_str) != Some(requested_stage)
                 {
@@ -1248,7 +1229,9 @@ impl SlcEngine {
 
         let mut effective_auto_load = auto_load.to_vec();
         if let Some(policy_document) = self.config.principal_policy_documents.get(&assignee)
-            && !effective_auto_load.iter().any(|item| item == policy_document)
+            && !effective_auto_load
+                .iter()
+                .any(|item| item == policy_document)
         {
             effective_auto_load.push(policy_document.clone());
         }
@@ -1342,8 +1325,8 @@ impl SlcEngine {
                 continue;
             }
             task_count += 1;
-            let status = workflow_string(&doc, "status")
-                .unwrap_or_else(|| STATUS_PENDING.to_string());
+            let status =
+                workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
             *status_counts.entry(status.clone()).or_default() += 1;
             if workflow_string(&doc, "issuer").as_deref() != Some("manager")
                 || workflow_string(&doc, "parent_task_id").is_some()
@@ -1358,9 +1341,7 @@ impl SlcEngine {
             else {
                 continue;
             };
-            if metadata.get("pipeline").and_then(Value::as_str)
-                != Some(LEADS_PORTFOLIO_PROJECT)
-            {
+            if metadata.get("pipeline").and_then(Value::as_str) != Some(LEADS_PORTFOLIO_PROJECT) {
                 continue;
             }
             let Some(slug) = metadata
@@ -1429,8 +1410,7 @@ impl SlcEngine {
         {
             return Ok(Vec::new());
         }
-        if matches!(scope, TaskListScope::Issued)
-            && issuer.is_some_and(|value| value != principal)
+        if matches!(scope, TaskListScope::Issued) && issuer.is_some_and(|value| value != principal)
         {
             return Ok(Vec::new());
         }
@@ -1506,8 +1486,8 @@ impl SlcEngine {
                 "only the assignee can start a task".into(),
             ));
         }
-        let current_status = workflow_string(&doc, "status")
-            .unwrap_or_else(|| STATUS_PENDING.to_string());
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
         if is_terminal_status(&current_status) {
             return Err(SlcError::InvalidInput(format!(
                 "terminal task cannot be started again: {current_status}"
@@ -1678,8 +1658,8 @@ impl SlcEngine {
             TaskEventKind::Progress
         };
         let issuer = workflow_string(&doc, "issuer");
-        let current_status = workflow_string(&doc, "status")
-            .unwrap_or_else(|| STATUS_PENDING.to_string());
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
         if is_terminal_status(&current_status) {
             if current_status != status
                 || workflow_string(&doc, "terminal_summary").as_deref() != Some(summary.as_str())
@@ -1837,12 +1817,11 @@ impl SlcEngine {
             &reason,
             &metadata,
         )?;
-        let current_status = workflow_string(&doc, "status")
-            .unwrap_or_else(|| STATUS_PENDING.to_string());
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
         if is_terminal_status(&current_status) {
             if current_status != STATUS_CANCELLED
-                || workflow_string(&doc, "terminal_summary").as_deref()
-                    != Some(reason.as_str())
+                || workflow_string(&doc, "terminal_summary").as_deref() != Some(reason.as_str())
             {
                 return Err(SlcError::InvalidInput(format!(
                     "terminal task cannot transition from {current_status} to {STATUS_CANCELLED}"
@@ -1900,12 +1879,7 @@ impl SlcEngine {
             )
             .await?;
         let mut task = self
-            .touch_task_projection(
-                &task_id,
-                &event,
-                Some(STATUS_CANCELLED),
-                Some(&reason),
-            )
+            .touch_task_projection(&task_id, &event, Some(STATUS_CANCELLED), Some(&reason))
             .await?;
         if task.status != STATUS_CANCELLED {
             return Err(SlcError::Storage(format!(
@@ -1966,6 +1940,197 @@ impl SlcEngine {
         self.touch_task_projection(task_id, &event, None, None)
             .await?;
         Ok(event)
+    }
+
+    /// Canonical manager update of a workflow task.
+    ///
+    /// Workflow task documents are append-only: legacy CRUD refuses to rewrite
+    /// their identity, lineage, queue state, status, or canonical content
+    /// behind the event stream (see [`crate::tasks::is_workflow_task`]). The
+    /// sanctioned exception is a manager — an `operator` seat with an explicit
+    /// `SLC_SEAT_MANAGE_ACL` target covering the task owner seat. This method
+    /// persists such an update through the workflow store: a durable `update`
+    /// event is appended first (actor, changed fields, timestamp — the audit
+    /// trail), then the task projection is refreshed. Nothing requested is
+    /// silently dropped; unknown statuses and unsupported fields are explicit
+    /// errors. Status transitions stay event-governed (`start_task`,
+    /// `report_task`, `cancel_task`) and are refused here whenever the
+    /// requested status differs from the current one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn workflow_update_task(
+        &self,
+        seat_id: &str,
+        task_id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        description_patch: Option<&Value>,
+        project_id: Option<Option<&str>>,
+        auto_load: Option<&[String]>,
+        status: Option<&str>,
+        metadata: Option<&Value>,
+    ) -> SlcResult<TaskInfo> {
+        let _workflow_guard = self.workflow_lock.lock().await;
+        let task_id = clean_required(task_id, "task_id", 500)?;
+        let doc = task_document(self.store().kb_get(&task_id).await?, &task_id)?;
+        if !is_workflow_task(&doc) {
+            return Err(SlcError::InvalidInput(format!(
+                "task {task_id} is not a workflow task; use the regular task update path"
+            )));
+        }
+        let owner = doc.seat_id.clone().ok_or_else(|| {
+            SlcError::InvalidInput(format!("workflow task {task_id} has no owner seat"))
+        })?;
+        let actor = self.workflow_principal(seat_id);
+        // Only a manager of the OWNER seat may route through the event store:
+        // the owner itself (actor seat == owner seat) stays on the append-only
+        // contract and reports through the dedicated event APIs.
+        if owner == seat_id || !self.can_manage_target(seat_id, &owner) {
+            return Err(SlcError::PermissionDenied(format!(
+                "workflow task {task_id} content may only be updated by a manager (operator role with an SLC_SEAT_MANAGE_ACL target) of seat {owner}; participants use task_message, report_task, start_task, or cancel_task"
+            )));
+        }
+
+        let mut doc = doc;
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
+        if let Some(raw) = status {
+            let normalized = normalize_task_status(raw)
+                .ok_or_else(|| SlcError::InvalidInput(format!("unsupported task status: {raw}")))?;
+            if normalized != current_status {
+                return Err(SlcError::InvalidInput(format!(
+                    "workflow task status is event-governed and cannot be switched from {current_status} to {normalized} through update_task; the assignee reports through report_task, start_task is assignee-only, and cancel_task handles queued/ready tasks"
+                )));
+            }
+        }
+
+        let mut changed_fields: Vec<&'static str> = Vec::new();
+        if let Some(n) = name {
+            if doc.metadata.extra.get("name").and_then(Value::as_str) != Some(n) {
+                doc.metadata.extra.insert("name".into(), json!(n));
+                changed_fields.push("name");
+            }
+        }
+        if description.is_some() && description_patch.is_some() {
+            return Err(SlcError::InvalidInput(
+                "pass either full-replacement description or diff/description_patch, not both"
+                    .into(),
+            ));
+        }
+        if let Some(d) = description {
+            if doc.content != d {
+                doc.content = d.into();
+                doc.content_hash = content_hash(&doc.content);
+                changed_fields.push("description");
+            }
+        }
+        if let Some(patch) = description_patch {
+            let next =
+                apply_description_patch(&doc.content, patch).map_err(SlcError::InvalidInput)?;
+            if next != doc.content {
+                doc.content = next;
+                doc.content_hash = content_hash(&doc.content);
+                changed_fields.push("description");
+            }
+        }
+        if let Some(al) = auto_load {
+            let al = al.to_vec();
+            if doc.auto_load != al {
+                doc.auto_load = al;
+                changed_fields.push("auto_load");
+            }
+        }
+        if let Some(pid) = project_id {
+            let has_project = doc
+                .metadata
+                .extra
+                .get("project")
+                .and_then(Value::as_str)
+                .is_some()
+                || doc
+                    .metadata
+                    .extra
+                    .get("project_id")
+                    .and_then(Value::as_str)
+                    .is_some();
+            match pid {
+                Some(p) => {
+                    if doc.metadata.extra.get("project").and_then(Value::as_str) != Some(p) {
+                        doc.metadata.extra.insert("project".into(), json!(p));
+                        doc.metadata.extra.remove("project_id");
+                        changed_fields.push("project_id");
+                    }
+                }
+                None => {
+                    if has_project {
+                        doc.metadata.extra.remove("project");
+                        doc.metadata.extra.remove("project_id");
+                        changed_fields.push("project_id");
+                    }
+                }
+            }
+        }
+        if let Some(obj) = metadata.and_then(Value::as_object) {
+            // Manager-owned structured task data stays isolated in
+            // `workflow_metadata`, away from SLC projection fields.
+            let sub = doc
+                .metadata
+                .extra
+                .entry("workflow_metadata".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            let mut sub_map = match sub {
+                Value::Object(map) => map.clone(),
+                _ => Map::new(),
+            };
+            let mut changed = false;
+            for (key, value) in obj {
+                if sub_map.get(key) != Some(value) {
+                    sub_map.insert(key.clone(), value.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                *sub = Value::Object(sub_map);
+                changed_fields.push("metadata");
+            }
+        }
+        if changed_fields.is_empty() {
+            return Err(SlcError::InvalidInput(format!(
+                "nothing to update for task {task_id}: no requested field differs from the current projection"
+            )));
+        }
+
+        // Durable audit event first — the event stream remains the canonical
+        // record of every authorized manager edit.
+        let assignee = workflow_string(&doc, "assignee");
+        let message = format!(
+            "Task {task_id} updated by {actor}: {}",
+            changed_fields.join(", ")
+        );
+        let event = self
+            .append_task_event(
+                &task_id,
+                TaskEventKind::Update,
+                &actor,
+                assignee.as_deref(),
+                None,
+                &message,
+                json!({
+                    "fields_changed": changed_fields,
+                    "manager_seat": seat_id,
+                }),
+                None,
+            )
+            .await?;
+
+        // Refresh the projection under the same workflow lock so reads
+        // (`get_task`, queue snapshots) see the persisted edit immediately.
+        doc.updated_at = Utc::now();
+        doc.version += 1;
+        self.store().kb_replace(&doc).await?;
+        let task = self
+            .touch_task_projection(&task_id, &event, None, None)
+            .await?;
+        Ok(task)
     }
 
     pub async fn workflow_task_events(
@@ -2296,7 +2461,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("must match its portfolio parent"));
+        assert!(
+            error
+                .to_string()
+                .contains("must match its portfolio parent")
+        );
     }
 
     #[tokio::test]
@@ -2494,7 +2663,13 @@ mod tests {
             .unwrap();
         assert_eq!(reported.task_id, task.task_id);
         assert_eq!(reported.status, STATUS_COMPLETED);
-        assert!(engine.task_get_active("seat-junior").await.unwrap().is_none());
+        assert!(
+            engine
+                .task_get_active("seat-junior")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2619,10 +2794,7 @@ mod tests {
             .unwrap();
         assert_eq!(replay.task_id, first.task_id);
         assert_eq!(replay.status, STATUS_COMPLETED);
-        assert_eq!(
-            replay.queue_state.as_deref(),
-            Some(QUEUE_STATE_TERMINAL)
-        );
+        assert_eq!(replay.queue_state.as_deref(), Some(QUEUE_STATE_TERMINAL));
     }
 
     #[tokio::test]
@@ -2853,7 +3025,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queue.capacity, 1);
-        assert_eq!(queue.ready_task_id.as_deref(), Some(second.task_id.as_str()));
+        assert_eq!(
+            queue.ready_task_id.as_deref(),
+            Some(second.task_id.as_str())
+        );
         assert_eq!(queue.entries.len(), 2);
         assert_eq!(queue.entries[0].position, 0);
         assert_eq!(queue.entries[0].task.task_id, second.task_id);
@@ -2942,7 +3117,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(indexed_replay.queue_state.as_deref(), Some(QUEUE_STATE_READY));
+        assert_eq!(
+            indexed_replay.queue_state.as_deref(),
+            Some(QUEUE_STATE_READY)
+        );
         engine
             .store()
             .delete_record(TASK_ASSIGN_IDEMPOTENCY, &assignment_key)
@@ -3227,7 +3405,10 @@ mod tests {
             .workflow_reconcile_task_queue("seat-senior", "junior")
             .await
             .unwrap();
-        assert_eq!(queue.running_task_id.as_deref(), Some(head.task_id.as_str()));
+        assert_eq!(
+            queue.running_task_id.as_deref(),
+            Some(head.task_id.as_str())
+        );
         assert_eq!(
             queue
                 .entries
@@ -3298,7 +3479,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cancelled_tail.status, STATUS_CANCELLED);
-        assert!(tail_next.is_none(), "cancelling queued work emits no duplicate wake");
+        assert!(
+            tail_next.is_none(),
+            "cancelling queued work emits no duplicate wake"
+        );
 
         let (cancelled_head, event, next) = engine
             .workflow_cancel_task(
@@ -3311,7 +3495,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cancelled_head.status, STATUS_CANCELLED);
-        assert_eq!(cancelled_head.queue_state.as_deref(), Some(QUEUE_STATE_TERMINAL));
+        assert_eq!(
+            cancelled_head.queue_state.as_deref(),
+            Some(QUEUE_STATE_TERMINAL)
+        );
         assert_eq!(next.unwrap().task_id, third.task_id);
 
         let (replayed, replayed_event, replay_next) = engine
@@ -3326,7 +3513,10 @@ mod tests {
             .unwrap();
         assert_eq!(replayed.status, STATUS_CANCELLED);
         assert_eq!(replayed_event.event_id, event.event_id);
-        assert!(replay_next.is_none(), "a replay must not emit a second ready wake");
+        assert!(
+            replay_next.is_none(),
+            "a replay must not emit a second ready wake"
+        );
     }
 
     #[tokio::test]
@@ -3381,9 +3571,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(coordinator_report
-            .to_string()
-            .contains("only the assignee can report"));
+        assert!(
+            coordinator_report
+                .to_string()
+                .contains("only the assignee can report")
+        );
 
         for actor in ["seat-senior", "seat-junior", "seat-manager"] {
             let error = engine
@@ -3396,7 +3588,11 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert!(error.to_string().contains("running task cannot be cancelled"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("running task cannot be cancelled")
+            );
         }
 
         let queue = engine
@@ -3476,7 +3672,10 @@ mod tests {
             .iter()
             .find(|entry| entry.task.task_id == second.task_id)
             .unwrap();
-        assert_eq!(repaired.task.queue_state.as_deref(), Some(QUEUE_STATE_QUEUED));
+        assert_eq!(
+            repaired.task.queue_state.as_deref(),
+            Some(QUEUE_STATE_QUEUED)
+        );
         assert!(repaired.task.queue_ready_event_id.is_none());
     }
 
@@ -3690,7 +3889,13 @@ mod tests {
             .unwrap();
         assert_eq!(repaired.queue_state.as_deref(), Some(QUEUE_STATE_TERMINAL));
         assert!(repaired.queue_ready_event_id.is_none());
-        assert!(engine.task_get_active("seat-junior").await.unwrap().is_none());
+        assert!(
+            engine
+                .task_get_active("seat-junior")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
