@@ -66,7 +66,34 @@ pub fn token_matches(candidate: &str) -> bool {
     let Some(expected) = std::env::var("SLC_MCP_TOKEN").ok() else {
         return false;
     };
-    constant_time_eq(candidate.as_bytes(), expected.as_bytes())
+    !expected.is_empty() && constant_time_eq(candidate.as_bytes(), expected.as_bytes())
+}
+
+/// Bind each bearer to exactly one seat when `SLC_MCP_SEAT_TOKENS` is set.
+/// The JSON seat -> token map is authoritative: even an empty or malformed map
+/// disables the legacy shared token, so migration can never silently fail open.
+/// With the variable absent, existing shared-bearer deployments are unchanged.
+fn seat_token_matches(raw: &str, seat: &str, candidate: &str) -> SlcResult<bool> {
+    let tokens: std::collections::HashMap<String, String> = serde_json::from_str(raw)
+        .map_err(|_| SlcError::InvalidInput("invalid SLC_MCP_SEAT_TOKENS configuration".into()))?;
+    let mut unique = std::collections::HashSet::new();
+    if tokens.is_empty() || tokens.iter().any(|(seat, token)| {
+        seat.trim().is_empty() || seat != seat.trim() || token.len() < 32
+            || token != token.trim() || !unique.insert(token)
+    }) {
+        return Err(SlcError::InvalidInput("invalid SLC_MCP_SEAT_TOKENS configuration".into()));
+    }
+    Ok(tokens.get(seat).is_some_and(|expected| {
+        constant_time_eq(candidate.as_bytes(), expected.as_bytes())
+    }))
+}
+
+fn bearer_matches_seat(seat: &str, candidate: &str) -> SlcResult<bool> {
+    match std::env::var("SLC_MCP_SEAT_TOKENS") {
+        Ok(raw) => seat_token_matches(&raw, seat, candidate),
+        Err(std::env::VarError::NotPresent) => Ok(token_matches(candidate)),
+        Err(_) => Err(SlcError::InvalidInput("invalid SLC_MCP_SEAT_TOKENS configuration".into())),
+    }
 }
 
 /// Authenticate headers into a [`Principal`] for the configured mode.
@@ -104,7 +131,7 @@ pub fn authenticate(mode: AuthMode, seat: Option<&str>, bearer: Option<&str>) ->
             let Some(bearer) = bearer.map(|b| b.trim()) else {
                 return Ok(None);
             };
-            if bearer.is_empty() || !token_matches(bearer) {
+            if bearer.is_empty() || !bearer_matches_seat(seat, bearer)? {
                 return Err(SlcError::InvalidInput("invalid bearer token".into()));
             }
             Ok(Some(Principal {
@@ -151,7 +178,39 @@ mod tests {
         assert!(ok.is_some());
         assert!(authenticate(AuthMode::BearerPlusSeat, Some("s"), Some("wrong")).is_err());
         assert!(authenticate(AuthMode::BearerPlusSeat, None, Some("sekrit")).unwrap().is_none());
-        unsafe { std::env::remove_var("SLC_MCP_TOKEN") };
+        let bound = "b".repeat(64);
+        unsafe { std::env::set_var("SLC_MCP_SEAT_TOKENS", serde_json::json!({"s": bound}).to_string()) };
+        let principal = authenticate(AuthMode::BearerPlusSeat, Some("s"), Some(&bound)).unwrap().unwrap();
+        assert_eq!(principal.seat_id, "s");
+        assert!(authenticate(AuthMode::BearerPlusSeat, Some("operator"), Some(&bound)).is_err());
+        assert!(authenticate(AuthMode::BearerPlusSeat, Some("s"), Some("sekrit")).is_err());
+        assert!(authenticate(AuthMode::BearerPlusSeat, Some("s"), None).unwrap().is_none());
+        unsafe { std::env::set_var("SLC_MCP_SEAT_TOKENS", "{}"); }
+        assert!(authenticate(AuthMode::BearerPlusSeat, Some("s"), Some("sekrit")).is_err());
+        unsafe {
+            std::env::remove_var("SLC_MCP_SEAT_TOKENS");
+            std::env::remove_var("SLC_MCP_TOKEN");
+        }
+    }
+
+    #[test]
+    fn bound_tokens_reject_impersonation_and_invalid_configuration() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let raw = serde_json::json!({"worker": a, "operator": b}).to_string();
+        assert!(seat_token_matches(&raw, "worker", &a).unwrap());
+        assert!(seat_token_matches(&raw, "operator", &b).unwrap());
+        assert!(!seat_token_matches(&raw, "operator", &a).unwrap());
+        assert!(!seat_token_matches(&raw, "worker", &b).unwrap());
+        assert!(!seat_token_matches(&raw, "unknown", &a).unwrap());
+        assert!(!seat_token_matches(&raw, "worker", "").unwrap());
+        assert!(!seat_token_matches(&raw, "worker", "old-shared-token").unwrap());
+        for invalid in ["", "{}", "not-json", "{\"s\":\"short\"}"] {
+            assert!(seat_token_matches(invalid, "worker", &a).is_err());
+        }
+        let duplicate = serde_json::json!({"worker": a, "operator": a}).to_string();
+        assert!(seat_token_matches(&duplicate, "worker", &a).is_err());
+        assert!(authenticate(AuthMode::BearerPlusSeat, Some("worker"), None).unwrap().is_none());
     }
 
     #[test]
