@@ -30,7 +30,7 @@ const CORE_DOCS: [(&str, &[&str]); 4] = [
 /// Current seed version. Bump = the system core documents get rewritten.
 /// v3: manifest synced with the code (tokens).
 /// v4: removed the byte-size output guard — the budget is token-only now.
-const SEED_VERSION: i64 = 4;
+const SEED_VERSION: i64 = 5;
 
 /// v1 documents no longer shipped in the bundle (legacy JSON seed).
 const LEGACY_V1_DOCS: [&str; 5] = [
