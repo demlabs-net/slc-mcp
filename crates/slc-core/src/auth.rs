@@ -41,7 +41,8 @@ pub struct Principal {
 
 impl Principal {
     pub fn has_permission(&self, permission: &str) -> bool {
-        self.permissions.iter().any(|p| p == ALL_PERMISSIONS) || self.permissions.iter().any(|p| p == permission)
+        self.permissions.iter().any(|p| p == ALL_PERMISSIONS)
+            || self.permissions.iter().any(|p| p == permission)
     }
 }
 
@@ -77,22 +78,31 @@ fn seat_token_matches(raw: &str, seat: &str, candidate: &str) -> SlcResult<bool>
     let tokens: std::collections::HashMap<String, String> = serde_json::from_str(raw)
         .map_err(|_| SlcError::InvalidInput("invalid SLC_MCP_SEAT_TOKENS configuration".into()))?;
     let mut unique = std::collections::HashSet::new();
-    if tokens.is_empty() || tokens.iter().any(|(seat, token)| {
-        seat.trim().is_empty() || seat != seat.trim() || token.len() < 32
-            || token != token.trim() || !unique.insert(token)
-    }) {
-        return Err(SlcError::InvalidInput("invalid SLC_MCP_SEAT_TOKENS configuration".into()));
+    if tokens.is_empty()
+        || tokens.iter().any(|(seat, token)| {
+            seat.trim().is_empty()
+                || seat != seat.trim()
+                || token.len() < 32
+                || token != token.trim()
+                || !unique.insert(token)
+        })
+    {
+        return Err(SlcError::InvalidInput(
+            "invalid SLC_MCP_SEAT_TOKENS configuration".into(),
+        ));
     }
-    Ok(tokens.get(seat).is_some_and(|expected| {
-        constant_time_eq(candidate.as_bytes(), expected.as_bytes())
-    }))
+    Ok(tokens
+        .get(seat)
+        .is_some_and(|expected| constant_time_eq(candidate.as_bytes(), expected.as_bytes())))
 }
 
 fn bearer_matches_seat(seat: &str, candidate: &str) -> SlcResult<bool> {
     match std::env::var("SLC_MCP_SEAT_TOKENS") {
         Ok(raw) => seat_token_matches(&raw, seat, candidate),
         Err(std::env::VarError::NotPresent) => Ok(token_matches(candidate)),
-        Err(_) => Err(SlcError::InvalidInput("invalid SLC_MCP_SEAT_TOKENS configuration".into())),
+        Err(_) => Err(SlcError::InvalidInput(
+            "invalid SLC_MCP_SEAT_TOKENS configuration".into(),
+        )),
     }
 }
 
@@ -100,7 +110,11 @@ fn bearer_matches_seat(seat: &str, candidate: &str) -> SlcResult<bool> {
 ///
 /// Returns `Ok(None)` when headers are absent/insufficient (the caller turns
 /// that into a 401). Returns `Err` on invalid config.
-pub fn authenticate(mode: AuthMode, seat: Option<&str>, bearer: Option<&str>) -> SlcResult<Option<Principal>> {
+pub fn authenticate(
+    mode: AuthMode,
+    seat: Option<&str>,
+    bearer: Option<&str>,
+) -> SlcResult<Option<Principal>> {
     match mode {
         AuthMode::Embedded => {
             let Some(seat) = seat.filter(|s| !s.is_empty()) else {
@@ -167,8 +181,16 @@ mod tests {
 
     #[test]
     fn legacy_requires_seat() {
-        assert!(authenticate(AuthMode::LegacySeatId, Some("seat_a"), None).unwrap().is_some());
-        assert!(authenticate(AuthMode::LegacySeatId, None, None).unwrap().is_none());
+        assert!(
+            authenticate(AuthMode::LegacySeatId, Some("seat_a"), None)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            authenticate(AuthMode::LegacySeatId, None, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -177,15 +199,32 @@ mod tests {
         let ok = authenticate(AuthMode::BearerPlusSeat, Some("s"), Some("sekrit")).unwrap();
         assert!(ok.is_some());
         assert!(authenticate(AuthMode::BearerPlusSeat, Some("s"), Some("wrong")).is_err());
-        assert!(authenticate(AuthMode::BearerPlusSeat, None, Some("sekrit")).unwrap().is_none());
+        assert!(
+            authenticate(AuthMode::BearerPlusSeat, None, Some("sekrit"))
+                .unwrap()
+                .is_none()
+        );
         let bound = "b".repeat(64);
-        unsafe { std::env::set_var("SLC_MCP_SEAT_TOKENS", serde_json::json!({"s": bound}).to_string()) };
-        let principal = authenticate(AuthMode::BearerPlusSeat, Some("s"), Some(&bound)).unwrap().unwrap();
+        unsafe {
+            std::env::set_var(
+                "SLC_MCP_SEAT_TOKENS",
+                serde_json::json!({"s": bound}).to_string(),
+            )
+        };
+        let principal = authenticate(AuthMode::BearerPlusSeat, Some("s"), Some(&bound))
+            .unwrap()
+            .unwrap();
         assert_eq!(principal.seat_id, "s");
         assert!(authenticate(AuthMode::BearerPlusSeat, Some("operator"), Some(&bound)).is_err());
         assert!(authenticate(AuthMode::BearerPlusSeat, Some("s"), Some("sekrit")).is_err());
-        assert!(authenticate(AuthMode::BearerPlusSeat, Some("s"), None).unwrap().is_none());
-        unsafe { std::env::set_var("SLC_MCP_SEAT_TOKENS", "{}"); }
+        assert!(
+            authenticate(AuthMode::BearerPlusSeat, Some("s"), None)
+                .unwrap()
+                .is_none()
+        );
+        unsafe {
+            std::env::set_var("SLC_MCP_SEAT_TOKENS", "{}");
+        }
         assert!(authenticate(AuthMode::BearerPlusSeat, Some("s"), Some("sekrit")).is_err());
         unsafe {
             std::env::remove_var("SLC_MCP_SEAT_TOKENS");
@@ -210,21 +249,43 @@ mod tests {
         }
         let duplicate = serde_json::json!({"worker": a, "operator": a}).to_string();
         assert!(seat_token_matches(&duplicate, "worker", &a).is_err());
-        assert!(authenticate(AuthMode::BearerPlusSeat, Some("worker"), None).unwrap().is_none());
+        assert!(
+            authenticate(AuthMode::BearerPlusSeat, Some("worker"), None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn embedded_requires_seat() {
-        assert!(authenticate(AuthMode::Embedded, Some("s"), None).unwrap().is_some());
-        assert!(authenticate(AuthMode::Embedded, None, None).unwrap().is_none());
+        assert!(
+            authenticate(AuthMode::Embedded, Some("s"), None)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            authenticate(AuthMode::Embedded, None, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn permission_checks() {
-        let p = Principal { seat_id: "s".into(), auth_mode: AuthMode::Embedded, user_id: None, permissions: vec!["settings:write".into()] };
+        let p = Principal {
+            seat_id: "s".into(),
+            auth_mode: AuthMode::Embedded,
+            user_id: None,
+            permissions: vec!["settings:write".into()],
+        };
         assert!(p.has_permission(SETTINGS_WRITE));
         assert!(!p.has_permission(PUBLIC_KNOWLEDGE_WRITE));
-        let superuser = Principal { seat_id: "s".into(), auth_mode: AuthMode::Embedded, user_id: None, permissions: vec![ALL_PERMISSIONS.into()] };
+        let superuser = Principal {
+            seat_id: "s".into(),
+            auth_mode: AuthMode::Embedded,
+            user_id: None,
+            permissions: vec![ALL_PERMISSIONS.into()],
+        };
         assert!(superuser.has_permission(PUBLIC_KNOWLEDGE_WRITE));
     }
 }

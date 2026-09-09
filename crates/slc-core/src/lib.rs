@@ -1439,7 +1439,10 @@ impl SlcEngine {
         let Some(id) = self.store.get_seat_active_document(seat_id).await? else {
             return Ok(None);
         };
-        Ok(self.get_document(&id).await?.filter(|doc| self.can_read_document(seat_id, doc)))
+        Ok(self
+            .get_document(&id)
+            .await?
+            .filter(|doc| self.can_read_document(seat_id, doc)))
     }
 
     pub async fn task_get_active(&self, seat_id: &str) -> SlcResult<Option<tasks::TaskInfo>> {
@@ -1852,18 +1855,65 @@ mod engine_tests {
         let engine = SlcEngine::with(store, llm, SlcConfig::default());
         engine.ensure_seat("reader").await.unwrap();
         engine.ensure_seat("owner").await.unwrap();
-        for (id, owner, visible) in [("private", Some("owner"), false), ("own", Some("reader"), true), ("public", None, true)] {
-            let mut doc = Document::new(id, DocumentCategory::Custom, "content", DocMeta::default(), vec![], owner.map(str::to_string));
+        for (id, owner, visible) in [
+            ("private", Some("owner"), false),
+            ("own", Some("reader"), true),
+            ("public", None, true),
+        ] {
+            let mut doc = Document::new(
+                id,
+                DocumentCategory::Custom,
+                "content",
+                DocMeta::default(),
+                vec![],
+                owner.map(str::to_string),
+            );
             engine.add_document(&mut doc).await.unwrap();
             // Simulate an old pointer written before activation ACL enforcement.
-            engine.seats.set_active_document("reader", Some(id)).await.unwrap();
-            assert_eq!(engine.document_get_active("reader").await.unwrap().is_some(), visible, "{id}");
+            engine
+                .seats
+                .set_active_document("reader", Some(id))
+                .await
+                .unwrap();
+            assert_eq!(
+                engine
+                    .document_get_active("reader")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                visible,
+                "{id}"
+            );
         }
-        let task = engine.task_create("owner", "private task", "private content", None, &[], &json!({})).await.unwrap();
-        engine.seats.set_active_document("reader", None).await.unwrap();
-        engine.seats.set_active_task("reader", Some(&task.task_id), None).await.unwrap();
+        let task = engine
+            .task_create(
+                "owner",
+                "private task",
+                "private content",
+                None,
+                &[],
+                &json!({}),
+            )
+            .await
+            .unwrap();
+        engine
+            .seats
+            .set_active_document("reader", None)
+            .await
+            .unwrap();
+        engine
+            .seats
+            .set_active_task("reader", Some(&task.task_id), None)
+            .await
+            .unwrap();
         assert!(engine.task_get_active("reader").await.unwrap().is_none());
-        assert!(engine.document_get_active("reader").await.unwrap().is_none());
+        assert!(
+            engine
+                .document_get_active("reader")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1882,8 +1932,18 @@ mod engine_tests {
         assert!(engine.can_manage_target("boss", "worker"));
         assert!(!engine.can_manage_target("boss", "unlisted"));
         assert!(engine.can_manage_target("worker", "worker"));
-        assert!(engine.require_seat_manage("role-only", "worker").await.is_err());
-        assert!(engine.require_seat_manage("acl-only", "worker").await.is_err());
+        assert!(
+            engine
+                .require_seat_manage("role-only", "worker")
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .require_seat_manage("acl-only", "worker")
+                .await
+                .is_err()
+        );
         assert!(engine.require_seat_manage("boss", "worker").await.is_ok());
     }
 
@@ -2033,7 +2093,6 @@ mod engine_tests {
         assert!(!engine.can_manage_seats("worker"));
     }
 
-<<<<<<< HEAD
     #[tokio::test]
     async fn document_write_authority_is_not_inferred_from_visibility() {
         use crate::roles::SeatRole;
@@ -2069,7 +2128,8 @@ mod engine_tests {
         assert!(engine.can_write_document("boss", &public));
         assert!(!engine.can_write_document("worker", &public));
         assert!(!engine.can_write_document("unscoped-operator", &public));
-=======
+    }
+
     /// Менеджер (operator + SLC_SEAT_MANAGE_ACL) обновляет workflow-задачу
     /// контактора в IN_WORK: правка персистится каноническим маршрутом через
     /// workflow-хранилище (durable update-событие) и переживает перезагрузку.
@@ -2113,7 +2173,12 @@ mod engine_tests {
         assert_eq!(assigned.issuer.as_deref(), Some("manager"));
         assert_eq!(assigned.assignee.as_deref(), Some("contactor"));
         engine
-            .workflow_start_task("seat-contactor", &assigned.task_id, "Starting", Some("start-1"))
+            .workflow_start_task(
+                "seat-contactor",
+                &assigned.task_id,
+                "Starting",
+                Some("start-1"),
+            )
             .await
             .unwrap();
 
@@ -2138,7 +2203,11 @@ mod engine_tests {
         assert_eq!(updated.status, STATUS_ACTIVE);
         assert_eq!(updated.queue_state.as_deref(), Some(QUEUE_STATE_RUNNING));
         assert_eq!(updated.project_id.as_deref(), Some("lead_gen"));
-        assert!(updated.auto_load.contains(&"swarm_policy_contactor".to_string()));
+        assert!(
+            updated
+                .auto_load
+                .contains(&"swarm_policy_contactor".to_string())
+        );
         assert_eq!(updated.metadata["priority"], json!("high"));
 
         // Перезагрузка: новая engine-инстанция на том же хранилище видит
@@ -2168,11 +2237,17 @@ mod engine_tests {
         // Тождественность и очередь не тронуты.
         let raw = store.kb_get(&assigned.task_id).await.unwrap().unwrap();
         assert_eq!(
-            raw.metadata.extra.get("workflow_version").and_then(Value::as_u64),
+            raw.metadata
+                .extra
+                .get("workflow_version")
+                .and_then(Value::as_u64),
             Some(1)
         );
         assert_eq!(
-            raw.metadata.extra.get("queue_state").and_then(Value::as_str),
+            raw.metadata
+                .extra
+                .get("queue_state")
+                .and_then(Value::as_str),
             Some(QUEUE_STATE_RUNNING)
         );
         assert!(raw.content.contains("уточнено"));
@@ -2193,7 +2268,10 @@ mod engine_tests {
             .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
             .unwrap_or_default();
         for field in ["name", "description", "auto_load", "project_id", "metadata"] {
-            assert!(fields.contains(&field), "fields_changed must include {field}: {fields:?}");
+            assert!(
+                fields.contains(&field),
+                "fields_changed must include {field}: {fields:?}"
+            );
         }
 
         // Статус workflow-задачи событиями не переписывается — явная ошибка.
@@ -2211,7 +2289,10 @@ mod engine_tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(status_err, SlcError::InvalidInput(_)), "{status_err}");
+        assert!(
+            matches!(status_err, SlcError::InvalidInput(_)),
+            "{status_err}"
+        );
         assert!(status_err.to_string().contains("event-governed"));
 
         // Владелец (контактор) остаётся на append-only контракте.
@@ -2310,7 +2391,10 @@ mod engine_tests {
             Err(SlcError::PermissionDenied(_))
         ));
         // Чужую workflow-задачу не удалить…
-        let err = engine.task_delete("seat-outsider", &workflow.task_id).await.unwrap_err();
+        let err = engine
+            .task_delete("seat-outsider", &workflow.task_id)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
         // …и не обновить.
         let err = engine
@@ -2329,13 +2413,24 @@ mod engine_tests {
             .unwrap_err();
         assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
         // Чужую обычную задачу не удалить.
-        let err = engine.task_delete("seat-analyst", &plain.task_id).await.unwrap_err();
+        let err = engine
+            .task_delete("seat-analyst", &plain.task_id)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
         // Владелец свою обычную задачу удаляет.
-        assert!(engine.task_delete("seat-contactor", &plain.task_id).await.unwrap());
+        assert!(
+            engine
+                .task_delete("seat-contactor", &plain.task_id)
+                .await
+                .unwrap()
+        );
         assert!(engine.get_document(&plain.task_id).await.unwrap().is_none());
         // Существующая workflow-задача для владельца неудаляема (история событий).
-        let err = engine.task_delete("seat-contactor", &workflow.task_id).await.unwrap_err();
+        let err = engine
+            .task_delete("seat-contactor", &workflow.task_id)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("cannot be deleted"), "{err}");
     }
 
@@ -2365,7 +2460,14 @@ mod engine_tests {
         let engine = SlcEngine::with(store.clone(), Arc::new(MockLlm::new(vec![])), config);
 
         let plain_contactor = engine
-            .task_create("seat-contactor", "contactor todo", "", None, &[], &json!({}))
+            .task_create(
+                "seat-contactor",
+                "contactor todo",
+                "",
+                None,
+                &[],
+                &json!({}),
+            )
             .await
             .unwrap();
         let plain_analyst = engine
@@ -2387,7 +2489,12 @@ mod engine_tests {
             .await
             .unwrap();
         engine
-            .workflow_start_task("seat-contactor", &workflow.task_id, "go", Some("list-start"))
+            .workflow_start_task(
+                "seat-contactor",
+                &workflow.task_id,
+                "go",
+                Some("list-start"),
+            )
             .await
             .unwrap();
 
@@ -2403,12 +2510,23 @@ mod engine_tests {
             .await
             .unwrap();
         assert_eq!(in_work.status, crate::tasks::STATUS_ACTIVE);
-        assert_eq!(in_work.queue_state.as_deref(), Some(crate::workflow::QUEUE_STATE_RUNNING));
+        assert_eq!(
+            in_work.queue_state.as_deref(),
+            Some(crate::workflow::QUEUE_STATE_RUNNING)
+        );
 
         // list (Visible scope): workflow-задачи всех управляемых сидов
         // (включая IN_WORK) видны менеджеру одним вызовом.
         let visible = engine
-            .workflow_list_tasks("seat-manager", TaskListScope::Visible, None, None, None, None, 50)
+            .workflow_list_tasks(
+                "seat-manager",
+                TaskListScope::Visible,
+                None,
+                None,
+                None,
+                None,
+                50,
+            )
             .await
             .unwrap();
         assert!(
@@ -2418,35 +2536,84 @@ mod engine_tests {
         );
         // По-сидовый list покрывает и обычные задачи каждого управляемого
         // сида (legacy target_seat семантика менеджера).
-        let per_seat_contactor = engine.task_list("seat-contactor", None, None, 50).await.unwrap();
-        let contactor_ids: HashSet<String> =
-            per_seat_contactor.iter().map(|t| t.task_id.clone()).collect();
+        let per_seat_contactor = engine
+            .task_list("seat-contactor", None, None, 50)
+            .await
+            .unwrap();
+        let contactor_ids: HashSet<String> = per_seat_contactor
+            .iter()
+            .map(|t| t.task_id.clone())
+            .collect();
         assert!(contactor_ids.contains(&plain_contactor.task_id));
         assert!(contactor_ids.contains(&workflow.task_id));
-        let per_seat_analyst = engine.task_list("seat-analyst", None, None, 50).await.unwrap();
-        assert!(per_seat_analyst.iter().any(|t| t.task_id == plain_analyst.task_id));
+        let per_seat_analyst = engine
+            .task_list("seat-analyst", None, None, 50)
+            .await
+            .unwrap();
+        assert!(
+            per_seat_analyst
+                .iter()
+                .any(|t| t.task_id == plain_analyst.task_id)
+        );
         // Аутсайдер ничего чужого в Visible не видит.
         let outsider_visible = engine
-            .workflow_list_tasks("seat-outsider", TaskListScope::Visible, None, None, None, None, 50)
+            .workflow_list_tasks(
+                "seat-outsider",
+                TaskListScope::Visible,
+                None,
+                None,
+                None,
+                None,
+                50,
+            )
             .await
             .unwrap();
         assert!(outsider_visible.is_empty());
 
         // delete: менеджер удаляет обычную задачу управляемого сида…
-        assert!(engine.task_delete("seat-manager", &plain_analyst.task_id).await.unwrap());
-        assert!(engine.get_document(&plain_analyst.task_id).await.unwrap().is_none());
+        assert!(
+            engine
+                .task_delete("seat-manager", &plain_analyst.task_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            engine
+                .get_document(&plain_analyst.task_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         // …но не workflow-задачу (история событий сохраняется).
-        let err = engine.task_delete("seat-manager", &workflow.task_id).await.unwrap_err();
+        let err = engine
+            .task_delete("seat-manager", &workflow.task_id)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("cannot be deleted"), "{err}");
-        assert!(engine.get_document(&workflow.task_id).await.unwrap().is_some());
+        assert!(
+            engine
+                .get_document(&workflow.task_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         // Неизвестный id — честный NotFound, не «скрытый» ответ.
         let err = engine
-            .task_update("seat-manager", "task_no_such_id", None, None, None, None, None, None, None)
+            .task_update(
+                "seat-manager",
+                "task_no_such_id",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, SlcError::NotFound(_)), "{err}");
->>>>>>> origin/fix/roy1-manager-full-task-access
     }
 
     /// Переименование документа: каскад auto_load/references/вики-ссылок/

@@ -532,9 +532,7 @@ impl SlcEngine {
     ) -> SlcResult<Document> {
         let doc = task_document(self.store().kb_get(task_id).await?, task_id)?;
         if !self.task_access_allowed(seat_id, &doc)
-            && !self
-                .active_task_descends_from(seat_id, task_id)
-                .await?
+            && !self.active_task_descends_from(seat_id, task_id).await?
         {
             return Err(SlcError::PermissionDenied(format!(
                 "principal {} cannot read task {task_id}",
@@ -553,25 +551,18 @@ impl SlcEngine {
     /// global queue here: callers must have explicitly activated the task (or
     /// have started it already), and a missing pointer remains a clear input
     /// error rather than silently selecting unrelated work.
-    async fn workflow_task_id_or_active(
-        &self,
-        seat_id: &str,
-        task_id: &str,
-    ) -> SlcResult<String> {
+    async fn workflow_task_id_or_active(&self, seat_id: &str, task_id: &str) -> SlcResult<String> {
         let task_id = task_id.trim();
         if !task_id.is_empty() {
             return Ok(task_id.to_string());
         }
 
         let actor = self.workflow_principal(seat_id);
-        let active = self
-            .task_get_active(seat_id)
-            .await?
-            .ok_or_else(|| {
-                SlcError::InvalidInput(
-                    "task_id must not be empty (no active SLC task to resolve)".into(),
-                )
-            })?;
+        let active = self.task_get_active(seat_id).await?.ok_or_else(|| {
+            SlcError::InvalidInput(
+                "task_id must not be empty (no active SLC task to resolve)".into(),
+            )
+        })?;
         if active.assignee.as_deref() != Some(actor.as_str()) {
             return Err(SlcError::PermissionDenied(
                 "the active SLC task is not assigned to the caller".into(),
@@ -649,8 +640,8 @@ impl SlcEngine {
         let incoming_event_at = DateTime::parse_from_rfc3339(&event.created_at).ok();
         let stale_event = same_event
             || current_event_at
-            .zip(incoming_event_at)
-            .is_some_and(|(current, incoming)| current >= incoming);
+                .zip(incoming_event_at)
+                .is_some_and(|(current, incoming)| current >= incoming);
         let mut changed = false;
         if !stale_event {
             doc.metadata
@@ -666,8 +657,8 @@ impl SlcEngine {
         // backend transaction. A retry therefore merges the intended state
         // transition even when a newer message already owns `last_event_*`.
         // Statuses only move forward: PENDING -> IN_WORK -> terminal.
-        let current_status = workflow_string(&doc, "status")
-            .unwrap_or_else(|| STATUS_PENDING.to_string());
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
         let mut resulting_status = current_status.clone();
         if let Some(status) = status {
             let apply_status = current_status != status
@@ -747,10 +738,7 @@ impl SlcEngine {
                 &DocFilter {
                     category: Some(DocumentCategory::Task),
                     seat_id: Some(assignee_seat),
-                    extra_strings: BTreeMap::from([(
-                        "assignee".to_string(),
-                        assignee.to_string(),
-                    )]),
+                    extra_strings: BTreeMap::from([("assignee".to_string(), assignee.to_string())]),
                     extra_strings_not_in: BTreeMap::from([(
                         "status".to_string(),
                         vec![
@@ -786,10 +774,7 @@ impl SlcEngine {
 
     /// Reconcile one principal's FIFO while the caller holds `workflow_lock`.
     /// Exactly one non-terminal task may reserve the lane as ready/running.
-    async fn reconcile_task_queue_locked(
-        &self,
-        assignee: &str,
-    ) -> SlcResult<TaskQueueSnapshot> {
+    async fn reconcile_task_queue_locked(&self, assignee: &str) -> SlcResult<TaskQueueSnapshot> {
         let mut docs = self.assignee_queue_documents(assignee).await?;
         let running = docs
             .iter()
@@ -862,12 +847,8 @@ impl SlcEngine {
                 .await?;
             self.touch_task_projection(&task_id, &event, None, None)
                 .await?;
-            self.set_task_queue_projection(
-                &task_id,
-                QUEUE_STATE_READY,
-                Some(&event.event_id),
-            )
-            .await?;
+            self.set_task_queue_projection(&task_id, QUEUE_STATE_READY, Some(&event.event_id))
+                .await?;
             docs = self.assignee_queue_documents(assignee).await?;
         }
 
@@ -909,11 +890,7 @@ impl SlcEngine {
             .filter(|doc| Some(doc.document_id.as_str()) != reserved_id.as_deref())
         {
             let task = self
-                .set_task_queue_projection(
-                    &doc.document_id,
-                    QUEUE_STATE_QUEUED,
-                    None,
-                )
+                .set_task_queue_projection(&doc.document_id, QUEUE_STATE_QUEUED, None)
                 .await?;
             entries.push(TaskQueueEntry {
                 position: queued_position,
@@ -1016,11 +993,9 @@ impl SlcEngine {
                         SlcError::Storage("task assignment idempotency record is corrupt".into())
                     })?;
                 if existing.get("fingerprint").and_then(Value::as_str) != Some(&fingerprint) {
-                    return Err(SlcError::InvalidInput(
-                        format!(
-                            "idempotency_key already belongs to task {task_id} with different assignment fields; retry the exact original request or use a new logical task attempt and key"
-                        ),
-                    ));
+                    return Err(SlcError::InvalidInput(format!(
+                        "idempotency_key already belongs to task {task_id} with different assignment fields; retry the exact original request or use a new logical task attempt and key"
+                    )));
                 }
                 // Idempotency survives terminal closure. Terminal tasks are no
                 // longer present in the runnable FIFO, but replaying the
@@ -1190,8 +1165,7 @@ impl SlcEngine {
                 else {
                     continue;
                 };
-                if metadata.get("pipeline").and_then(Value::as_str)
-                    != Some(LEADS_PORTFOLIO_PROJECT)
+                if metadata.get("pipeline").and_then(Value::as_str) != Some(LEADS_PORTFOLIO_PROJECT)
                     || metadata.get("slug").and_then(Value::as_str) != Some(requested_slug)
                     || metadata.get("stage").and_then(Value::as_str) != Some(requested_stage)
                 {
@@ -1255,7 +1229,9 @@ impl SlcEngine {
 
         let mut effective_auto_load = auto_load.to_vec();
         if let Some(policy_document) = self.config.principal_policy_documents.get(&assignee)
-            && !effective_auto_load.iter().any(|item| item == policy_document)
+            && !effective_auto_load
+                .iter()
+                .any(|item| item == policy_document)
         {
             effective_auto_load.push(policy_document.clone());
         }
@@ -1349,8 +1325,8 @@ impl SlcEngine {
                 continue;
             }
             task_count += 1;
-            let status = workflow_string(&doc, "status")
-                .unwrap_or_else(|| STATUS_PENDING.to_string());
+            let status =
+                workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
             *status_counts.entry(status.clone()).or_default() += 1;
             if workflow_string(&doc, "issuer").as_deref() != Some("manager")
                 || workflow_string(&doc, "parent_task_id").is_some()
@@ -1365,9 +1341,7 @@ impl SlcEngine {
             else {
                 continue;
             };
-            if metadata.get("pipeline").and_then(Value::as_str)
-                != Some(LEADS_PORTFOLIO_PROJECT)
-            {
+            if metadata.get("pipeline").and_then(Value::as_str) != Some(LEADS_PORTFOLIO_PROJECT) {
                 continue;
             }
             let Some(slug) = metadata
@@ -1436,8 +1410,7 @@ impl SlcEngine {
         {
             return Ok(Vec::new());
         }
-        if matches!(scope, TaskListScope::Issued)
-            && issuer.is_some_and(|value| value != principal)
+        if matches!(scope, TaskListScope::Issued) && issuer.is_some_and(|value| value != principal)
         {
             return Ok(Vec::new());
         }
@@ -1513,8 +1486,8 @@ impl SlcEngine {
                 "only the assignee can start a task".into(),
             ));
         }
-        let current_status = workflow_string(&doc, "status")
-            .unwrap_or_else(|| STATUS_PENDING.to_string());
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
         if is_terminal_status(&current_status) {
             return Err(SlcError::InvalidInput(format!(
                 "terminal task cannot be started again: {current_status}"
@@ -1685,8 +1658,8 @@ impl SlcEngine {
             TaskEventKind::Progress
         };
         let issuer = workflow_string(&doc, "issuer");
-        let current_status = workflow_string(&doc, "status")
-            .unwrap_or_else(|| STATUS_PENDING.to_string());
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
         if is_terminal_status(&current_status) {
             if current_status != status
                 || workflow_string(&doc, "terminal_summary").as_deref() != Some(summary.as_str())
@@ -1844,12 +1817,11 @@ impl SlcEngine {
             &reason,
             &metadata,
         )?;
-        let current_status = workflow_string(&doc, "status")
-            .unwrap_or_else(|| STATUS_PENDING.to_string());
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
         if is_terminal_status(&current_status) {
             if current_status != STATUS_CANCELLED
-                || workflow_string(&doc, "terminal_summary").as_deref()
-                    != Some(reason.as_str())
+                || workflow_string(&doc, "terminal_summary").as_deref() != Some(reason.as_str())
             {
                 return Err(SlcError::InvalidInput(format!(
                     "terminal task cannot transition from {current_status} to {STATUS_CANCELLED}"
@@ -1907,12 +1879,7 @@ impl SlcEngine {
             )
             .await?;
         let mut task = self
-            .touch_task_projection(
-                &task_id,
-                &event,
-                Some(STATUS_CANCELLED),
-                Some(&reason),
-            )
+            .touch_task_projection(&task_id, &event, Some(STATUS_CANCELLED), Some(&reason))
             .await?;
         if task.status != STATUS_CANCELLED {
             return Err(SlcError::Storage(format!(
@@ -2024,12 +1991,11 @@ impl SlcEngine {
         }
 
         let mut doc = doc;
-        let current_status = workflow_string(&doc, "status")
-            .unwrap_or_else(|| STATUS_PENDING.to_string());
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
         if let Some(raw) = status {
-            let normalized = normalize_task_status(raw).ok_or_else(|| {
-                SlcError::InvalidInput(format!("unsupported task status: {raw}"))
-            })?;
+            let normalized = normalize_task_status(raw)
+                .ok_or_else(|| SlcError::InvalidInput(format!("unsupported task status: {raw}")))?;
             if normalized != current_status {
                 return Err(SlcError::InvalidInput(format!(
                     "workflow task status is event-governed and cannot be switched from {current_status} to {normalized} through update_task; the assignee reports through report_task, start_task is assignee-only, and cancel_task handles queued/ready tasks"
@@ -2039,13 +2005,7 @@ impl SlcEngine {
 
         let mut changed_fields: Vec<&'static str> = Vec::new();
         if let Some(n) = name {
-            if doc
-                .metadata
-                .extra
-                .get("name")
-                .and_then(Value::as_str)
-                != Some(n)
-            {
+            if doc.metadata.extra.get("name").and_then(Value::as_str) != Some(n) {
                 doc.metadata.extra.insert("name".into(), json!(n));
                 changed_fields.push("name");
             }
@@ -2094,13 +2054,7 @@ impl SlcEngine {
                     .is_some();
             match pid {
                 Some(p) => {
-                    if doc
-                        .metadata
-                        .extra
-                        .get("project")
-                        .and_then(Value::as_str)
-                        != Some(p)
-                    {
+                    if doc.metadata.extra.get("project").and_then(Value::as_str) != Some(p) {
                         doc.metadata.extra.insert("project".into(), json!(p));
                         doc.metadata.extra.remove("project_id");
                         changed_fields.push("project_id");
@@ -2173,7 +2127,9 @@ impl SlcEngine {
         doc.updated_at = Utc::now();
         doc.version += 1;
         self.store().kb_replace(&doc).await?;
-        let task = self.touch_task_projection(&task_id, &event, None, None).await?;
+        let task = self
+            .touch_task_projection(&task_id, &event, None, None)
+            .await?;
         Ok(task)
     }
 
@@ -2505,7 +2461,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("must match its portfolio parent"));
+        assert!(
+            error
+                .to_string()
+                .contains("must match its portfolio parent")
+        );
     }
 
     #[tokio::test]
@@ -2703,7 +2663,13 @@ mod tests {
             .unwrap();
         assert_eq!(reported.task_id, task.task_id);
         assert_eq!(reported.status, STATUS_COMPLETED);
-        assert!(engine.task_get_active("seat-junior").await.unwrap().is_none());
+        assert!(
+            engine
+                .task_get_active("seat-junior")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2828,10 +2794,7 @@ mod tests {
             .unwrap();
         assert_eq!(replay.task_id, first.task_id);
         assert_eq!(replay.status, STATUS_COMPLETED);
-        assert_eq!(
-            replay.queue_state.as_deref(),
-            Some(QUEUE_STATE_TERMINAL)
-        );
+        assert_eq!(replay.queue_state.as_deref(), Some(QUEUE_STATE_TERMINAL));
     }
 
     #[tokio::test]
@@ -3062,7 +3025,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queue.capacity, 1);
-        assert_eq!(queue.ready_task_id.as_deref(), Some(second.task_id.as_str()));
+        assert_eq!(
+            queue.ready_task_id.as_deref(),
+            Some(second.task_id.as_str())
+        );
         assert_eq!(queue.entries.len(), 2);
         assert_eq!(queue.entries[0].position, 0);
         assert_eq!(queue.entries[0].task.task_id, second.task_id);
@@ -3151,7 +3117,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(indexed_replay.queue_state.as_deref(), Some(QUEUE_STATE_READY));
+        assert_eq!(
+            indexed_replay.queue_state.as_deref(),
+            Some(QUEUE_STATE_READY)
+        );
         engine
             .store()
             .delete_record(TASK_ASSIGN_IDEMPOTENCY, &assignment_key)
@@ -3436,7 +3405,10 @@ mod tests {
             .workflow_reconcile_task_queue("seat-senior", "junior")
             .await
             .unwrap();
-        assert_eq!(queue.running_task_id.as_deref(), Some(head.task_id.as_str()));
+        assert_eq!(
+            queue.running_task_id.as_deref(),
+            Some(head.task_id.as_str())
+        );
         assert_eq!(
             queue
                 .entries
@@ -3507,7 +3479,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cancelled_tail.status, STATUS_CANCELLED);
-        assert!(tail_next.is_none(), "cancelling queued work emits no duplicate wake");
+        assert!(
+            tail_next.is_none(),
+            "cancelling queued work emits no duplicate wake"
+        );
 
         let (cancelled_head, event, next) = engine
             .workflow_cancel_task(
@@ -3520,7 +3495,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cancelled_head.status, STATUS_CANCELLED);
-        assert_eq!(cancelled_head.queue_state.as_deref(), Some(QUEUE_STATE_TERMINAL));
+        assert_eq!(
+            cancelled_head.queue_state.as_deref(),
+            Some(QUEUE_STATE_TERMINAL)
+        );
         assert_eq!(next.unwrap().task_id, third.task_id);
 
         let (replayed, replayed_event, replay_next) = engine
@@ -3535,7 +3513,10 @@ mod tests {
             .unwrap();
         assert_eq!(replayed.status, STATUS_CANCELLED);
         assert_eq!(replayed_event.event_id, event.event_id);
-        assert!(replay_next.is_none(), "a replay must not emit a second ready wake");
+        assert!(
+            replay_next.is_none(),
+            "a replay must not emit a second ready wake"
+        );
     }
 
     #[tokio::test]
@@ -3590,9 +3571,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(coordinator_report
-            .to_string()
-            .contains("only the assignee can report"));
+        assert!(
+            coordinator_report
+                .to_string()
+                .contains("only the assignee can report")
+        );
 
         for actor in ["seat-senior", "seat-junior", "seat-manager"] {
             let error = engine
@@ -3605,7 +3588,11 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert!(error.to_string().contains("running task cannot be cancelled"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("running task cannot be cancelled")
+            );
         }
 
         let queue = engine
@@ -3685,7 +3672,10 @@ mod tests {
             .iter()
             .find(|entry| entry.task.task_id == second.task_id)
             .unwrap();
-        assert_eq!(repaired.task.queue_state.as_deref(), Some(QUEUE_STATE_QUEUED));
+        assert_eq!(
+            repaired.task.queue_state.as_deref(),
+            Some(QUEUE_STATE_QUEUED)
+        );
         assert!(repaired.task.queue_ready_event_id.is_none());
     }
 
@@ -3899,7 +3889,13 @@ mod tests {
             .unwrap();
         assert_eq!(repaired.queue_state.as_deref(), Some(QUEUE_STATE_TERMINAL));
         assert!(repaired.queue_ready_event_id.is_none());
-        assert!(engine.task_get_active("seat-junior").await.unwrap().is_none());
+        assert!(
+            engine
+                .task_get_active("seat-junior")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

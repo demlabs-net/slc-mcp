@@ -1421,8 +1421,11 @@ async fn context_dependencies(
     let mut seen = result.included.clone();
     let mut queue = VecDeque::new();
     let mut inspected = 0;
-    let configured_policy = engine.config.principal_policy_documents
-        .get(&engine.workflow_principal(seat_id)).cloned();
+    let configured_policy = engine
+        .config
+        .principal_policy_documents
+        .get(&engine.workflow_principal(seat_id))
+        .cloned();
     let active_is_policy = configured_policy.as_deref() == Some(active.document_id.as_str());
     // FIFO preserves link order. Only the configured policy chain inherits
     // upstream's trusted-policy access; ordinary dependencies require read ACLs.
@@ -1433,7 +1436,10 @@ async fn context_dependencies(
             }
             inspected += 1;
             if seen.insert(id.clone()) {
-                queue.push_back((id.clone(), trusted || configured_policy.as_deref() == Some(id.as_str())));
+                queue.push_back((
+                    id.clone(),
+                    trusted || configured_policy.as_deref() == Some(id.as_str()),
+                ));
             }
         }
         false
@@ -1546,7 +1552,11 @@ async fn build_context(
     // Preserve active document and focuses, then prioritize working
     // dependencies over optional profiles/base docs. Recheck the anchor's
     // permissions: its ownership may have changed since activation.
-    let active = engine.document_get_active(seat_id).await.ok().flatten()
+    let active = engine
+        .document_get_active(seat_id)
+        .await
+        .ok()
+        .flatten()
         .filter(|d| engine.can_read_document(seat_id, d));
     let active_block = active.as_ref().map(|d| {
         used_tokens += context_document_tokens(d);
@@ -1561,13 +1571,23 @@ async fn build_context(
         }
     }
     let dependencies = if let Some(active) = &active {
-        Some(context_dependencies(engine, seat_id, active,
-            limit_tokens.saturating_sub(used_tokens)).await)
+        Some(
+            context_dependencies(
+                engine,
+                seat_id,
+                active,
+                limit_tokens.saturating_sub(used_tokens),
+            )
+            .await,
+        )
     } else {
         None
     };
     let traversal_limited = dependencies.as_ref().is_some_and(|d| d.traversal_limited);
-    let mut omitted = dependencies.as_ref().map(|d| d.omitted.clone()).unwrap_or_default();
+    let mut omitted = dependencies
+        .as_ref()
+        .map(|d| d.omitted.clone())
+        .unwrap_or_default();
     used_tokens += dependencies.as_ref().map_or(0, |d| d.used_tokens);
     let mut profile_blocks: Vec<Value> = Vec::new();
     if let Ok(Some((content, _))) = engine.get_seat_profile(seat_id).await {
@@ -1588,7 +1608,10 @@ async fn build_context(
             "core_methodology",
             "core_slc_best_practice",
         ] {
-            if dependencies.as_ref().is_some_and(|d| d.included.contains(base)) {
+            if dependencies
+                .as_ref()
+                .is_some_and(|d| d.included.contains(base))
+            {
                 continue;
             }
             if let Ok(Some(d)) = engine.get_document(base).await {
@@ -1674,7 +1697,9 @@ async fn build_context(
     let warning = if compressed || !llm_compressed.is_empty() {
         let mut parts = Vec::new();
         if traversal_limited {
-            parts.push(format!("auto_load traversal limited to {CONTEXT_AUTO_LOAD_LINK_LIMIT} links"));
+            parts.push(format!(
+                "auto_load traversal limited to {CONTEXT_AUTO_LOAD_LINK_LIMIT} links"
+            ));
         }
         if !omitted.is_empty() {
             parts.push(format!("whole blocks omitted: {}", omitted.join(", ")));
@@ -2756,8 +2781,12 @@ async fn call_tool(
                 .require_seat_manage(seat_id, target)
                 .await
                 .map_err(json_err)?;
-            match engine.document_get_active(target).await.map_err(json_err)?
-                .filter(|doc| engine.can_read_document(seat_id, doc)) {
+            match engine
+                .document_get_active(target)
+                .await
+                .map_err(json_err)?
+                .filter(|doc| engine.can_read_document(seat_id, doc))
+            {
                 Some(d) => {
                     json!({"success": true, "has_active_document": true, "target_seat": target, "document_id": d.document_id, "category": d.category.as_str(), "content": d.content, "tags": d.tags})
                 }
@@ -3216,21 +3245,10 @@ async fn call_tool(
                     "message": format!("document not found: {id}")
                 }));
             };
-<<<<<<< HEAD
             if !engine.can_write_document(seat_id, &doc) {
                 return Err(json_err(slc_core::SlcError::PermissionDenied(format!(
-                    "seat {seat_id} has no right to update document {id}"
+                    "document {id} belongs to another seat; only its owner or a manager (operator role with an SLC_SEAT_MANAGE_ACL target for that seat) may update it"
                 ))));
-=======
-            // Тот же контракт, что и у задач: свой/публичный документ либо
-            // менеджер управляемого сида (operator + SLC_SEAT_MANAGE_ACL).
-            if !engine.can_read_document(seat_id, &doc) {
-                return Err(json!({
-                    "code": -32003,
-                    "kind": "permission_denied",
-                    "message": format!("document {id} belongs to another seat; only its owner or a manager (operator role with an SLC_SEAT_MANAGE_ACL target for that seat) may update it")
-                }));
->>>>>>> origin/fix/roy1-manager-full-task-access
             }
             if slc_core::tasks::is_workflow_task(&doc) {
                 return Err(json!({
@@ -3294,29 +3312,15 @@ async fn call_tool(
                 .unwrap_or("");
             let purge = args.get("purge").and_then(|v| v.as_bool()).unwrap_or(false);
             if let Some(doc) = engine.store().kb_get(id).await.map_err(json_err)? {
-<<<<<<< HEAD
                 if !engine.can_write_document(seat_id, &doc) {
                     return Err(json_err(slc_core::SlcError::PermissionDenied(format!(
-                        "seat {seat_id} has no right to delete document {id}"
+                        "document {id} belongs to another seat; only its owner or a manager (operator role with an SLC_SEAT_MANAGE_ACL target for that seat) may delete it"
                     ))));
-                }
-                if slc_core::tasks::is_workflow_task(&doc) {
-                    return Err(json!({
-                        "code": -32602,
-=======
-                // Свой/публичный документ либо менеджер управляемого сида.
-                if !engine.can_read_document(seat_id, &doc) {
-                    return Err(json!({
-                        "code": -32003,
-                        "kind": "permission_denied",
-                        "message": format!("document {id} belongs to another seat; only its owner or a manager (operator role with an SLC_SEAT_MANAGE_ACL target for that seat) may delete it")
-                    }));
                 }
                 if slc_core::tasks::is_workflow_task(&doc) {
                     return Err(json!({
                         "code": -32002,
                         "kind": "invalid_input",
->>>>>>> origin/fix/roy1-manager-full-task-access
                         "message": "workflow tasks cannot be deleted; preserve their event history"
                     }));
                 }
@@ -3799,9 +3803,7 @@ fn ru_error_text(tool: &str, kind: &str, message: &str) -> String {
              get_document/list_documents. Если объект существует под другим id, передавайте \
              фактический id."
         ),
-        "invalid_input"
-            if message.contains("workflow") || message.contains("append-only") =>
-        {
+        "invalid_input" if message.contains("workflow") || message.contains("append-only") => {
             format!(
                 "{message}\n\
                  Действие: workflow-задачи изменяются только событиями. Менеджер управляемого \
@@ -4099,16 +4101,30 @@ mod seat_filter_tests {
 
     async fn context_test_engine() -> SlcEngine {
         let store = Arc::new(slc_core::storage::sqlite::SqliteStore::in_memory().unwrap());
-        let engine = SlcEngine::with(store, Arc::new(slc_core::MockLlm::new(vec![])),
-            slc_core::SlcConfig::default());
+        let engine = SlcEngine::with(
+            store,
+            Arc::new(slc_core::MockLlm::new(vec![])),
+            slc_core::SlcConfig::default(),
+        );
         engine.ensure_seat("reader").await.unwrap();
         engine
     }
 
-    async fn context_test_doc(engine: &SlcEngine, id: &str, content: &str,
-        owner: Option<&str>, links: &[&str]) -> Document {
-        let mut doc = Document::new(id, DocumentCategory::Custom, content,
-            DocMeta::default(), vec!["test".into()], owner.map(str::to_string));
+    async fn context_test_doc(
+        engine: &SlcEngine,
+        id: &str,
+        content: &str,
+        owner: Option<&str>,
+        links: &[&str],
+    ) -> Document {
+        let mut doc = Document::new(
+            id,
+            DocumentCategory::Custom,
+            content,
+            DocMeta::default(),
+            vec!["test".into()],
+            owner.map(str::to_string),
+        );
         doc.auto_load = links.iter().map(|s| s.to_string()).collect();
         engine.add_document(&mut doc).await.unwrap();
         doc
@@ -4116,27 +4132,51 @@ mod seat_filter_tests {
 
     async fn test_context(engine: &SlcEngine, limit: usize, summary: &str, base: bool) -> Value {
         let (events, _) = tokio::sync::broadcast::channel(8);
-        build_context(engine, "reader", summary, &[], &[], &[], base, Some(limit), &events)
-            .await.unwrap()
+        build_context(
+            engine,
+            "reader",
+            summary,
+            &[],
+            &[],
+            &[],
+            base,
+            Some(limit),
+            &events,
+        )
+        .await
+        .unwrap()
     }
 
     fn context_ids(context: &Value) -> Vec<&str> {
-        context["docs"].as_array().unwrap().iter()
-            .map(|d| d["id"].as_str().unwrap()).collect()
+        context["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect()
     }
 
     #[tokio::test]
     async fn context_auto_load_chains_cycles_duplicates_and_base_overlap() {
         let engine = context_test_engine().await;
-        context_test_doc(&engine, "anchor", "active", None,
-            &["b", "c", "b", "core_slc_manifest"]).await;
+        context_test_doc(
+            &engine,
+            "anchor",
+            "active",
+            None,
+            &["b", "c", "b", "core_slc_manifest"],
+        )
+        .await;
         context_test_doc(&engine, "b", "second", None, &["d", "anchor"]).await;
         context_test_doc(&engine, "c", "third", Some("reader"), &["d"]).await;
         context_test_doc(&engine, "d", "fourth", None, &["b"]).await;
         context_test_doc(&engine, "core_slc_manifest", "manifest", None, &[]).await;
         engine.document_activate("reader", "anchor").await.unwrap();
         let updated = test_context(&engine, 10000, "", true).await;
-        assert_eq!(context_ids(&updated), ["anchor", "b", "c", "core_slc_manifest", "d"]);
+        assert_eq!(
+            context_ids(&updated),
+            ["anchor", "b", "c", "core_slc_manifest", "d"]
+        );
         let saved = test_context(&engine, 10000, "checkpoint", true).await;
         assert_eq!(updated["docs"], saved["docs"]);
         assert!(updated["save_info"].is_null());
@@ -4146,11 +4186,32 @@ mod seat_filter_tests {
     #[tokio::test]
     async fn context_auto_load_missing_private_and_stale_anchor_do_not_leak() {
         let engine = context_test_engine().await;
-        context_test_doc(&engine, "anchor", "active", None, &["missing", "private", "own"]).await;
-        context_test_doc(&engine, "private", "SECRET_CONTENT", Some("other"), &["hidden_child"]).await;
+        context_test_doc(
+            &engine,
+            "anchor",
+            "active",
+            None,
+            &["missing", "private", "own"],
+        )
+        .await;
+        context_test_doc(
+            &engine,
+            "private",
+            "SECRET_CONTENT",
+            Some("other"),
+            &["hidden_child"],
+        )
+        .await;
         context_test_doc(&engine, "hidden_child", "SECRET_DESCENDANT", None, &[]).await;
         context_test_doc(&engine, "own", "readable", Some("reader"), &[]).await;
-        context_test_doc(&engine, "core_slc_manifest", "SECRET_BASE", Some("other"), &[]).await;
+        context_test_doc(
+            &engine,
+            "core_slc_manifest",
+            "SECRET_BASE",
+            Some("other"),
+            &[],
+        )
+        .await;
         engine.document_activate("reader", "anchor").await.unwrap();
         let context = test_context(&engine, 10000, "", true).await;
         assert_eq!(context_ids(&context), ["anchor", "own"]);
@@ -4159,7 +4220,11 @@ mod seat_filter_tests {
             assert!(!text.contains(secret));
         }
         // Simulate a pointer whose target became private after activation.
-        engine.store().set_seat_active_document("reader", Some("private")).await.unwrap();
+        engine
+            .store()
+            .set_seat_active_document("reader", Some("private"))
+            .await
+            .unwrap();
         let stale = test_context(&engine, 10000, "", true).await;
         assert!(context_ids(&stale).is_empty());
         assert!(!stale.to_string().contains("SECRET"));
@@ -4190,7 +4255,14 @@ mod seat_filter_tests {
         context_test_doc(&engine, "beyond_limit", "not loaded", None, &[]).await;
         for duplicate in [true, false] {
             active.auto_load = (0..CONTEXT_AUTO_LOAD_LINK_LIMIT)
-                .map(|i| if duplicate { "missing".into() } else { format!("missing_{i}") }).collect();
+                .map(|i| {
+                    if duplicate {
+                        "missing".into()
+                    } else {
+                        format!("missing_{i}")
+                    }
+                })
+                .collect();
             active.auto_load.push("beyond_limit".into());
             let deps = context_dependencies(&engine, "reader", &active, 10000).await;
             assert!(deps.traversal_limited);
@@ -4207,11 +4279,7 @@ mod seat_filter_tests {
         config
             .principal_policy_documents
             .insert("worker".into(), "role_policy".into());
-        let engine = SlcEngine::with(
-            store,
-            Arc::new(slc_core::MockLlm::new(vec![])),
-            config,
-        );
+        let engine = SlcEngine::with(store, Arc::new(slc_core::MockLlm::new(vec![])), config);
         let mut global = Document::new(
             "global_policy",
             DocumentCategory::System,
@@ -4251,7 +4319,10 @@ mod seat_filter_tests {
         task.auto_load = vec!["private_secret".into(), "role_policy".into()];
         engine.add_document(&mut task).await.unwrap();
         engine.ensure_seat("worker").await.unwrap();
-        engine.document_activate("worker", "active_task").await.unwrap();
+        engine
+            .document_activate("worker", "active_task")
+            .await
+            .unwrap();
         let (events, _) = tokio::sync::broadcast::channel(8);
         let context = call_tool(
             &engine,
@@ -4661,7 +4732,6 @@ mod seat_filter_tests {
         assert!(!serialized.contains("canonical task body"));
         assert!(!serialized.contains("private report"));
         assert!(serialized.contains("list_task_events"));
-
     }
 
     fn catalog() -> std::collections::HashMap<String, Value> {
@@ -4684,26 +4754,34 @@ mod seat_filter_tests {
         assert!(update.contains("workflow event store"), "{update}");
         assert!(update.contains("IN_WORK"), "{update}");
         // get/delete/list задач заявляют только то, что реализовано.
-        assert!(catalog["get_task"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("SLC_SEAT_MANAGE_ACL"));
-        assert!(catalog["get_task"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("IN_WORK"));
-        assert!(catalog["delete_task"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("SLC_SEAT_MANAGE_ACL"));
+        assert!(
+            catalog["get_task"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("SLC_SEAT_MANAGE_ACL")
+        );
+        assert!(
+            catalog["get_task"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("IN_WORK")
+        );
+        assert!(
+            catalog["delete_task"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("SLC_SEAT_MANAGE_ACL")
+        );
         let list = catalog["list_tasks"]["description"].as_str().unwrap();
         assert!(list.contains("target_seat"), "{list}");
         assert!(list.contains("SLC_SEAT_MANAGE_ACL"), "{list}");
         // update_task по-прежнему требует task_id.
-        assert!(catalog["update_task"]["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("task_id")));
+        assert!(
+            catalog["update_task"]["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("task_id"))
+        );
     }
 
     #[tokio::test]
@@ -4754,9 +4832,9 @@ mod seat_filter_tests {
 
     /// Engine helper — рой менеджера над контактором/аналитиком.
     async fn swarm_engine() -> SlcEngine {
+        use slc_core::roles::SeatRole;
         use slc_core::storage::sqlite::SqliteStore;
         use slc_core::{MockLlm, SlcConfig, StorageBackend};
-        use slc_core::roles::SeatRole;
         use std::collections::{HashMap, HashSet};
 
         let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
@@ -4790,7 +4868,8 @@ mod seat_filter_tests {
             .await
             .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
-        serde_json::from_str(text).unwrap_or_else(|_| panic!("tool {name} returned non-JSON: {text}"))
+        serde_json::from_str(text)
+            .unwrap_or_else(|_| panic!("tool {name} returned non-JSON: {text}"))
     }
 
     #[tokio::test]
@@ -4831,7 +4910,12 @@ mod seat_filter_tests {
         for seat in ["seat-contactor", "seat-manager"] {
             let fetched = tool_json(&engine, seat, "get_task", json!({"task_id": task_id})).await;
             assert_eq!(fetched["task"]["name"], "Prepare pitch v2", "{seat}");
-            assert!(fetched["task"]["description"].as_str().unwrap().contains("учтено"));
+            assert!(
+                fetched["task"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("учтено")
+            );
             assert_eq!(fetched["task"]["status"], "IN_WORK");
         }
         // Аудит-событие update лежит в workflow-хранилище.
@@ -4863,7 +4947,12 @@ mod seat_filter_tests {
         .await
         .unwrap_err();
         assert_eq!(owner_blocked["kind"], "invalid_input");
-        assert!(owner_blocked["message"].as_str().unwrap().contains("append-only"));
+        assert!(
+            owner_blocked["message"]
+                .as_str()
+                .unwrap()
+                .contains("append-only")
+        );
     }
 
     #[tokio::test]
@@ -4910,10 +4999,20 @@ mod seat_filter_tests {
     #[tokio::test]
     async fn manager_get_list_delete_semantics_across_managed_seats() {
         let engine = swarm_engine().await;
-        let contactor_task =
-            tool_json(&engine, "seat-contactor", "create_task", json!({"name": "c1"})).await;
-        let analyst_task =
-            tool_json(&engine, "seat-analyst", "create_task", json!({"name": "a1"})).await;
+        let contactor_task = tool_json(
+            &engine,
+            "seat-contactor",
+            "create_task",
+            json!({"name": "c1"}),
+        )
+        .await;
+        let analyst_task = tool_json(
+            &engine,
+            "seat-analyst",
+            "create_task",
+            json!({"name": "a1"}),
+        )
+        .await;
         let workflow = tool_json(
             &engine,
             "seat-manager",
@@ -4995,7 +5094,13 @@ mod seat_filter_tests {
         .await
         .unwrap_err();
         assert_eq!(workflow_delete["kind"], "invalid_input");
-        let still_there = tool_json(&engine, "seat-contactor", "get_task", json!({"task_id": wf_id})).await;
+        let still_there = tool_json(
+            &engine,
+            "seat-contactor",
+            "get_task",
+            json!({"task_id": wf_id}),
+        )
+        .await;
         assert_eq!(still_there["success"], true);
         let owner_deleted = tool_json(
             &engine,

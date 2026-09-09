@@ -10,7 +10,7 @@
 //! are operational state, not RAG-eligible documents.
 
 use crate::error::{SlcError, SlcResult};
-use crate::proactivity::{mind_matches, normalize_write_mind_type, MindType};
+use crate::proactivity::{MindType, mind_matches, normalize_write_mind_type};
 use crate::storage::StorageBackend;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -101,7 +101,9 @@ impl<S: StorageBackend> FocusManager<S> {
     }
 
     pub async fn remove(&self, focus_id: &str, seat_id: Option<&str>) -> SlcResult<bool> {
-        let Some(item) = self.get(focus_id, seat_id).await? else { return Ok(false) };
+        let Some(item) = self.get(focus_id, seat_id).await? else {
+            return Ok(false);
+        };
         self.store.delete_record(COLLECTION, focus_id).await?;
         // Clean up references to the removed focus in other focuses.
         let mut fix = Vec::new();
@@ -128,7 +130,9 @@ impl<S: StorageBackend> FocusManager<S> {
         depends_on: Option<&[String]>,
         seat_id: Option<&str>,
     ) -> SlcResult<bool> {
-        let Some(mut item) = self.get(focus_id, seat_id).await? else { return Ok(false) };
+        let Some(mut item) = self.get(focus_id, seat_id).await? else {
+            return Ok(false);
+        };
         let mut changed = false;
         if let Some(t) = title {
             item.title = t.into();
@@ -173,7 +177,9 @@ impl<S: StorageBackend> FocusManager<S> {
     }
 
     pub async fn get(&self, focus_id: &str, seat_id: Option<&str>) -> SlcResult<Option<FocusItem>> {
-        let Some(val) = self.store.get_record(COLLECTION, focus_id).await? else { return Ok(None) };
+        let Some(val) = self.store.get_record(COLLECTION, focus_id).await? else {
+            return Ok(None);
+        };
         let item: FocusItem = serde_json::from_value(val)?;
         if let Some(s) = seat_id {
             if item.seat_id != s {
@@ -185,26 +191,44 @@ impl<S: StorageBackend> FocusManager<S> {
 
     /// Non-archived focuses with decay above threshold, sorted by priority
     /// (highest first). `mind_type: None` → no scope filter.
-    pub async fn get_active(&self, seat_id: &str, mind_type: Option<MindType>) -> SlcResult<Vec<FocusItem>> {
+    pub async fn get_active(
+        &self,
+        seat_id: &str,
+        mind_type: Option<MindType>,
+    ) -> SlcResult<Vec<FocusItem>> {
         let mut items = self.list_raw(seat_id, false).await?;
-        items.retain(|i| mind_matches(i.mind_type, mind_type) && i.decay_score(DECAY_LAMBDA) >= DECAY_THRESHOLD);
+        items.retain(|i| {
+            mind_matches(i.mind_type, mind_type) && i.decay_score(DECAY_LAMBDA) >= DECAY_THRESHOLD
+        });
         items.sort_by(|a, b| b.priority.cmp(&a.priority));
         Ok(items)
     }
 
     /// Active focuses whose dependencies are all resolved.
-    pub async fn get_unblocked(&self, seat_id: &str, mind_type: Option<MindType>) -> SlcResult<Vec<FocusItem>> {
+    pub async fn get_unblocked(
+        &self,
+        seat_id: &str,
+        mind_type: Option<MindType>,
+    ) -> SlcResult<Vec<FocusItem>> {
         let active = self.get_active(seat_id, mind_type).await?;
-        let active_ids: std::collections::HashSet<String> = active.iter().map(|f| f.focus_id.clone()).collect();
+        let active_ids: std::collections::HashSet<String> =
+            active.iter().map(|f| f.focus_id.clone()).collect();
         Ok(active
             .into_iter()
             .filter(|f| f.depends_on.iter().all(|d| !active_ids.contains(d)))
             .collect())
     }
 
-    pub async fn list_archived(&self, seat_id: &str, mind_type: Option<MindType>) -> SlcResult<Vec<FocusItem>> {
+    pub async fn list_archived(
+        &self,
+        seat_id: &str,
+        mind_type: Option<MindType>,
+    ) -> SlcResult<Vec<FocusItem>> {
         let items = self.list_raw(seat_id, true).await?;
-        Ok(items.into_iter().filter(|i| mind_matches(i.mind_type, mind_type)).collect())
+        Ok(items
+            .into_iter()
+            .filter(|i| mind_matches(i.mind_type, mind_type))
+            .collect())
     }
 
     /// Archive focuses whose decay score dropped below threshold. Returns the
@@ -222,14 +246,24 @@ impl<S: StorageBackend> FocusManager<S> {
         Ok(archived)
     }
 
-    pub async fn increment_reminder(&self, focus_id: &str, seat_id: Option<&str>) -> SlcResult<bool> {
-        let Some(mut item) = self.get(focus_id, seat_id).await? else { return Ok(false) };
+    pub async fn increment_reminder(
+        &self,
+        focus_id: &str,
+        seat_id: Option<&str>,
+    ) -> SlcResult<bool> {
+        let Some(mut item) = self.get(focus_id, seat_id).await? else {
+            return Ok(false);
+        };
         item.reminder_count += 1;
         self.put(&item).await?;
         Ok(true)
     }
 
-    pub async fn count_active(&self, seat_id: &str, mind_type: Option<MindType>) -> SlcResult<usize> {
+    pub async fn count_active(
+        &self,
+        seat_id: &str,
+        mind_type: Option<MindType>,
+    ) -> SlcResult<usize> {
         Ok(self.get_active(seat_id, mind_type).await?.len())
     }
 
@@ -239,14 +273,18 @@ impl<S: StorageBackend> FocusManager<S> {
         let mut stack: Vec<String> = deps.to_vec();
         while let Some(current) = stack.pop() {
             if current == focus_id {
-                return Err(SlcError::InvalidInput(format!("Cycle detected: {focus_id} → … → {focus_id}")));
+                return Err(SlcError::InvalidInput(format!(
+                    "Cycle detected: {focus_id} → … → {focus_id}"
+                )));
             }
             if visited.contains(&current) {
                 continue;
             }
             visited.insert(current.clone());
             let Some(item) = self.get(&current, Some(seat_id)).await? else {
-                return Err(SlcError::InvalidInput("Focus dependency not found for Seat".into()));
+                return Err(SlcError::InvalidInput(
+                    "Focus dependency not found for Seat".into(),
+                ));
             };
             stack.extend(item.depends_on);
         }
@@ -277,20 +315,30 @@ mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteStore;
 
-    async fn manager() -> (FocusManager<std::sync::Arc<dyn StorageBackend>>, std::sync::Arc<dyn StorageBackend>) {
-        let store: std::sync::Arc<dyn StorageBackend> = std::sync::Arc::new(SqliteStore::in_memory().unwrap());
+    async fn manager() -> (
+        FocusManager<std::sync::Arc<dyn StorageBackend>>,
+        std::sync::Arc<dyn StorageBackend>,
+    ) {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(SqliteStore::in_memory().unwrap());
         (FocusManager::new(store.clone()), store)
     }
 
     #[tokio::test]
     async fn add_get_active_cycle_and_archive() {
         let (m, _) = manager().await;
-        let a = m.add("seat1", "Ship MVP", "desc", 8, &[], None).await.unwrap();
+        let a = m
+            .add("seat1", "Ship MVP", "desc", 8, &[], None)
+            .await
+            .unwrap();
         assert!(a.focus_id.starts_with("foc_"));
         assert_eq!(a.priority, 8);
 
         // B depends on A (which exists) → allowed, no cycle
-        let b = m.add("seat1", "B", "", 5, &[a.focus_id.clone()], None).await.unwrap();
+        let b = m
+            .add("seat1", "B", "", 5, &[a.focus_id.clone()], None)
+            .await
+            .unwrap();
         let unblocked = m.get_unblocked("seat1", None).await.unwrap();
         // A is unblocked, B depends on A (which is active) → B blocked
         let ids: Vec<_> = unblocked.iter().map(|f| f.focus_id.clone()).collect();
@@ -298,15 +346,33 @@ mod tests {
         assert!(!ids.contains(&b.focus_id));
 
         // a cycle: C depends on A, then update A to depend on C
-        let c = m.add("seat1", "C", "", 5, &[a.focus_id.clone()], None).await.unwrap();
-        let err = m.update(&a.focus_id, None, None, None, Some(&[c.focus_id.clone()]), None).await.unwrap_err();
+        let c = m
+            .add("seat1", "C", "", 5, &[a.focus_id.clone()], None)
+            .await
+            .unwrap();
+        let err = m
+            .update(
+                &a.focus_id,
+                None,
+                None,
+                None,
+                Some(&[c.focus_id.clone()]),
+                None,
+            )
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("Cycle detected"));
 
         // hard limit (already have a, b, c = 3)
         for i in 0..4 {
-            m.add("seat1", &format!("F{i}"), "", 3, &[], None).await.unwrap();
+            m.add("seat1", &format!("F{i}"), "", 3, &[], None)
+                .await
+                .unwrap();
         }
-        let err = m.add("seat1", "overflow", "", 1, &[], None).await.unwrap_err();
+        let err = m
+            .add("seat1", "overflow", "", 1, &[], None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("Hard limit"));
     }
 
@@ -331,7 +397,11 @@ mod tests {
     async fn update_and_remove() {
         let (m, _) = manager().await;
         let item = m.add("seat3", "X", "old", 4, &[], None).await.unwrap();
-        assert!(m.update(&item.focus_id, Some("Y"), Some("new"), Some(9), None, None).await.unwrap());
+        assert!(
+            m.update(&item.focus_id, Some("Y"), Some("new"), Some(9), None, None)
+                .await
+                .unwrap()
+        );
         let got = m.get(&item.focus_id, None).await.unwrap().unwrap();
         assert_eq!(got.title, "Y");
         assert_eq!(got.description, "new");
@@ -345,8 +415,17 @@ mod tests {
     async fn seat_scoping_and_reminder() {
         let (m, _) = manager().await;
         let item = m.add("seat_a", "Focus A", "", 5, &[], None).await.unwrap();
-        assert!(m.get(&item.focus_id, Some("seat_b")).await.unwrap().is_none());
-        assert!(m.increment_reminder(&item.focus_id, Some("seat_a")).await.unwrap());
+        assert!(
+            m.get(&item.focus_id, Some("seat_b"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            m.increment_reminder(&item.focus_id, Some("seat_a"))
+                .await
+                .unwrap()
+        );
         let got = m.get(&item.focus_id, None).await.unwrap().unwrap();
         assert_eq!(got.reminder_count, 1);
     }

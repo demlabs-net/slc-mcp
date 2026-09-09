@@ -12,7 +12,7 @@
 use crate::error::SlcResult;
 use crate::storage::StorageBackend;
 use chrono::{Duration, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const COLLECTION: &str = "paginated_responses";
 
@@ -130,7 +130,12 @@ impl<S: StorageBackend> Paginator<S> {
     /// Cache a response, splitting it into pages. Returns the paginated
     /// result (with `_pagination`). If the payload fits one page, returns it
     /// directly with a single-page envelope.
-    pub async fn paginate(&self, _seat_id: &str, response_id: &str, data: &Value) -> SlcResult<Value> {
+    pub async fn paginate(
+        &self,
+        _seat_id: &str,
+        response_id: &str,
+        data: &Value,
+    ) -> SlcResult<Value> {
         let page_token_limit = self.page_token_limit().await?;
         self.paginate_with_limit(_seat_id, response_id, data, page_token_limit)
             .await
@@ -171,11 +176,7 @@ impl<S: StorageBackend> Paginator<S> {
                     let parts = Self::split_item(&result, chunk_limit);
                     let total_pages = parts.len();
                     self.store
-                        .put_record(
-                            COLLECTION,
-                            &format!("{response_id}:pages"),
-                            &json!(parts),
-                        )
+                        .put_record(COLLECTION, &format!("{response_id}:pages"), &json!(parts))
                         .await?;
                     self.store
                         .put_record(
@@ -190,8 +191,7 @@ impl<S: StorageBackend> Paginator<S> {
                         )
                         .await?;
                     let mut first = parts.into_iter().next().unwrap_or_default();
-                    first["_pagination"] =
-                        page_metadata(response_id, 1, total_pages, Some(1));
+                    first["_pagination"] = page_metadata(response_id, 1, total_pages, Some(1));
                     return Ok(first);
                 }
             }
@@ -201,11 +201,16 @@ impl<S: StorageBackend> Paginator<S> {
             return Ok(out);
         }
 
-        let items = result[list_key.as_ref().unwrap()].as_array().cloned().unwrap_or_default();
+        let items = result[list_key.as_ref().unwrap()]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let total_items = items.len();
         let envelope: Value = {
             let mut e = result.clone();
-            e.as_object_mut().unwrap().remove(list_key.as_ref().unwrap());
+            e.as_object_mut()
+                .unwrap()
+                .remove(list_key.as_ref().unwrap());
             e
         };
 
@@ -213,17 +218,16 @@ impl<S: StorageBackend> Paginator<S> {
         let mut pages: Vec<Value> = Vec::new();
         let mut current: Vec<Value> = Vec::new();
         let mut current_chars = 0usize;
-        let flush = |pages: &mut Vec<Value>,
-                     current: &mut Vec<Value>,
-                     current_chars: &mut usize| {
-            if !current.is_empty() {
-                let mut page = envelope.clone();
-                page[list_key.as_ref().unwrap()] = json!(*current);
-                pages.push(page);
-                *current = Vec::new();
-                *current_chars = 0;
-            }
-        };
+        let flush =
+            |pages: &mut Vec<Value>, current: &mut Vec<Value>, current_chars: &mut usize| {
+                if !current.is_empty() {
+                    let mut page = envelope.clone();
+                    page[list_key.as_ref().unwrap()] = json!(*current);
+                    pages.push(page);
+                    *current = Vec::new();
+                    *current_chars = 0;
+                }
+            };
         for item in items {
             let item_chars = estimate_chars(&item);
             if item_chars > char_limit {
@@ -272,20 +276,32 @@ impl<S: StorageBackend> Paginator<S> {
 
         // First page inline.
         let mut first = pages.into_iter().next().unwrap_or_default();
-        first["_pagination"] =
-            page_metadata(response_id, 1, total_pages, Some(total_items));
+        first["_pagination"] = page_metadata(response_id, 1, total_pages, Some(total_items));
         Ok(first)
     }
 
     /// Fetch a specific page.
-    pub async fn get_page(&self, seat_id: &str, response_id: &str, page: usize) -> SlcResult<Value> {
+    pub async fn get_page(
+        &self,
+        seat_id: &str,
+        response_id: &str,
+        page: usize,
+    ) -> SlcResult<Value> {
         let _ = seat_id;
-        let Some(pages_val) = self.store.get_record(COLLECTION, &format!("{response_id}:pages")).await? else {
-            return Ok(json!({ "error": format!("Response '{response_id}' not found or already expired") }));
+        let Some(pages_val) = self
+            .store
+            .get_record(COLLECTION, &format!("{response_id}:pages"))
+            .await?
+        else {
+            return Ok(
+                json!({ "error": format!("Response '{response_id}' not found or already expired") }),
+            );
         };
         let pages = pages_val.as_array().cloned().unwrap_or_default();
         if page < 1 || page > pages.len() {
-            return Ok(json!({ "error": format!("Invalid page {page}; total pages {}", pages.len()) }));
+            return Ok(
+                json!({ "error": format!("Invalid page {page}; total pages {}", pages.len()) }),
+            );
         }
         let mut out = pages[page - 1].clone();
         out["_pagination"] = page_metadata(response_id, page, pages.len(), None);
@@ -303,7 +319,10 @@ impl<S: StorageBackend> Paginator<S> {
                 out["_pagination"]["response_created_at"] = ts.clone();
             }
             let current = self.page_token_limit().await.unwrap_or(0);
-            let cached = meta.get("page_token_limit").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let cached = meta
+                .get("page_token_limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
             if pages.len() == 1 && cached != 0 && cached != current {
                 out["_pagination"]["hint"] = json!(format!(
                     "этот ответ кэширован при лимите страницы {cached} токенов, текущий — {current}. Если клиент обрезает выхлоп: set_page_limit(<меньше>) и ПОВТОРНО вызови исходный тул (например get_document) — кэш обновится."
@@ -315,10 +334,17 @@ impl<S: StorageBackend> Paginator<S> {
 
     /// Delete a cached response.
     pub async fn delete_response(&self, response_id: &str) -> SlcResult<Value> {
-        let pages_removed = self.store.delete_record(COLLECTION, &format!("{response_id}:pages")).await?;
-        self.store.delete_record(COLLECTION, &format!("{response_id}:meta")).await?;
+        let pages_removed = self
+            .store
+            .delete_record(COLLECTION, &format!("{response_id}:pages"))
+            .await?;
+        self.store
+            .delete_record(COLLECTION, &format!("{response_id}:meta"))
+            .await?;
         if !pages_removed {
-            return Ok(json!({ "error": format!("Response '{response_id}' not found or already expired") }));
+            return Ok(
+                json!({ "error": format!("Response '{response_id}' not found or already expired") }),
+            );
         }
         Ok(json!({ "success": true, "response_id": response_id, "deleted_pages": 1 }))
     }
@@ -330,9 +356,13 @@ impl<S: StorageBackend> Paginator<S> {
         // Persist under canonical + production-compat keys.
         let mut m = serde_json::Map::new();
         m.insert("page_token_limit".into(), json!(tokens));
-        self.store.put_record(COLLECTION, "settings", &Value::Object(m.clone())).await?;
+        self.store
+            .put_record(COLLECTION, "settings", &Value::Object(m.clone()))
+            .await?;
         m.insert("limit_tokens".into(), json!(tokens));
-        self.store.put_record(COLLECTION, "settings:prod", &Value::Object(m)).await?;
+        self.store
+            .put_record(COLLECTION, "settings:prod", &Value::Object(m))
+            .await?;
         Ok(json!({ "success": true, "page_token_limit": tokens, "limit_tokens": tokens }))
     }
 
@@ -355,11 +385,18 @@ impl<S: StorageBackend> Paginator<S> {
         let mut removed = 0;
         for (key, val) in self.store.list_records(COLLECTION).await? {
             if key.ends_with(":meta") {
-                let created = val.get("created_at").and_then(|v| v.as_str()).and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+                let created = val
+                    .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
                 if let Some(created) = created {
                     if created.with_timezone(&Utc) < cutoff {
                         let base = key.trim_end_matches(":meta");
-                        if self.store.delete_record(COLLECTION, &format!("{base}:pages")).await? {
+                        if self
+                            .store
+                            .delete_record(COLLECTION, &format!("{base}:pages"))
+                            .await?
+                        {
                             removed += 1;
                         }
                         self.store.delete_record(COLLECTION, &key).await?;
@@ -391,7 +428,18 @@ fn find_list_key(result: &Value) -> Option<String> {
     // (auto_load/references/tags у документа) иначе перехватывали бы
     // пагинацию, и одиночный объект с большим content не резался бы.
     let non_empty = |v: &Value| v.as_array().is_some_and(|a| !a.is_empty());
-    for key in ["results", "content", "items", "focuses", "reminders", "notifications", "tasks", "projects", "docs", "events"] {
+    for key in [
+        "results",
+        "content",
+        "items",
+        "focuses",
+        "reminders",
+        "notifications",
+        "tasks",
+        "projects",
+        "docs",
+        "events",
+    ] {
         if let Some(v) = obj.get(key) {
             if non_empty(v) {
                 return Some(key.to_string());
@@ -445,21 +493,30 @@ mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteStore;
 
-    fn paginator() -> (Paginator<std::sync::Arc<dyn StorageBackend>>, std::sync::Arc<dyn StorageBackend>) {
-        let store: std::sync::Arc<dyn StorageBackend> = std::sync::Arc::new(SqliteStore::in_memory().unwrap());
+    fn paginator() -> (
+        Paginator<std::sync::Arc<dyn StorageBackend>>,
+        std::sync::Arc<dyn StorageBackend>,
+    ) {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(SqliteStore::in_memory().unwrap());
         (Paginator::new(store.clone()), store)
     }
 
     #[tokio::test]
     async fn paginates_a_list() {
         let (p, _) = paginator();
-        let items: Vec<Value> = (0..100).map(|i| json!({"i": i, "text": "x".repeat(50)})).collect();
+        let items: Vec<Value> = (0..100)
+            .map(|i| json!({"i": i, "text": "x".repeat(50)}))
+            .collect();
         let result = p
             .paginate_with_limit("seat_x", "resp_1", &json!({ "results": items }), 500)
             .await
             .unwrap();
         let total_pages = result["_pagination"]["total_pages"].as_i64().unwrap();
-        assert!(total_pages > 1, "expected multiple pages, got {total_pages}");
+        assert!(
+            total_pages > 1,
+            "expected multiple pages, got {total_pages}"
+        );
         assert_eq!(result["_pagination"]["page"], 1);
 
         // fetch a middle page
@@ -467,7 +524,11 @@ mod tests {
         assert!(page2.get("_pagination").is_some());
         assert!(page2.get("results").is_some());
 
-        assert!(p.delete_response("resp_1").await.unwrap()["success"].as_bool().unwrap());
+        assert!(
+            p.delete_response("resp_1").await.unwrap()["success"]
+                .as_bool()
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -496,10 +557,16 @@ mod tests {
             .await
             .unwrap();
         let total = result["_pagination"]["total_pages"].as_u64().unwrap();
-        assert!(total >= 5, "big doc должен разбиться на части, total={total}");
+        assert!(
+            total >= 5,
+            "big doc должен разбиться на части, total={total}"
+        );
         // первая часть — chunk с part
         let first = result["results"][0].clone();
-        assert!(first.get("part").is_some(), "часть должна быть помечена part");
+        assert!(
+            first.get("part").is_some(),
+            "часть должна быть помечена part"
+        );
         // все части склеиваются в полный контент
         let mut combined = String::new();
         for page in 1..=total {
@@ -641,7 +708,10 @@ mod tests {
             .await
             .unwrap();
         let total = result["_pagination"]["total_pages"].as_u64().unwrap();
-        assert!(total >= 3, "контент объекта должен разбиться, total={total}");
+        assert!(
+            total >= 3,
+            "контент объекта должен разбиться, total={total}"
+        );
         assert!(result.get("part").is_some(), "первая часть помечена part");
         let mut combined = String::new();
         for page in 1..=total {
@@ -666,12 +736,11 @@ mod tests {
     async fn page_limit_accepts_any_positive_value() {
         let (p, store) = paginator();
         assert!(p.set_page_limit(0).await.unwrap()["error"].is_string());
-        assert!(p
-            .set_page_limit(350_000)
-            .await
-            .unwrap()["success"]
-            .as_bool()
-            .unwrap());
+        assert!(
+            p.set_page_limit(350_000).await.unwrap()["success"]
+                .as_bool()
+                .unwrap()
+        );
         let settings = store
             .get_record(COLLECTION, "settings")
             .await

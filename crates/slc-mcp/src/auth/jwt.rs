@@ -36,7 +36,11 @@ impl JwtManager {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(7);
-        Self { secret, access_minutes, refresh_days }
+        Self {
+            secret,
+            access_minutes,
+            refresh_days,
+        }
     }
 
     fn encode(&self, claims: Claims) -> Result<String, String> {
@@ -64,7 +68,12 @@ impl JwtManager {
         Ok(data.claims)
     }
 
-    pub fn create_access_token(&self, user_id: &str, username: &str, groups: &[String]) -> Result<String, String> {
+    pub fn create_access_token(
+        &self,
+        user_id: &str,
+        username: &str,
+        groups: &[String],
+    ) -> Result<String, String> {
         let now = now_ts();
         self.encode(Claims {
             sub: user_id.into(),

@@ -85,13 +85,28 @@ pub async fn resolve_seat(
     // legacy header/cookie identity path. Full web authentication above keeps
     // its independent JWT identity; seat mode uses the same bound MCP bearer.
     if std::env::var_os("SLC_MCP_SEAT_TOKENS").is_some() {
-        let seat = headers.get("x-seat-id").and_then(|v| v.to_str().ok()).map(str::trim);
+        let seat = headers
+            .get("x-seat-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
         let authorization = bearer_from(headers);
-        let token = authorization.as_deref().and_then(|v| v.strip_prefix("Bearer "));
+        let token = authorization
+            .as_deref()
+            .and_then(|v| v.strip_prefix("Bearer "));
         let principal = slc_core::authenticate(slc_core::AuthMode::BearerPlusSeat, seat, token)
-            .ok().flatten()
-            .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "Invalid authentication credentials".into()))?;
-        state.engine.seats.ensure_seat(&principal.seat_id).await
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid authentication credentials".into(),
+                )
+            })?;
+        state
+            .engine
+            .seats
+            .ensure_seat(&principal.seat_id)
+            .await
             .map_err(|e| internal(e.to_string()))?;
         return Ok((principal.seat_id, None));
     }

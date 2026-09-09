@@ -181,8 +181,7 @@ async fn main() -> anyhow::Result<()> {
             // а не перезаписывает его (иначе авто-коммит vault выключен
             // всегда, когда флаг не передан).
             config.auto_git_commit = auto_commit || config.auto_git_commit;
-            let dist = std::env::var("SLC_WEBUI_DIST")
-                .unwrap_or_else(|_| "./web-ui/dist".into());
+            let dist = std::env::var("SLC_WEBUI_DIST").unwrap_or_else(|_| "./web-ui/dist".into());
             let auth_state = auth::AuthState::from_env(&config.path);
             auth_state.store.load().context("auth store load")?;
             if config.mcp_sampling {
@@ -215,10 +214,18 @@ async fn main() -> anyhow::Result<()> {
             let engine = SlcEngine::open_async(config).await?;
             if let Some(uri) = from_mongo {
                 let opts = slc_core::migrate::MongoMigrateOptions { uri, database: db };
-                let llm = if rename_with_ai { Some(engine.llm()) } else { None };
-                let report =
-                    slc_core::migrate::migrate_legacy_mongo(&opts, engine.store(), llm, rename_with_ai)
-                        .await?;
+                let llm = if rename_with_ai {
+                    Some(engine.llm())
+                } else {
+                    None
+                };
+                let report = slc_core::migrate::migrate_legacy_mongo(
+                    &opts,
+                    engine.store(),
+                    llm,
+                    rename_with_ai,
+                )
+                .await?;
                 println!("mongo migration complete: {report:?}");
             } else if let Some(from) = from {
                 let report = slc_core::migrate::migrate_legacy_vault(&from, engine.store()).await?;
@@ -326,7 +333,8 @@ async fn main() -> anyhow::Result<()> {
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "doc".into());
-            let mut doc = slc_core::Document::new(name, cat, content, Default::default(), vec![], seat);
+            let mut doc =
+                slc_core::Document::new(name, cat, content, Default::default(), vec![], seat);
             engine.add_document(&mut doc).await?;
             println!(
                 "imported {} → {}",
