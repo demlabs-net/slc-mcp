@@ -142,6 +142,7 @@
 3. Истории: read-only API + archive/purge (только admin) (P4.1).
 4. Personalization (профили), observability, External sync.
 5. **Агентская система (registry/runs/субагенты) — НЕ портируем**; только
-   агентский поиск (agentic search на gemma-4-e4b).
+   клиентский multi-hop agentic search и seat-scoped MCP sampling без
+   отдельной reasoning-модели SLC.
 6. **Web UI — портируем на Rust** как standalone `slc-webui` в отдельном
    Docker (P6). REST API + Web UI для Vassista-клиентов — другие агенты.

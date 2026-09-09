@@ -4,7 +4,7 @@ use crate::server::AppState;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode, header, Uri},
+    http::{Request, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use std::sync::Arc;
@@ -30,10 +30,7 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
-pub async fn handler(
-    State(state): State<Arc<AppState>>,
-    uri: Uri,
-) -> Response {
+pub async fn handler(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let raw = uri.path().trim_start_matches('/');
     let rel = if raw.is_empty() { "index.html" } else { raw };
     // Path traversal protection.

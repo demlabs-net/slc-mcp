@@ -1,11 +1,10 @@
 //! LLM client abstraction — summarization/reasoning + embeddings.
 //!
-//! Two HTTP providers (auto-selected, same as the Python legacy):
-//! - [`LmStudioClient`] — **LM Studio** (OpenAI-compatible `/v1/…`), chosen
-//!   when `LMSTUDIO_URL` is set. `google/gemma-4-e4b` for reasoning/agentic
-//!   work, `text-embedding-nomic-embed-text-v1.5` for embeddings (defaults,
-//!   overridable via `LMSTUDIO_MODEL` / `LMSTUDIO_EMBED_MODEL`).
-//! - [`OllamaClient`] — Ollama HTTP API, used otherwise.
+//! Production can use [`McpSamplingLlm`] for seat-scoped reasoning through the
+//! already connected MCP client's model. It needs no dedicated model server;
+//! embeddings are unavailable in this mode and search falls back to BM25.
+//! Standalone deployments can instead select LM Studio, Ollama, Candle, or the
+//! deterministic CPU-hash provider.
 //!
 //! Any other provider can implement [`LlmClient`] (e.g. the core Vassista
 //! `LlmProvider` when embedded via the static lib).
@@ -120,7 +119,14 @@ impl LmStudioClient {
         embed_model: impl Into<String>,
     ) -> Self {
         LmStudioClient {
-            http: reqwest::Client::new(),
+            // A hung LM Studio (or a wedged connection) must not stall the
+            // caller forever: reindex-embeddings used to block on a batch
+            // embedding request with no timeout (observed: 0% CPU, process
+            // in futex_wait, embeddings.json frozen). 60s bounds every call.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
             embed_model: embed_model.into(),

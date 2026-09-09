@@ -4,7 +4,7 @@ use crate::error::SlcResult;
 use crate::model::{Seat, SeatStatus, UsageStats, unique_id};
 use crate::storage::StorageBackend;
 use chrono::{Duration, Utc};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Seat lifecycle manager.
 pub struct SeatManager<S: StorageBackend> {
@@ -15,7 +15,10 @@ pub struct SeatManager<S: StorageBackend> {
 
 impl<S: StorageBackend> SeatManager<S> {
     pub fn new(store: S, ttl_seconds: i64) -> Self {
-        SeatManager { store, ttl: ttl_seconds }
+        SeatManager {
+            store,
+            ttl: ttl_seconds,
+        }
     }
 
     pub fn with_env(store: S) -> Self {
@@ -28,7 +31,12 @@ impl<S: StorageBackend> SeatManager<S> {
 
     /// Create a seat; caller-supplied `seat_id` is kept as-is (≤128 chars,
     /// non-JWT) — otherwise auto-generated `slc_session_{…}`.
-    pub async fn create_seat(&self, seat_id: Option<String>, name: Option<String>, metadata: Option<Map<String, Value>>) -> SlcResult<Seat> {
+    pub async fn create_seat(
+        &self,
+        seat_id: Option<String>,
+        name: Option<String>,
+        metadata: Option<Map<String, Value>>,
+    ) -> SlcResult<Seat> {
         let now = Utc::now();
         let generated = match &seat_id {
             Some(id) if !id.is_empty() && id.len() <= 128 && !id.starts_with("eyJ") => id.clone(),
@@ -43,7 +51,11 @@ impl<S: StorageBackend> SeatManager<S> {
             status: SeatStatus::Active,
             created_at: now,
             last_accessed: now,
-            expires_at: if self.ttl > 0 { Some(now + Duration::seconds(self.ttl)) } else { None },
+            expires_at: if self.ttl > 0 {
+                Some(now + Duration::seconds(self.ttl))
+            } else {
+                None
+            },
             metadata: metadata.unwrap_or_default(),
             active_task_id: None,
             active_document_id: None,
@@ -64,7 +76,8 @@ impl<S: StorageBackend> SeatManager<S> {
             self.store.touch_seat(seat_id).await?;
             return Ok(seat);
         }
-        self.create_seat(Some(seat_id.to_string()), None, None).await
+        self.create_seat(Some(seat_id.to_string()), None, None)
+            .await
     }
 
     pub async fn list_active(&self, limit: usize) -> SlcResult<Vec<Seat>> {
@@ -72,7 +85,9 @@ impl<S: StorageBackend> SeatManager<S> {
     }
 
     pub async fn close_seat(&self, seat_id: &str) -> SlcResult<bool> {
-        self.store.set_seat_status(seat_id, SeatStatus::Closed).await
+        self.store
+            .set_seat_status(seat_id, SeatStatus::Closed)
+            .await
     }
 
     /// Mark expired seats as EXPIRED; returns how many.
@@ -82,7 +97,9 @@ impl<S: StorageBackend> SeatManager<S> {
         for seat in self.store.list_active_seats(1000).await? {
             if let Some(exp) = seat.expires_at {
                 if exp < now {
-                    self.store.set_seat_status(&seat.seat_id, SeatStatus::Expired).await?;
+                    self.store
+                        .set_seat_status(&seat.seat_id, SeatStatus::Expired)
+                        .await?;
                     n += 1;
                 }
             }
@@ -90,13 +107,25 @@ impl<S: StorageBackend> SeatManager<S> {
         Ok(n)
     }
 
-    pub async fn record_tool_use(&self, seat_id: &str, tool_name: &str, tokens: i64) -> SlcResult<bool> {
+    pub async fn record_tool_use(
+        &self,
+        seat_id: &str,
+        tool_name: &str,
+        tokens: i64,
+    ) -> SlcResult<bool> {
         self.store.incr_seat_stats(seat_id, tool_name, tokens).await
     }
 
     /// Active task pointer on the seat (working-memory context).
-    pub async fn set_active_task(&self, seat_id: &str, task_id: Option<&str>, context: Option<Value>) -> SlcResult<bool> {
-        let Some(mut seat) = self.store.get_seat(seat_id).await? else { return Ok(false) };
+    pub async fn set_active_task(
+        &self,
+        seat_id: &str,
+        task_id: Option<&str>,
+        context: Option<Value>,
+    ) -> SlcResult<bool> {
+        let Some(mut seat) = self.store.get_seat(seat_id).await? else {
+            return Ok(false);
+        };
         seat.active_task_id = task_id.map(String::from);
         // A task is a document — keep the unified anchor in sync.
         seat.active_document_id = task_id.map(String::from);
@@ -111,8 +140,14 @@ impl<S: StorageBackend> SeatManager<S> {
 
     /// Set the seat's active document (any category) — the context anchor
     /// included in `update_context`. `None` clears it.
-    pub async fn set_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool> {
-        let Some(mut seat) = self.store.get_seat(seat_id).await? else { return Ok(false) };
+    pub async fn set_active_document(
+        &self,
+        seat_id: &str,
+        document_id: Option<&str>,
+    ) -> SlcResult<bool> {
+        let Some(mut seat) = self.store.get_seat(seat_id).await? else {
+            return Ok(false);
+        };
         seat.active_document_id = document_id.map(String::from);
         self.store.insert_seat(&seat).await?;
         Ok(true)
@@ -127,7 +162,9 @@ impl<S: StorageBackend> SeatManager<S> {
     /// `context_limit_tokens`; legacy seats may still contain
     /// `context_limit_chars`).
     pub async fn set_context_key(&self, seat_id: &str, key: &str, value: Value) -> SlcResult<bool> {
-        let Some(mut seat) = self.store.get_seat(seat_id).await? else { return Ok(false) };
+        let Some(mut seat) = self.store.get_seat(seat_id).await? else {
+            return Ok(false);
+        };
         seat.context.insert(key.to_string(), value);
         self.store.insert_seat(&seat).await?;
         Ok(true)
@@ -159,10 +196,16 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         let mgr = SeatManager::new(store, 60);
 
-        let seat = mgr.create_seat(None, Some("cli".into()), None).await.unwrap();
+        let seat = mgr
+            .create_seat(None, Some("cli".into()), None)
+            .await
+            .unwrap();
         assert!(seat.seat_id.starts_with("slc_session_"));
 
-        let named = mgr.create_seat(Some("cursor-1".into()), None, None).await.unwrap();
+        let named = mgr
+            .create_seat(Some("cursor-1".into()), None, None)
+            .await
+            .unwrap();
         assert_eq!(named.seat_id, "cursor-1");
 
         let ensured = mgr.ensure_seat("cursor-1").await.unwrap();

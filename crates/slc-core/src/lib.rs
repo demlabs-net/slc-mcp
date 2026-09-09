@@ -25,15 +25,16 @@ pub mod model;
 pub mod notifications;
 pub mod pagination;
 pub mod proactivity;
-pub mod roles;
 pub mod profiles;
 pub mod reminders;
+pub mod roles;
 pub mod search;
 pub mod seat;
 pub mod seed;
 pub mod storage;
 pub mod tasks;
 pub mod timer;
+pub mod workflow;
 
 pub use auth::{AuthMode, Principal, auth_mode_from_env, authenticate};
 pub use error::{SlcError, SlcResult};
@@ -51,6 +52,7 @@ pub use seat::SeatManager;
 pub use storage::{DocFilter, DocSort, MetaPatch, SortDir, SortField, StorageBackend};
 pub use tasks::{ProjectInfo, TaskInfo, WorkItemManager};
 pub use timer::{TimerHandler, TimerRegistry};
+pub use workflow::{TaskEvent, TaskEventKind, TaskListScope};
 
 /// Which storage backend to open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,20 +193,26 @@ pub struct SlcConfig {
     /// Explicit cross-seat scope for operator seats.  From env
     /// `SLC_SEAT_MANAGE_ACL` (`manager=developer|designer,root=*`).
     /// An operator without an ACL entry remains restricted to its own seat.
-    pub seat_manage_acl: std::collections::HashMap<
-        String,
-        std::collections::HashSet<String>,
-    >,
+    pub seat_manage_acl: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Stable workflow principal → SLC seat mapping. Workflow records never
+    /// contain Swarm MCP endpoint names or transport-specific identities.
+    pub principal_seats: std::collections::HashMap<String, String>,
+    /// Workflow principal → SLC policy document automatically attached to
+    /// every new assigned task through its `auto_load` chain.
+    pub principal_policy_documents: std::collections::HashMap<String, String>,
+    /// Principal-level task delegation ACL, independent from message routing.
+    pub task_assign_acl: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Text-only principals cannot claim visual acceptance in task reports.
+    pub text_only_principals: std::collections::HashSet<String>,
 }
 
 impl SlcConfig {
-    /// Add a role to a seat (builder style; for embedded staticlib clients).
-    pub fn with_seat_role(
-        mut self,
-        seat_id: impl Into<String>,
-        role: roles::SeatRole,
-    ) -> Self {
-        self.seat_roles.entry(seat_id.into()).or_default().push(role);
+    /// Add a role to a seat (builder-style; for embedded staticlib clients).
+    pub fn with_seat_role(mut self, seat_id: impl Into<String>, role: roles::SeatRole) -> Self {
+        self.seat_roles
+            .entry(seat_id.into())
+            .or_default()
+            .push(role);
         self
     }
 
@@ -257,6 +265,10 @@ impl Default for SlcConfig {
                 .unwrap_or(true),
             seat_roles: roles::parse_roles_env(),
             seat_manage_acl: roles::parse_manage_acl_env(),
+            principal_seats: roles::parse_principal_seats_env(),
+            principal_policy_documents: roles::parse_principal_policy_documents_env(),
+            task_assign_acl: roles::parse_task_assign_acl_env(),
+            text_only_principals: roles::parse_text_only_principals_env(),
         }
     }
 }
@@ -355,6 +367,9 @@ pub struct SlcEngine {
     consolidator:
         MemoryConsolidator<std::sync::Arc<dyn StorageBackend>, std::sync::Arc<dyn LlmClient>>,
     pub config: SlcConfig,
+    /// Serializes workflow projections with their event/idempotency writes.
+    /// Storage backends do not expose a shared cross-record transaction API.
+    workflow_lock: tokio::sync::Mutex<()>,
     scheduler: tokio::sync::Mutex<Option<timer::TimerRegistry>>,
 }
 impl SlcEngine {
@@ -497,6 +512,7 @@ impl SlcEngine {
             compressor,
             consolidator,
             config,
+            workflow_lock: tokio::sync::Mutex::new(()),
             scheduler: tokio::sync::Mutex::new(None),
         }
     }
@@ -566,7 +582,7 @@ impl SlcEngine {
         Ok(self.config.context_limit_tokens)
     }
 
-    /// The active LLM provider (LM Studio or Ollama).
+    /// The active reasoning provider (including MCP sampling or local hash).
     pub fn llm(&self) -> &dyn LlmClient {
         self.llm.as_ref()
     }
@@ -910,6 +926,23 @@ impl SlcEngine {
         m.get_task(seat_id, task_id).await
     }
 
+    /// Update a task with full manager semantics.
+    ///
+    /// Authorization: the caller may update its own (or public) tasks, or —
+    /// as a manager (`operator` role with an explicit `SLC_SEAT_MANAGE_ACL`
+    /// target) — tasks of every managed seat. A genuinely unknown id is an
+    /// explicit [`SlcError::NotFound`]; an existing task of a non-managed seat
+    /// is an explicit [`SlcError::PermissionDenied`] (never a fake
+    /// "not found").
+    ///
+    /// Workflow tasks (see [`crate::tasks::is_workflow_task`]) stay
+    /// append-only for their participants and owners — those keep the legacy
+    /// `InvalidInput` guidance (use `task_message`/`report_task`/…). Only a
+    /// manager of the task owner seat may edit them: the edit is persisted
+    /// canonically through the workflow event store
+    /// ([`Self::workflow_update_task`]) which appends a durable
+    /// `update` audit event and refreshes the projection — never a silent
+    /// no-op and never a rewrite behind the event stream.
     pub async fn task_update(
         &self,
         seat_id: &str,
@@ -921,10 +954,52 @@ impl SlcEngine {
         auto_load: Option<&[String]>,
         status: Option<&str>,
         metadata: Option<&serde_json::Value>,
-    ) -> SlcResult<Option<tasks::TaskInfo>> {
+    ) -> SlcResult<tasks::TaskInfo> {
+        let Some(doc) = self.get_document(task_id).await? else {
+            return Err(SlcError::NotFound(format!("task not found: {task_id}")));
+        };
+        if doc.category != DocumentCategory::Task {
+            return Err(SlcError::NotFound(format!("task not found: {task_id}")));
+        }
+        let actor_owns = doc.is_kb_visible(seat_id);
+        let actor_manages = doc
+            .seat_id
+            .as_deref()
+            .filter(|owner| *owner != seat_id)
+            .is_some_and(|owner| self.can_manage_target(seat_id, owner));
+        if !actor_owns && !actor_manages {
+            return Err(SlcError::PermissionDenied(format!(
+                "task {task_id} belongs to another seat; only its owner or a manager (operator role with an SLC_SEAT_MANAGE_ACL target for that seat) may update it"
+            )));
+        }
+        if tasks::is_workflow_task(&doc) {
+            // The owner/participant stays on the append-only contract.
+            if !actor_manages {
+                return Err(SlcError::InvalidInput(
+                    "workflow tasks are append-only; use task_message, report_task, or cancel_task"
+                        .into(),
+                ));
+            }
+            return self
+                .workflow_update_task(
+                    seat_id,
+                    task_id,
+                    name,
+                    description,
+                    description_patch,
+                    project_id,
+                    auto_load,
+                    status,
+                    metadata,
+                )
+                .await;
+        }
         let m = tasks::WorkItemManager::new(self.store.clone());
+        // Plain (non-workflow) task: the document owner is the effective CRUD
+        // seat (public tasks are edited as their acting seat).
+        let effective_seat = doc.seat_id.clone().unwrap_or_else(|| seat_id.to_string());
         m.update_task(
-            seat_id,
+            &effective_seat,
             task_id,
             name,
             description,
@@ -934,12 +1009,40 @@ impl SlcEngine {
             status,
             metadata,
         )
-        .await
+        .await?
+        .ok_or_else(|| SlcError::NotFound(format!("task not found: {task_id}")))
     }
 
+    /// Delete a task with full manager semantics: the owner (or public task)
+    /// deletes its own plain tasks; a manager deletes plain tasks of every
+    /// managed seat. An unknown id is an idempotent `Ok(false)`; an existing
+    /// task of a non-managed seat is an explicit
+    /// [`SlcError::PermissionDenied`]. Workflow tasks are never deletable —
+    /// their event history is preserved ([`SlcError::InvalidInput`]).
     pub async fn task_delete(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
-        let m = tasks::WorkItemManager::new(self.store.clone());
-        m.delete_task(seat_id, task_id).await
+        let Some(doc) = self.get_document(task_id).await? else {
+            return Ok(false);
+        };
+        if doc.category != DocumentCategory::Task {
+            return Ok(false);
+        }
+        let actor_owns = doc.is_kb_visible(seat_id);
+        let actor_manages = doc
+            .seat_id
+            .as_deref()
+            .filter(|owner| *owner != seat_id)
+            .is_some_and(|owner| self.can_manage_target(seat_id, owner));
+        if !actor_owns && !actor_manages {
+            return Err(SlcError::PermissionDenied(format!(
+                "task {task_id} belongs to another seat; only its owner or a manager (operator role with an SLC_SEAT_MANAGE_ACL target for that seat) may delete it"
+            )));
+        }
+        if tasks::is_workflow_task(&doc) {
+            return Err(SlcError::InvalidInput(
+                "workflow tasks cannot be deleted; preserve their event history".into(),
+            ));
+        }
+        self.store().kb_purge(task_id).await
     }
 
     pub async fn task_list(
@@ -989,7 +1092,11 @@ impl SlcEngine {
 
     /// A seat's roles (empty — no special rights).
     pub fn seat_roles(&self, seat_id: &str) -> Vec<roles::SeatRole> {
-        self.config.seat_roles.get(seat_id).cloned().unwrap_or_default()
+        self.config
+            .seat_roles
+            .get(seat_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Whether an operator has at least one explicitly allowed cross-seat target.
@@ -1017,9 +1124,7 @@ impl SlcEngine {
                 .config
                 .seat_manage_acl
                 .get(actor)
-                .is_some_and(|targets| {
-                    targets.contains(target_seat) || targets.contains("*")
-                })
+                .is_some_and(|targets| targets.contains(target_seat) || targets.contains("*"))
     }
 
     /// Explicit cross-seat targets exposed to operator clients for discovery.
@@ -1044,7 +1149,16 @@ impl SlcEngine {
                 .is_some_and(|owner| self.can_manage_target(seat_id, owner))
     }
 
-    /// Right check: the actor may manage target_seat (its own seat — always).
+    /// Whether a seat may mutate or delete an existing knowledge document.
+    /// Public visibility is deliberately not write authority.
+    pub fn can_write_document(&self, seat_id: &str, doc: &Document) -> bool {
+        match doc.seat_id.as_deref() {
+            Some(owner) => self.can_manage_target(seat_id, owner),
+            None => self.has_operator_role(seat_id) && self.can_manage_seats(seat_id),
+        }
+    }
+
+    /// Permission check: actor may manage target_seat (own seat — always).
     pub async fn require_seat_manage(&self, actor: &str, target_seat: &str) -> SlcResult<()> {
         if self.can_manage_target(actor, target_seat) {
             return Ok(());
@@ -1099,8 +1213,17 @@ impl SlcEngine {
         }
         self.require_seat_manage(actor, target_seat).await?;
         let m = tasks::WorkItemManager::new(self.store.clone());
-        m.update_project(target_seat, project_id, None, None, None, None, Some(status), None)
-            .await
+        m.update_project(
+            target_seat,
+            project_id,
+            None,
+            None,
+            None,
+            None,
+            Some(status),
+            None,
+        )
+        .await
     }
 
     /// Archive/unarchive a focus on the target seat.
@@ -1138,10 +1261,19 @@ impl SlcEngine {
             return Err(SlcError::InvalidInput("new id must differ".into()));
         }
         let Some(doc) = self.get_document(document_id).await? else {
-            return Err(SlcError::NotFound(format!("document not found: {document_id}")));
+            return Err(SlcError::NotFound(format!(
+                "document not found: {document_id}"
+            )));
         };
         if !doc.is_kb_visible(seat_id) {
-            return Err(SlcError::NotFound(format!("document not found: {document_id}")));
+            return Err(SlcError::NotFound(format!(
+                "document not found: {document_id}"
+            )));
+        }
+        if tasks::is_workflow_task(&doc) {
+            return Err(SlcError::InvalidInput(
+                "workflow task ids are immutable; preserve event correlation and lineage".into(),
+            ));
         }
         if self.store.kb_get(new_id).await?.is_some() {
             return Err(SlcError::InvalidInput(format!(
@@ -1178,9 +1310,7 @@ impl SlcEngine {
             let mut c3 = false;
             for key in ["project", "project_id"] {
                 if d.metadata.extra.get(key).and_then(|v| v.as_str()) == Some(document_id) {
-                    d.metadata
-                        .extra
-                        .insert(key.into(), json!(new_id));
+                    d.metadata.extra.insert(key.into(), json!(new_id));
                     c3 = true;
                 }
             }
@@ -1288,7 +1418,8 @@ impl SlcEngine {
     ) -> SlcResult<RenameReport> {
         let m = tasks::WorkItemManager::new(self.store.clone());
         let new_id = m.speaking_id(new_name).await;
-        self.rename_document(seat_id, task_id, &new_id, Some(new_name)).await
+        self.rename_document(seat_id, task_id, &new_id, Some(new_name))
+            .await
     }
 
     /// Rename a project: the new id is a slug from `new_name`, the name is updated.
@@ -1300,7 +1431,8 @@ impl SlcEngine {
     ) -> SlcResult<RenameReport> {
         let m = tasks::WorkItemManager::new(self.store.clone());
         let new_id = m.speaking_id(new_name).await;
-        self.rename_document(seat_id, project_id, &new_id, Some(new_name)).await
+        self.rename_document(seat_id, project_id, &new_id, Some(new_name))
+            .await
     }
 
     /// The seat's active document, if any (task fallback included).
@@ -1308,12 +1440,21 @@ impl SlcEngine {
         let Some(id) = self.store.get_seat_active_document(seat_id).await? else {
             return Ok(None);
         };
-        self.get_document(&id).await
+        Ok(self
+            .get_document(&id)
+            .await?
+            .filter(|doc| self.can_read_document(seat_id, doc)))
     }
 
     pub async fn task_get_active(&self, seat_id: &str) -> SlcResult<Option<tasks::TaskInfo>> {
         let m = tasks::WorkItemManager::new(self.store.clone());
-        m.get_active_task(seat_id).await
+        let Some(task) = m.get_active_task(seat_id).await? else {
+            return Ok(None);
+        };
+        match self.get_document(&task.task_id).await? {
+            Some(doc) if self.can_read_document(seat_id, &doc) => Ok(Some(task)),
+            _ => Ok(None),
+        }
     }
 
     pub async fn project_create(
@@ -1680,7 +1821,7 @@ pub unsafe extern "C" fn slc_free_string(ptr: *mut std::os::raw::c_char) {
 #[cfg(test)]
 mod engine_tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[tokio::test]
     async fn summarize_text_uses_llm_and_falls_back() {
@@ -1707,8 +1848,108 @@ mod engine_tests {
         assert!(out2.len() > 5, "no manual truncation: {out2}");
     }
 
+    #[tokio::test]
+    async fn active_anchors_do_not_disclose_foreign_private_documents() {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
+        let engine = SlcEngine::with(store, llm, SlcConfig::default());
+        engine.ensure_seat("reader").await.unwrap();
+        engine.ensure_seat("owner").await.unwrap();
+        for (id, owner, visible) in [
+            ("private", Some("owner"), false),
+            ("own", Some("reader"), true),
+            ("public", None, true),
+        ] {
+            let mut doc = Document::new(
+                id,
+                DocumentCategory::Custom,
+                "content",
+                DocMeta::default(),
+                vec![],
+                owner.map(str::to_string),
+            );
+            engine.add_document(&mut doc).await.unwrap();
+            // Simulate an old pointer written before activation ACL enforcement.
+            engine
+                .seats
+                .set_active_document("reader", Some(id))
+                .await
+                .unwrap();
+            assert_eq!(
+                engine
+                    .document_get_active("reader")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                visible,
+                "{id}"
+            );
+        }
+        let task = engine
+            .task_create(
+                "owner",
+                "private task",
+                "private content",
+                None,
+                &[],
+                &json!({}),
+            )
+            .await
+            .unwrap();
+        engine
+            .seats
+            .set_active_document("reader", None)
+            .await
+            .unwrap();
+        engine
+            .seats
+            .set_active_task("reader", Some(&task.task_id), None)
+            .await
+            .unwrap();
+        assert!(engine.task_get_active("reader").await.unwrap().is_none());
+        assert!(
+            engine
+                .document_get_active("reader")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_and_explicit_target_are_both_required() {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
+        let config = SlcConfig::default()
+            .with_seat_role("role-only", roles::SeatRole::Operator)
+            .with_seat_manage_target("acl-only", "worker")
+            .with_seat_role("boss", roles::SeatRole::Operator)
+            .with_seat_manage_target("boss", "worker");
+        let engine = SlcEngine::with(store, llm, config);
+        assert!(!engine.can_manage_target("role-only", "worker"));
+        assert!(!engine.can_manage_target("acl-only", "worker"));
+        assert!(engine.can_manage_target("boss", "worker"));
+        assert!(!engine.can_manage_target("boss", "unlisted"));
+        assert!(engine.can_manage_target("worker", "worker"));
+        assert!(
+            engine
+                .require_seat_manage("role-only", "worker")
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .require_seat_manage("acl-only", "worker")
+                .await
+                .is_err()
+        );
+        assert!(engine.require_seat_manage("boss", "worker").await.is_ok());
+    }
+
     /// Seat roles: an operator manages another seat's context, a regular
-    /// seat — does not (SlcError::PermissionDenied).
+    /// seat — not (SlcError::PermissionDenied).
     #[tokio::test]
     async fn seat_roles_manage_other_seats() {
         use crate::error::SlcError;
@@ -1736,7 +1977,10 @@ mod engine_tests {
             Some("worker".to_string()),
         );
         engine.add_document(&mut doc).await.unwrap();
-        let task = engine.task_create("worker", "worker task", "", None, &[], &json!({})).await.unwrap();
+        let task = engine
+            .task_create("worker", "worker task", "", None, &[], &json!({}))
+            .await
+            .unwrap();
 
         // A regular seat cannot manage another seat.
         let err = engine
@@ -1745,35 +1989,79 @@ mod engine_tests {
             .unwrap_err();
         assert!(matches!(err, SlcError::PermissionDenied(_)), "{err:?}");
 
-        // One's own seat — always allowed (target = actor).
-        assert!(engine.document_activate_for("worker", "worker", "doc_worker").await.unwrap());
+        // Own seat — always allowed (target = actor).
+        assert!(
+            engine
+                .document_activate_for("worker", "worker", "doc_worker")
+                .await
+                .unwrap()
+        );
 
         // The operator activates/deactivates another seat.
-        assert!(engine.document_activate_for("boss", "worker", "doc_worker").await.unwrap());
+        assert!(
+            engine
+                .document_activate_for("boss", "worker", "doc_worker")
+                .await
+                .unwrap()
+        );
         assert_eq!(
-            engine.document_get_active("worker").await.unwrap().unwrap().document_id,
+            engine
+                .document_get_active("worker")
+                .await
+                .unwrap()
+                .unwrap()
+                .document_id,
             "doc_worker"
         );
-        engine.document_deactivate_for("boss", "worker").await.unwrap();
-        assert!(engine.document_get_active("worker").await.unwrap().is_none());
+        engine
+            .document_deactivate_for("boss", "worker")
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .document_get_active("worker")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
-        // Tasks: the operator sets the active task of another seat.
-        assert!(engine.task_activate_for("boss", "worker", &task.task_id).await.unwrap());
+        // Tasks: the operator sets an active task on another seat.
+        assert!(
+            engine
+                .task_activate_for("boss", "worker", &task.task_id)
+                .await
+                .unwrap()
+        );
         assert_eq!(
-            engine.task_get_active("worker").await.unwrap().unwrap().task_id,
+            engine
+                .task_get_active("worker")
+                .await
+                .unwrap()
+                .unwrap()
+                .task_id,
             task.task_id
         );
 
-        // Focuses: the operator archives another seat's focus.
-        let f = engine.focus_add("worker", "focus task", "", 5, &[], None).await.unwrap();
-        assert!(engine.focus_set_archived_for("boss", "worker", &f.focus_id, true).await.unwrap());
-        assert!(engine
-            .focus_list("worker", None)
+        // Focuses: the operator archives a focus of another seat.
+        let f = engine
+            .focus_add("worker", "focus task", "", 5, &[], None)
             .await
-            .unwrap()
-            .iter()
-            .all(|x| x.focus_id != f.focus_id || x.archived));
-        // Without a role — denial.
+            .unwrap();
+        assert!(
+            engine
+                .focus_set_archived_for("boss", "worker", &f.focus_id, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            engine
+                .focus_list("worker", None)
+                .await
+                .unwrap()
+                .iter()
+                .all(|x| x.focus_id != f.focus_id || x.archived)
+        );
+        // Without a role — denied.
         let err = engine
             .focus_set_archived_for("worker", "boss", &f.focus_id, true)
             .await
@@ -1781,7 +2069,10 @@ mod engine_tests {
         assert!(matches!(err, SlcError::PermissionDenied(_)));
 
         // Projects: the operator archives another seat's project.
-        let proj = engine.project_create("worker", "worker proj", "", &[], &json!({})).await.unwrap();
+        let proj = engine
+            .project_create("worker", "worker proj", "", &[], &json!({}))
+            .await
+            .unwrap();
         let updated = engine
             .project_set_status_for("boss", "worker", &proj.project_id, "archived")
             .await
@@ -1803,8 +2094,531 @@ mod engine_tests {
         assert!(!engine.can_manage_seats("worker"));
     }
 
-    /// Document rename: cascade of auto_load/references/wiki links/active
-    /// seat pointers; rename_task builds a slug from the new name.
+    #[tokio::test]
+    async fn document_write_authority_is_not_inferred_from_visibility() {
+        use crate::roles::SeatRole;
+
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
+        let config = SlcConfig::default()
+            .with_seat_role("boss", SeatRole::Operator)
+            .with_seat_manage_target("boss", "worker")
+            .with_seat_role("unscoped-operator", SeatRole::Operator);
+        let engine = SlcEngine::with(store, llm, config);
+        let owned = Document::new(
+            "owned",
+            DocumentCategory::Custom,
+            "content",
+            DocMeta::default(),
+            vec![],
+            Some("worker".into()),
+        );
+        let public = Document::new(
+            "public",
+            DocumentCategory::System,
+            "content",
+            DocMeta::default(),
+            vec![],
+            None,
+        );
+
+        assert!(engine.can_write_document("worker", &owned));
+        assert!(engine.can_write_document("boss", &owned));
+        assert!(!engine.can_write_document("other", &owned));
+        assert!(engine.can_write_document("boss", &public));
+        assert!(!engine.can_write_document("worker", &public));
+        assert!(!engine.can_write_document("unscoped-operator", &public));
+    }
+
+    /// A manager (operator + SLC_SEAT_MANAGE_ACL) updates the contactor's
+    /// workflow task in IN_WORK: the edit is persisted through the canonical
+    /// workflow-store route (a durable update event) and survives a reload.
+    #[tokio::test]
+    async fn manager_updates_workflow_task_of_managed_seat_with_durable_event() {
+        use crate::roles::SeatRole;
+        use crate::tasks::STATUS_ACTIVE;
+        use crate::workflow::{QUEUE_STATE_RUNNING, TaskEventKind};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let store: Arc<dyn StorageBackend> =
+            Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let config = SlcConfig::default()
+            .with_seat_role("seat-manager", SeatRole::Operator)
+            .with_seat_manage_target("seat-manager", "seat-contactor")
+            .with_seat_manage_target("seat-manager", "seat-analyst");
+        let mut config = config;
+        config.principal_seats = HashMap::from([
+            ("manager".into(), "seat-manager".into()),
+            ("contactor".into(), "seat-contactor".into()),
+            ("analyst".into(), "seat-analyst".into()),
+        ]);
+        config.task_assign_acl = HashMap::from([("manager".into(), HashSet::from(["*".into()]))]);
+        let engine = SlcEngine::with(store.clone(), Arc::new(MockLlm::new(vec![])), config);
+
+        let assigned = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "contactor",
+                "Prepare pitch",
+                "initial body",
+                None,
+                None,
+                &[],
+                &json!({"customer": "acme"}),
+                Some("assign-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(assigned.issuer.as_deref(), Some("manager"));
+        assert_eq!(assigned.assignee.as_deref(), Some("contactor"));
+        engine
+            .workflow_start_task(
+                "seat-contactor",
+                &assigned.task_id,
+                "Starting",
+                Some("start-1"),
+            )
+            .await
+            .unwrap();
+
+        // The manager edits the contactor's workflow task while it is
+        // IN_WORK: name + append-diff to the body + auto_load + project + metadata.
+        let updated = engine
+            .task_update(
+                "seat-manager",
+                &assigned.task_id,
+                Some("Prepare pitch v2"),
+                None,
+                Some(&json!([{"op":"append","content":"## Правки менеджера\nуточнено"}])),
+                Some(Some("lead_gen")),
+                Some(&["swarm_policy_contactor".to_string()]),
+                Some("IN_WORK"),
+                Some(&json!({"priority": "high"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.name, "Prepare pitch v2");
+        assert!(updated.description.contains("уточнено"));
+        assert_eq!(updated.status, STATUS_ACTIVE);
+        assert_eq!(updated.queue_state.as_deref(), Some(QUEUE_STATE_RUNNING));
+        assert_eq!(updated.project_id.as_deref(), Some("lead_gen"));
+        assert!(
+            updated
+                .auto_load
+                .contains(&"swarm_policy_contactor".to_string())
+        );
+        assert_eq!(updated.metadata["priority"], json!("high"));
+
+        // Reload: a new engine instance on the same store sees the edit
+        // both from the contactor seat and from the manager seat.
+        let engine2 = SlcEngine::with(store.clone(), Arc::new(MockLlm::new(vec![])), {
+            let mut c = SlcConfig::default()
+                .with_seat_role("seat-manager", SeatRole::Operator)
+                .with_seat_manage_target("seat-manager", "seat-contactor");
+            c.principal_seats = HashMap::from([
+                ("manager".into(), "seat-manager".into()),
+                ("contactor".into(), "seat-contactor".into()),
+            ]);
+            c.task_assign_acl = HashMap::from([("manager".into(), HashSet::from(["*".into()]))]);
+            c
+        });
+        let from_owner = engine2
+            .workflow_get_task("seat-contactor", &assigned.task_id)
+            .await
+            .unwrap();
+        assert_eq!(from_owner.name, "Prepare pitch v2");
+        assert!(from_owner.description.contains("уточнено"));
+        let from_manager = engine2
+            .workflow_get_task("seat-manager", &assigned.task_id)
+            .await
+            .unwrap();
+        assert_eq!(from_manager.name, "Prepare pitch v2");
+        // Identity and queue are untouched.
+        let raw = store.kb_get(&assigned.task_id).await.unwrap().unwrap();
+        assert_eq!(
+            raw.metadata
+                .extra
+                .get("workflow_version")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            raw.metadata
+                .extra
+                .get("queue_state")
+                .and_then(Value::as_str),
+            Some(QUEUE_STATE_RUNNING)
+        );
+        assert!(raw.content.contains("уточнено"));
+
+        // Audit: a durable update event carrying the changed fields.
+        let events = engine2
+            .workflow_task_events("seat-manager", &assigned.task_id, 50)
+            .await
+            .unwrap();
+        let update_event = events
+            .iter()
+            .find(|event| event.kind == TaskEventKind::Update)
+            .expect("manager update must append a durable update event");
+        assert_eq!(update_event.actor, "manager");
+        assert!(update_event.message.contains("updated by manager"));
+        let fields = update_event.metadata["fields_changed"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for field in ["name", "description", "auto_load", "project_id", "metadata"] {
+            assert!(
+                fields.contains(&field),
+                "fields_changed must include {field}: {fields:?}"
+            );
+        }
+
+        // A workflow task's status is not rewritten through events — an explicit error.
+        let status_err = engine
+            .task_update(
+                "seat-manager",
+                &assigned.task_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("COMPLETED"),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(status_err, SlcError::InvalidInput(_)),
+            "{status_err}"
+        );
+        assert!(status_err.to_string().contains("event-governed"));
+
+        // The owner (contactor) stays on the append-only contract.
+        let owner_err = engine
+            .task_update(
+                "seat-contactor",
+                &assigned.task_id,
+                Some("hijacked"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(owner_err.to_string().contains("append-only"), "{owner_err}");
+    }
+
+    /// Tasks of other seats (plain and workflow) cannot be updated or
+    /// deleted by a non-manager: an explicit PermissionDenied instead of a fake "not found".
+    #[tokio::test]
+    async fn non_manager_cannot_update_or_delete_tasks_of_other_seats() {
+        use crate::roles::SeatRole;
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let store: Arc<dyn StorageBackend> =
+            Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let config = SlcConfig::default()
+            .with_seat_role("seat-manager", SeatRole::Operator)
+            .with_seat_manage_target("seat-manager", "seat-contactor")
+            .with_seat_manage_target("seat-manager", "seat-analyst");
+        let mut config = config;
+        config.principal_seats = HashMap::from([
+            ("manager".into(), "seat-manager".into()),
+            ("contactor".into(), "seat-contactor".into()),
+            ("analyst".into(), "seat-analyst".into()),
+        ]);
+        config.task_assign_acl = HashMap::from([("manager".into(), HashSet::from(["*".into()]))]);
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        engine.ensure_seat("seat-outsider").await.unwrap();
+
+        let plain = engine
+            .task_create("seat-contactor", "private plan", "", None, &[], &json!({}))
+            .await
+            .unwrap();
+        let workflow = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "contactor",
+                "Call campaign",
+                "call list",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("deny-assign"),
+            )
+            .await
+            .unwrap();
+
+        // A non-manager cannot update another seat's plain task.
+        let err = engine
+            .task_update(
+                "seat-outsider",
+                &plain.task_id,
+                Some("rewritten"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
+        assert!(err.to_string().contains("SLC_SEAT_MANAGE_ACL"));
+        // The analyst does not own the contactor's task either.
+        assert!(matches!(
+            engine
+                .task_update(
+                    "seat-analyst",
+                    &plain.task_id,
+                    Some("rewritten"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await,
+            Err(SlcError::PermissionDenied(_))
+        ));
+        // Another seat's workflow task cannot be deleted…
+        let err = engine
+            .task_delete("seat-outsider", &workflow.task_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
+        // …nor updated.
+        let err = engine
+            .task_update(
+                "seat-outsider",
+                &workflow.task_id,
+                Some("x"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
+        // Another seat's plain task cannot be deleted.
+        let err = engine
+            .task_delete("seat-analyst", &plain.task_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
+        // The owner deletes its own plain task.
+        assert!(
+            engine
+                .task_delete("seat-contactor", &plain.task_id)
+                .await
+                .unwrap()
+        );
+        assert!(engine.get_document(&plain.task_id).await.unwrap().is_none());
+        // An existing workflow task cannot be deleted by its owner either (event history).
+        let err = engine
+            .task_delete("seat-contactor", &workflow.task_id)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be deleted"), "{err}");
+    }
+
+    /// A manager sees/reads/deletes tasks of all managed seats
+    /// (plain and workflow, including IN_WORK); an unknown id — NotFound,
+    /// workflow tasks — cannot be deleted.
+    #[tokio::test]
+    async fn manager_get_list_delete_semantics_cover_all_managed_seats() {
+        use crate::roles::SeatRole;
+        use crate::workflow::TaskListScope;
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let store: Arc<dyn StorageBackend> =
+            Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let config = SlcConfig::default()
+            .with_seat_role("seat-manager", SeatRole::Operator)
+            .with_seat_manage_target("seat-manager", "seat-contactor")
+            .with_seat_manage_target("seat-manager", "seat-analyst");
+        let mut config = config;
+        config.principal_seats = HashMap::from([
+            ("manager".into(), "seat-manager".into()),
+            ("contactor".into(), "seat-contactor".into()),
+            ("analyst".into(), "seat-analyst".into()),
+        ]);
+        config.task_assign_acl = HashMap::from([("manager".into(), HashSet::from(["*".into()]))]);
+        let engine = SlcEngine::with(store.clone(), Arc::new(MockLlm::new(vec![])), config);
+
+        let plain_contactor = engine
+            .task_create(
+                "seat-contactor",
+                "contactor todo",
+                "",
+                None,
+                &[],
+                &json!({}),
+            )
+            .await
+            .unwrap();
+        let plain_analyst = engine
+            .task_create("seat-analyst", "analyst todo", "", None, &[], &json!({}))
+            .await
+            .unwrap();
+        let workflow = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "contactor",
+                "Cold list",
+                "call them",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("list-assign"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-contactor",
+                &workflow.task_id,
+                "go",
+                Some("list-start"),
+            )
+            .await
+            .unwrap();
+
+        // get: the manager reads tasks of every managed seat (including the
+        // IN_WORK workflow task), the owner — its own.
+        let via_manager = engine
+            .workflow_get_task("seat-manager", &plain_analyst.task_id)
+            .await
+            .unwrap();
+        assert_eq!(via_manager.task_id, plain_analyst.task_id);
+        let in_work = engine
+            .workflow_get_task("seat-manager", &workflow.task_id)
+            .await
+            .unwrap();
+        assert_eq!(in_work.status, crate::tasks::STATUS_ACTIVE);
+        assert_eq!(
+            in_work.queue_state.as_deref(),
+            Some(crate::workflow::QUEUE_STATE_RUNNING)
+        );
+
+        // list (Visible scope): workflow tasks of all managed seats
+        // (including IN_WORK) are visible to the manager in one call.
+        let visible = engine
+            .workflow_list_tasks(
+                "seat-manager",
+                TaskListScope::Visible,
+                None,
+                None,
+                None,
+                None,
+                50,
+            )
+            .await
+            .unwrap();
+        assert!(
+            visible.iter().any(|t| t.task_id == workflow.task_id),
+            "manager Visible list must include the IN_WORK workflow task: {:?}",
+            visible.iter().map(|t| &t.task_id).collect::<Vec<_>>()
+        );
+        // The per-seat list also covers the plain tasks of every managed
+        // seat (legacy target_seat manager semantics).
+        let per_seat_contactor = engine
+            .task_list("seat-contactor", None, None, 50)
+            .await
+            .unwrap();
+        let contactor_ids: HashSet<String> = per_seat_contactor
+            .iter()
+            .map(|t| t.task_id.clone())
+            .collect();
+        assert!(contactor_ids.contains(&plain_contactor.task_id));
+        assert!(contactor_ids.contains(&workflow.task_id));
+        let per_seat_analyst = engine
+            .task_list("seat-analyst", None, None, 50)
+            .await
+            .unwrap();
+        assert!(
+            per_seat_analyst
+                .iter()
+                .any(|t| t.task_id == plain_analyst.task_id)
+        );
+        // An outsider sees nothing foreign in the Visible scope.
+        let outsider_visible = engine
+            .workflow_list_tasks(
+                "seat-outsider",
+                TaskListScope::Visible,
+                None,
+                None,
+                None,
+                None,
+                50,
+            )
+            .await
+            .unwrap();
+        assert!(outsider_visible.is_empty());
+
+        // delete: the manager deletes a plain task of a managed seat…
+        assert!(
+            engine
+                .task_delete("seat-manager", &plain_analyst.task_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            engine
+                .get_document(&plain_analyst.task_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // …but not a workflow task (event history is preserved).
+        let err = engine
+            .task_delete("seat-manager", &workflow.task_id)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be deleted"), "{err}");
+        assert!(
+            engine
+                .get_document(&workflow.task_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // An unknown id — an honest NotFound, not a "hidden" answer.
+        let err = engine
+            .task_update(
+                "seat-manager",
+                "task_no_such_id",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SlcError::NotFound(_)), "{err}");
+    }
+
+    /// Renaming a document: a cascade over auto_load/references/wiki links/
+    /// active seat pointers; rename_task builds the slug from the new name.
     #[tokio::test]
     async fn rename_document_cascades_links() {
         let store: std::sync::Arc<dyn StorageBackend> =
@@ -1834,10 +2648,16 @@ mod engine_tests {
         ref_doc.auto_load = vec!["old_name".into()];
         ref_doc.references = vec!["old_name".into()];
         engine.add_document(&mut ref_doc).await.unwrap();
-        // The seat's active pointer to the old id.
-        engine.document_activate("seat_a", "old_name").await.unwrap();
+        // The seat's active pointer on the old id.
+        engine
+            .document_activate("seat_a", "old_name")
+            .await
+            .unwrap();
 
-        let report = engine.rename_document("seat_a", "old_name", "new_name", None).await.unwrap();
+        let report = engine
+            .rename_document("seat_a", "old_name", "new_name", None)
+            .await
+            .unwrap();
         assert_eq!(report.new_id, "new_name");
         assert_eq!(report.links_fixed, 2); // the doc itself (content) + ref_doc
         assert_eq!(report.content_links_fixed, 1); // only the doc itself
@@ -1846,10 +2666,18 @@ mod engine_tests {
         // The old id is gone, the new one is in place, content has replaced links.
         assert!(engine.get_document("old_name").await.unwrap().is_none());
         let renamed = engine.get_document("new_name").await.unwrap().unwrap();
-        assert_eq!(renamed.content, "текст со ссылкой [[new_name]] и [[new_name|alias]]");
-        // The seat pointer is updated.
         assert_eq!(
-            engine.document_get_active("seat_a").await.unwrap().unwrap().document_id,
+            renamed.content,
+            "текст со ссылкой [[new_name]] и [[new_name|alias]]"
+        );
+        // The seat's pointer was updated.
+        assert_eq!(
+            engine
+                .document_get_active("seat_a")
+                .await
+                .unwrap()
+                .unwrap()
+                .document_id,
             "new_name"
         );
         // References updated.
@@ -1857,11 +2685,28 @@ mod engine_tests {
         assert_eq!(refd.auto_load, vec!["new_name".to_string()]);
         assert_eq!(refd.references, vec!["new_name".to_string()]);
         // A link to a nonexistent id — an error.
-        let err = engine.rename_document("seat_a", "new_name", "new_name", None).await.unwrap_err();
+        let err = engine
+            .rename_document("seat_a", "new_name", "new_name", None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SlcError::InvalidInput(_)));
-        // Embeddings: the old key removed, the new one re-embedded.
-        assert!(engine.store().get_embedding("new_name").await.unwrap().is_some());
-        assert!(engine.store().get_embedding("old_name").await.unwrap().is_none());
+        // Embeddings: the old key was removed, the new one is re-embedded.
+        assert!(
+            engine
+                .store()
+                .get_embedding("new_name")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            engine
+                .store()
+                .get_embedding("old_name")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// rename_task: the new id = slug from the name, the name is updated.
@@ -1872,9 +2717,15 @@ mod engine_tests {
         let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
         let engine = SlcEngine::with(store.clone(), llm, SlcConfig::default());
         engine.ensure_seat("seat_a").await.unwrap();
-        let task = engine.task_create("seat_a", "Старая задача", "", None, &[], &json!({})).await.unwrap();
+        let task = engine
+            .task_create("seat_a", "Старая задача", "", None, &[], &json!({}))
+            .await
+            .unwrap();
 
-        let report = engine.rename_task("seat_a", &task.task_id, "Новая задача").await.unwrap();
+        let report = engine
+            .rename_task("seat_a", &task.task_id, "Новая задача")
+            .await
+            .unwrap();
         assert_eq!(report.new_id, "novaya_zadacha");
         assert!(engine.get_document(&task.task_id).await.unwrap().is_none());
         let t = engine.task_list("seat_a", None, None, 10).await.unwrap();

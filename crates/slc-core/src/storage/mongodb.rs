@@ -17,9 +17,9 @@
 
 use crate::error::{SlcError, SlcResult};
 use crate::model::{Document, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat, SeatStatus};
-use crate::storage::{DocFilter, DocSort, MetaPatch, SortField, SortDir, StorageBackend};
+use crate::storage::{DocFilter, DocSort, MetaPatch, SortDir, SortField, StorageBackend};
+use bson::{Bson, Document as BsonDoc, doc};
 use chrono::{DateTime, Utc};
-use bson::{doc, Bson, Document as BsonDoc};
 use mongodb::options::IndexOptions;
 use mongodb::{Client, Collection, IndexModel};
 
@@ -64,7 +64,11 @@ impl MongoStore {
         docs.create_index(
             IndexModel::builder()
                 .keys(doc! { "kind": 1, "seat_id": 1, "category": 1 })
-                .options(IndexOptions::builder().name("kind_seat_cat".to_string()).build())
+                .options(
+                    IndexOptions::builder()
+                        .name("kind_seat_cat".to_string())
+                        .build(),
+                )
                 .build(),
         )
         .await
@@ -74,7 +78,11 @@ impl MongoStore {
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "scope": 1, "seat_id": 1, "document_id": 1 })
-                    .options(IndexOptions::builder().name("emb_scope_seat".to_string()).build())
+                    .options(
+                        IndexOptions::builder()
+                            .name("emb_scope_seat".to_string())
+                            .build(),
+                    )
                     .build(),
             )
             .await
@@ -146,14 +154,18 @@ fn bson_to_doc(b: BsonDoc) -> SlcResult<Document> {
     b.remove("_id");
     b.remove("kind");
     normalize_dates(&mut b, false);
-    bson::deserialize_from_document::<Document>(b).map_err(|e| SlcError::Storage(format!("bson to doc: {e}")))
+    bson::deserialize_from_document::<Document>(b)
+        .map_err(|e| SlcError::Storage(format!("bson to doc: {e}")))
 }
 
 /// Build the query for a `DocFilter` plus the kind discriminator.
 fn filter_query(kind: &str, f: &DocFilter) -> BsonDoc {
     let mut q = doc! { "kind": kind };
     if let Some(ids) = &f.document_ids {
-        q.insert("document_id", doc! { "$in": ids.iter().map(|i| Bson::String(i.clone())).collect::<Vec<_>>() });
+        q.insert(
+            "document_id",
+            doc! { "$in": ids.iter().map(|i| Bson::String(i.clone())).collect::<Vec<_>>() },
+        );
     }
     if let Some(cat) = f.category {
         q.insert("category", Bson::String(cat.as_str().into()));
@@ -174,6 +186,22 @@ fn filter_query(kind: &str, f: &DocFilter) -> BsonDoc {
     if let Some(t) = &f.doc_type {
         q.insert("metadata.doc_type", Bson::String(t.clone()));
     }
+    for (key, value) in &f.extra_strings {
+        q.insert(format!("metadata.{key}"), Bson::String(value.clone()));
+    }
+    for (key, values) in &f.extra_strings_not_in {
+        if !values.is_empty() {
+            q.insert(
+                format!("metadata.{key}"),
+                doc! {
+                    "$nin": values
+                        .iter()
+                        .map(|value| Bson::String(value.clone()))
+                        .collect::<Vec<_>>()
+                },
+            );
+        }
+    }
     if let Some(a) = f.archived {
         q.insert("metadata.archived", Bson::Boolean(a));
     }
@@ -186,10 +214,16 @@ fn filter_query(kind: &str, f: &DocFilter) -> BsonDoc {
     if !f.tags_any.is_empty() || !f.tags_all.is_empty() {
         let mut tags = BsonDoc::new();
         if !f.tags_any.is_empty() {
-            tags.insert("$in", Bson::Array(f.tags_any.iter().map(|t| Bson::String(t.clone())).collect()));
+            tags.insert(
+                "$in",
+                Bson::Array(f.tags_any.iter().map(|t| Bson::String(t.clone())).collect()),
+            );
         }
         if !f.tags_all.is_empty() {
-            tags.insert("$all", Bson::Array(f.tags_all.iter().map(|t| Bson::String(t.clone())).collect()));
+            tags.insert(
+                "$all",
+                Bson::Array(f.tags_all.iter().map(|t| Bson::String(t.clone())).collect()),
+            );
         }
         q.insert("tags", Bson::Document(tags));
     }
@@ -256,8 +290,10 @@ impl StorageBackend for MongoStore {
     async fn kb_update_content(&self, document_id: &str, content: &str) -> SlcResult<bool> {
         let res = self
             .docs()
-            .update_one(doc! { "_id": document_id, "kind": KIND_KB },
-                doc! { "$set": { "content": content, "updated_at": Utc::now() } })
+            .update_one(
+                doc! { "_id": document_id, "kind": KIND_KB },
+                doc! { "$set": { "content": content, "updated_at": Utc::now() } },
+            )
             .await
             .map_err(|e| SlcError::Storage(format!("kb update content: {e}")))?;
         Ok(res.modified_count > 0)
@@ -275,14 +311,22 @@ impl StorageBackend for MongoStore {
     async fn kb_replace(&self, doc: &Document) -> SlcResult<bool> {
         let existed = self.kb_get(&doc.document_id).await?.is_some();
         self.docs()
-            .replace_one(doc! { "_id": &doc.document_id, "kind": KIND_KB },
-                doc_to_bson(KIND_KB, doc)?).upsert(true)
+            .replace_one(
+                doc! { "_id": &doc.document_id, "kind": KIND_KB },
+                doc_to_bson(KIND_KB, doc)?,
+            )
+            .upsert(true)
             .await
             .map_err(|e| SlcError::Storage(format!("kb replace: {e}")))?;
         Ok(existed)
     }
 
-    async fn kb_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>> {
+    async fn kb_find(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+        limit: usize,
+    ) -> SlcResult<Vec<Document>> {
         let mut cursor = self
             .docs()
             .find(filter_query(KIND_KB, filter))
@@ -291,8 +335,14 @@ impl StorageBackend for MongoStore {
             .await
             .map_err(|e| SlcError::Storage(format!("kb find: {e}")))?;
         let mut out = Vec::new();
-        while cursor.advance().await.map_err(|e| SlcError::Storage(format!("cursor: {e}")))? {
-            let b: BsonDoc = cursor.deserialize_current().map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let b: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
             out.push(bson_to_doc(b)?);
         }
         Ok(out)
@@ -317,8 +367,10 @@ impl StorageBackend for MongoStore {
     async fn kb_soft_delete(&self, document_id: &str) -> SlcResult<bool> {
         let res = self
             .docs()
-            .update_one(doc! { "_id": document_id, "kind": KIND_KB },
-                doc! { "$set": { "deleted_at": Utc::now() } })
+            .update_one(
+                doc! { "_id": document_id, "kind": KIND_KB },
+                doc! { "$set": { "deleted_at": Utc::now() } },
+            )
             .await
             .map_err(|e| SlcError::Storage(format!("kb soft delete: {e}")))?;
         Ok(res.modified_count > 0)
@@ -327,8 +379,10 @@ impl StorageBackend for MongoStore {
     async fn kb_restore(&self, document_id: &str) -> SlcResult<bool> {
         let res = self
             .docs()
-            .update_one(doc! { "_id": document_id, "kind": KIND_KB },
-                doc! { "$unset": { "deleted_at": "" } })
+            .update_one(
+                doc! { "_id": document_id, "kind": KIND_KB },
+                doc! { "$unset": { "deleted_at": "" } },
+            )
             .await
             .map_err(|e| SlcError::Storage(format!("kb restore: {e}")))?;
         Ok(res.modified_count > 0)
@@ -352,8 +406,14 @@ impl StorageBackend for MongoStore {
             .await
             .map_err(|e| SlcError::Storage(format!("kb graveyard: {e}")))?;
         let mut out = Vec::new();
-        while cursor.advance().await.map_err(|e| SlcError::Storage(format!("cursor: {e}")))? {
-            let b: BsonDoc = cursor.deserialize_current().map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let b: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
             out.push(bson_to_doc(b)?);
         }
         Ok(out)
@@ -386,14 +446,22 @@ impl StorageBackend for MongoStore {
             .map_err(|e| SlcError::Storage(format!("episodic get: {e}")))?;
         let existed = existing.is_some();
         self.docs()
-            .replace_one(doc! { "_id": &doc.document_id, "kind": KIND_EPISODIC },
-                doc_to_bson(KIND_EPISODIC, doc)?).upsert(true)
+            .replace_one(
+                doc! { "_id": &doc.document_id, "kind": KIND_EPISODIC },
+                doc_to_bson(KIND_EPISODIC, doc)?,
+            )
+            .upsert(true)
             .await
             .map_err(|e| SlcError::Storage(format!("episodic upsert: {e}")))?;
         Ok(existed)
     }
 
-    async fn episodic_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>> {
+    async fn episodic_find(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+        limit: usize,
+    ) -> SlcResult<Vec<Document>> {
         let mut cursor = self
             .docs()
             .find(filter_query(KIND_EPISODIC, filter))
@@ -402,8 +470,14 @@ impl StorageBackend for MongoStore {
             .await
             .map_err(|e| SlcError::Storage(format!("episodic find: {e}")))?;
         let mut out = Vec::new();
-        while cursor.advance().await.map_err(|e| SlcError::Storage(format!("cursor: {e}")))? {
-            let b: BsonDoc = cursor.deserialize_current().map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let b: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
             out.push(bson_to_doc(b)?);
         }
         Ok(out)
@@ -465,8 +539,14 @@ impl StorageBackend for MongoStore {
             .await
             .map_err(|e| SlcError::Storage(format!("get embedding: {e}")))?;
         let mut out = Vec::new();
-        while cursor.advance().await.map_err(|e| SlcError::Storage(format!("cursor: {e}")))? {
-            let b: BsonDoc = cursor.deserialize_current().map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let b: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
             if let Ok(arr) = b.get_array("embedding") {
                 out.extend(arr.iter().filter_map(|v| v.as_f64()).map(|v| v as f32));
             }
@@ -482,14 +562,27 @@ impl StorageBackend for MongoStore {
             .await
             .map_err(|e| SlcError::Storage(format!("get chunks: {e}")))?;
         let mut out = Vec::new();
-        while cursor.advance().await.map_err(|e| SlcError::Storage(format!("cursor: {e}")))? {
-            let b: BsonDoc = cursor.deserialize_current().map_err(|e| SlcError::Storage(format!("row: {e}")))?;
-            out.push(bson::deserialize_from_document::<EmbeddingRecord>(b).map_err(|e| SlcError::Storage(format!("row: {e}")))?);
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let b: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+            out.push(
+                bson::deserialize_from_document::<EmbeddingRecord>(b)
+                    .map_err(|e| SlcError::Storage(format!("row: {e}")))?,
+            );
         }
         Ok(out)
     }
 
-    async fn all_embeddings(&self, scope: EmbeddingScope, seat_id: Option<&str>) -> SlcResult<Vec<EmbeddingRecord>> {
+    async fn all_embeddings(
+        &self,
+        scope: EmbeddingScope,
+        seat_id: Option<&str>,
+    ) -> SlcResult<Vec<EmbeddingRecord>> {
         let scope_v = bson::serialize_to_bson(&scope).unwrap_or(Bson::Null);
         let mut q = doc! { "scope": scope_v };
         match seat_id {
@@ -506,9 +599,18 @@ impl StorageBackend for MongoStore {
             .await
             .map_err(|e| SlcError::Storage(format!("all embeddings: {e}")))?;
         let mut out = Vec::new();
-        while cursor.advance().await.map_err(|e| SlcError::Storage(format!("cursor: {e}")))? {
-            let b: BsonDoc = cursor.deserialize_current().map_err(|e| SlcError::Storage(format!("row: {e}")))?;
-            out.push(bson::deserialize_from_document::<EmbeddingRecord>(b).map_err(|e| SlcError::Storage(format!("row: {e}")))?);
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let b: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+            out.push(
+                bson::deserialize_from_document::<EmbeddingRecord>(b)
+                    .map_err(|e| SlcError::Storage(format!("row: {e}")))?,
+            );
         }
         Ok(out)
     }
@@ -527,7 +629,8 @@ impl StorageBackend for MongoStore {
             .map_err(|e| SlcError::Storage(format!("seat to bson: {e}")))?;
         b.insert("_id", Bson::String(seat.seat_id.clone()));
         self.seats()
-            .replace_one(doc! { "_id": &seat.seat_id }, b).upsert(true)
+            .replace_one(doc! { "_id": &seat.seat_id }, b)
+            .upsert(true)
             .await
             .map_err(|e| SlcError::Storage(format!("seat upsert: {e}")))?;
         Ok(())
@@ -541,7 +644,8 @@ impl StorageBackend for MongoStore {
             .map_err(|e| SlcError::Storage(format!("get seat: {e}")))?;
         found
             .map(|b| {
-                bson::deserialize_from_document::<Seat>(b).map_err(|e| SlcError::Storage(format!("seat from bson: {e}")))
+                bson::deserialize_from_document::<Seat>(b)
+                    .map_err(|e| SlcError::Storage(format!("seat from bson: {e}")))
             })
             .transpose()
     }
@@ -555,9 +659,18 @@ impl StorageBackend for MongoStore {
             .await
             .map_err(|e| SlcError::Storage(format!("list seats: {e}")))?;
         let mut out = Vec::new();
-        while cursor.advance().await.map_err(|e| SlcError::Storage(format!("cursor: {e}")))? {
-            let b: BsonDoc = cursor.deserialize_current().map_err(|e| SlcError::Storage(format!("row: {e}")))?;
-            out.push(bson::deserialize_from_document::<Seat>(b).map_err(|e| SlcError::Storage(format!("row: {e}")))?);
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let b: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+            out.push(
+                bson::deserialize_from_document::<Seat>(b)
+                    .map_err(|e| SlcError::Storage(format!("row: {e}")))?,
+            );
         }
         Ok(out)
     }
@@ -565,8 +678,10 @@ impl StorageBackend for MongoStore {
     async fn touch_seat(&self, seat_id: &str) -> SlcResult<bool> {
         let res = self
             .seats()
-            .update_one(doc! { "_id": seat_id },
-                doc! { "$set": { "last_accessed": Utc::now() } })
+            .update_one(
+                doc! { "_id": seat_id },
+                doc! { "$set": { "last_accessed": Utc::now() } },
+            )
             .await
             .map_err(|e| SlcError::Storage(format!("touch seat: {e}")))?;
         Ok(res.modified_count > 0)
@@ -575,8 +690,10 @@ impl StorageBackend for MongoStore {
     async fn set_seat_status(&self, seat_id: &str, status: SeatStatus) -> SlcResult<bool> {
         let res = self
             .seats()
-            .update_one(doc! { "_id": seat_id },
-                doc! { "$set": { "status": status.as_str() } })
+            .update_one(
+                doc! { "_id": seat_id },
+                doc! { "$set": { "status": status.as_str() } },
+            )
             .await
             .map_err(|e| SlcError::Storage(format!("set seat status: {e}")))?;
         Ok(res.modified_count > 0)
@@ -585,18 +702,29 @@ impl StorageBackend for MongoStore {
     async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
         let res = self
             .seats()
-            .update_one(doc! { "_id": seat_id },
-                doc! { "$set": { "active_task_id": task_id, "active_document_id": task_id } })
+            .update_one(
+                doc! { "_id": seat_id },
+                doc! { "$set": { "active_task_id": task_id, "active_document_id": task_id } },
+            )
             .await
             .map_err(|e| SlcError::Storage(format!("set active task: {e}")))?;
         Ok(res.modified_count > 0)
     }
 
-    async fn set_seat_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool> {
-        let value = document_id.map(|s| Bson::String(s.to_string())).unwrap_or(Bson::Null);
+    async fn set_seat_active_document(
+        &self,
+        seat_id: &str,
+        document_id: Option<&str>,
+    ) -> SlcResult<bool> {
+        let value = document_id
+            .map(|s| Bson::String(s.to_string()))
+            .unwrap_or(Bson::Null);
         let res = self
             .seats()
-            .update_one(doc! { "_id": seat_id }, doc! { "$set": { "active_document_id": value } })
+            .update_one(
+                doc! { "_id": seat_id },
+                doc! { "$set": { "active_document_id": value } },
+            )
             .await
             .map_err(|e| SlcError::Storage(format!("set active document: {e}")))?;
         Ok(res.modified_count > 0)
@@ -605,7 +733,8 @@ impl StorageBackend for MongoStore {
     async fn get_seat_active_document(&self, seat_id: &str) -> SlcResult<Option<String>> {
         let found = self
             .seats()
-            .find_one(doc! { "_id": seat_id }).projection(doc! { "active_document_id": 1i32, "active_task_id": 1i32 })
+            .find_one(doc! { "_id": seat_id })
+            .projection(doc! { "active_document_id": 1i32, "active_task_id": 1i32 })
             .await
             .map_err(|e| SlcError::Storage(format!("get active document: {e}")))?;
         Ok(found.and_then(|b| {
@@ -616,15 +745,22 @@ impl StorageBackend for MongoStore {
         }))
     }
 
-    async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool> {
+    async fn incr_seat_stats(
+        &self,
+        seat_id: &str,
+        tool_name: &str,
+        tokens_used: i64,
+    ) -> SlcResult<bool> {
         let res = self
             .seats()
-            .update_one(doc! { "_id": seat_id },
+            .update_one(
+                doc! { "_id": seat_id },
                 doc! { "$inc": {
                     "usage_stats.total_requests": 1i64,
                     "usage_stats.total_tokens": tokens_used,
                     format!("usage_stats.tools_used.{}", tool_name): 1i64,
-                }})
+                }},
+            )
             .await
             .map_err(|e| SlcError::Storage(format!("incr stats: {e}")))?;
         Ok(res.modified_count > 0)
@@ -636,7 +772,8 @@ impl StorageBackend for MongoStore {
             .map_err(|e| SlcError::Storage(format!("timer to bson: {e}")))?;
         b.insert("_id", Bson::String(timer.timer_id.clone()));
         self.timers()
-            .replace_one(doc! { "_id": &timer.timer_id }, b).upsert(true)
+            .replace_one(doc! { "_id": &timer.timer_id }, b)
+            .upsert(true)
             .await
             .map_err(|e| SlcError::Storage(format!("timer upsert: {e}")))?;
         Ok(())
@@ -667,23 +804,40 @@ impl StorageBackend for MongoStore {
             .await
             .map_err(|e| SlcError::Storage(format!("active timers: {e}")))?;
         let mut out = Vec::new();
-        while cursor.advance().await.map_err(|e| SlcError::Storage(format!("cursor: {e}")))? {
-            let b: BsonDoc = cursor.deserialize_current().map_err(|e| SlcError::Storage(format!("row: {e}")))?;
-            out.push(bson::deserialize_from_document::<PersistedTimer>(b).map_err(|e| SlcError::Storage(format!("row: {e}")))?);
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let b: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+            out.push(
+                bson::deserialize_from_document::<PersistedTimer>(b)
+                    .map_err(|e| SlcError::Storage(format!("row: {e}")))?,
+            );
         }
         Ok(out)
     }
 
     async fn set_timer_fired(&self, timer_id: &str, now: DateTime<Utc>) -> SlcResult<()> {
         self.timers()
-            .update_one(doc! { "_id": timer_id }, doc! { "$set": { "last_fired_at": now } })
+            .update_one(
+                doc! { "_id": timer_id },
+                doc! { "$set": { "last_fired_at": now } },
+            )
             .await
             .map_err(|e| SlcError::Storage(format!("set timer fired: {e}")))?;
         Ok(())
     }
 
     // ── Records ──
-    async fn put_record(&self, collection: &str, key: &str, value: &serde_json::Value) -> SlcResult<()> {
+    async fn put_record(
+        &self,
+        collection: &str,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> SlcResult<()> {
         let bson_val = bson::serialize_to_bson(value)
             .map_err(|e| SlcError::Storage(format!("record to bson: {e}")))?;
         self.records()
@@ -693,7 +847,11 @@ impl StorageBackend for MongoStore {
         Ok(())
     }
 
-    async fn get_record(&self, collection: &str, key: &str) -> SlcResult<Option<serde_json::Value>> {
+    async fn get_record(
+        &self,
+        collection: &str,
+        key: &str,
+    ) -> SlcResult<Option<serde_json::Value>> {
         let found = self
             .records()
             .find_one(doc! { "_id": format!("{collection}/{key}") })
@@ -703,7 +861,10 @@ impl StorageBackend for MongoStore {
             .map(|b| {
                 b.get("value")
                     .cloned()
-                    .map(|v| bson::deserialize_from_bson::<serde_json::Value>(v).map_err(|e| SlcError::Storage(format!("record value: {e}"))))
+                    .map(|v| {
+                        bson::deserialize_from_bson::<serde_json::Value>(v)
+                            .map_err(|e| SlcError::Storage(format!("record value: {e}")))
+                    })
                     .unwrap_or_else(|| Ok(serde_json::Value::Null))
             })
             .transpose()
@@ -725,8 +886,14 @@ impl StorageBackend for MongoStore {
             .await
             .map_err(|e| SlcError::Storage(format!("list records: {e}")))?;
         let mut out = Vec::new();
-        while cursor.advance().await.map_err(|e| SlcError::Storage(format!("cursor: {e}")))? {
-            let b: BsonDoc = cursor.deserialize_current().map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let b: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
             if let (Some(key), Some(val)) = (b.get_str("key").ok(), b.get("value")) {
                 if let Ok(v) = bson::deserialize_from_bson::<serde_json::Value>(val.clone()) {
                     out.push((key.to_string(), v));
@@ -738,10 +905,7 @@ impl StorageBackend for MongoStore {
 
     // ── health / close ──
     async fn health_check(&self) -> bool {
-        self.db
-            .run_command(doc! { "ping": 1i32 })
-            .await
-            .is_ok()
+        self.db.run_command(doc! { "ping": 1i32 }).await.is_ok()
     }
 
     async fn close(&self) -> SlcResult<()> {
@@ -782,7 +946,10 @@ mod tests {
         assert_eq!(back.tags, doc.tags);
         assert_eq!(back.seat_id, doc.seat_id);
         // BSON datetimes are millisecond-precision.
-        assert_eq!(back.created_at.timestamp_millis(), doc.created_at.timestamp_millis());
+        assert_eq!(
+            back.created_at.timestamp_millis(),
+            doc.created_at.timestamp_millis()
+        );
     }
 
     #[test]
@@ -799,7 +966,10 @@ mod tests {
         let tags = q.get("tags").unwrap().as_document().unwrap();
         assert_eq!(tags.get_array("$in").unwrap().len(), 2);
         assert_eq!(tags.get_array("$all").unwrap().len(), 1);
-        assert!(q.get("deleted_at").unwrap().as_null().is_some(), "deleted=false → null filter");
+        assert!(
+            q.get("deleted_at").unwrap().as_null().is_some(),
+            "deleted=false → null filter"
+        );
     }
 
     #[test]
@@ -833,12 +1003,24 @@ mod tests {
         assert_eq!(got.content, doc.content);
         assert_eq!(got.seat_id.as_deref(), Some("seat_x"));
 
-        assert!(store.kb_update_content("project_vassista", "новый контент").await.unwrap());
+        assert!(
+            store
+                .kb_update_content("project_vassista", "новый контент")
+                .await
+                .unwrap()
+        );
         let got = store.kb_get("project_vassista").await.unwrap().unwrap();
         assert_eq!(got.content, "новый контент");
 
         assert_eq!(store.kb_count(&DocFilter::default()).await.unwrap(), 1);
-        let hits = store.kb_find(&DocFilter::default(), &DocSort::by_created(SortDir::Desc), 10).await.unwrap();
+        let hits = store
+            .kb_find(
+                &DocFilter::default(),
+                &DocSort::by_created(SortDir::Desc),
+                10,
+            )
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
 
         // Episodic is a separate kind.
@@ -852,7 +1034,10 @@ mod tests {
         );
         store.episodic_insert(&hist).await.unwrap();
         assert_eq!(store.kb_count(&DocFilter::default()).await.unwrap(), 1);
-        assert_eq!(store.episodic_count(&DocFilter::default()).await.unwrap(), 1);
+        assert_eq!(
+            store.episodic_count(&DocFilter::default()).await.unwrap(),
+            1
+        );
 
         // Seats.
         let seat = crate::model::Seat {
@@ -869,16 +1054,28 @@ mod tests {
             usage_stats: Default::default(),
         };
         store.insert_seat(&seat).await.unwrap();
-        assert!(store.set_seat_active_document("seat_x", Some("project_vassista")).await.unwrap());
+        assert!(
+            store
+                .set_seat_active_document("seat_x", Some("project_vassista"))
+                .await
+                .unwrap()
+        );
         assert_eq!(
-            store.get_seat_active_document("seat_x").await.unwrap().as_deref(),
+            store
+                .get_seat_active_document("seat_x")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("project_vassista")
         );
         assert_eq!(store.list_active_seats(10).await.unwrap().len(), 1);
         assert!(store.incr_seat_stats("seat_x", "search", 12).await.unwrap());
 
         // Records.
-        store.put_record("notifications", "n1", &serde_json::json!({"text": "hi"})).await.unwrap();
+        store
+            .put_record("notifications", "n1", &serde_json::json!({"text": "hi"}))
+            .await
+            .unwrap();
         assert_eq!(store.list_records("notifications").await.unwrap().len(), 1);
         assert!(store.delete_record("notifications", "n1").await.unwrap());
 
@@ -910,9 +1107,20 @@ mod tests {
             seat_id: Some("seat_x".into()),
         };
         store.insert_embeddings(&[rec]).await.unwrap();
-        let emb = store.get_embedding("project_vassista").await.unwrap().unwrap();
+        let emb = store
+            .get_embedding("project_vassista")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(emb.len(), 3);
-        assert_eq!(store.get_all_chunks("project_vassista").await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .get_all_chunks("project_vassista")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Cleanup.
         assert!(store.kb_purge("project_vassista").await.unwrap());

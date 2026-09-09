@@ -106,6 +106,7 @@ Copy `.env.example` to `.env`. Key variables:
 |---|---|---|
 | `SLC_VAULT_PATH` | `~/.slc/vault` | Obsidian vault (or SQLite file) location |
 | `SLC_LLM` | — | Provider: `lmstudio`, `ollama`, `candle`, `hash` |
+| `SLC_MCP_SAMPLING` | `false` | Delegate reasoning to the connected MCP client (`sampling/createMessage`); no generative endpoint needed. `SLC_LLM=hash` is then the fail-closed fallback for CLI paths |
 | `LMSTUDIO_URL` / `LMSTUDIO_MODEL` / `LMSTUDIO_EMBED_MODEL` | — | OpenAI-compatible LM Studio endpoint and models |
 | `OLLAMA_ENDPOINT` / `OLLAMA_REASONING_MODEL` / `OLLAMA_EMBEDDING_MODEL` | — | Ollama fallback |
 | `SLC_AI_ORGANIZE` | `true` | Ask the reasoning LLM where a new document belongs (project folder) |
@@ -118,7 +119,7 @@ Copy `.env.example` to `.env`. Key variables:
 | `SLC_SEAT_MANAGE_ACL` | — | Explicit cross-seat targets, e.g. `boss=worker|tester` |
 | `SLC_CONTEXT_LIMIT_TOKENS` | `100000` | Fallback token budget for `update_context` |
 | `SLC_PAGINATION_ENABLED` | `true` | Paginate oversized tool responses |
-| `SLC_PAGE_TOKEN_LIMIT` | `5000` | Approximate page size in tokens |
+| `SLC_PAGE_TOKEN_LIMIT` | `50000` | Approximate page size in tokens |
 | `JWT_SECRET_KEY` | — | JWT signing key (required for `SLC_AUTH=full`) |
 | `YANDEX_CLIENT_ID` / `YANDEX_CLIENT_SECRET` | — | Yandex OAuth credentials for the web UI |
 
@@ -137,6 +138,11 @@ Endpoints (Streamable HTTP, MCP `2025-03-26`):
 Auth is per-request: the client sends its seat in the `X-Seat-ID` header
 (`SLC_MCP_AUTH=legacy_seat_id`, the default). In `bearer_plus_seat` mode a
 bearer token is required as well.
+
+With `SLC_MCP_SAMPLING=true`, reasoning requests (compression,
+consolidation, AI id naming) are returned to the authenticated seat's
+connected MCP client as `sampling/createMessage` — SLC then needs no
+dedicated generative endpoint; embeddings degrade to BM25 text search.
 
 ### Tool groups
 
@@ -181,8 +187,11 @@ If your client's harness truncates tool output, lower the page size:
 - per connection: header `X-SLC-Page-Token-Limit: <tokens>`;
 - persisted: `set_page_limit(<tokens>)` (or env `SLC_PAGE_TOKEN_LIMIT`).
 
-A page of `N` tokens ≈ `N×3` characters ≈ `N×9` bytes of Cyrillic text; the
-default `5000` fits a 50 KB output budget.
+A page of `N` tokens ≈ `N×3` characters ≈ `N×9` bytes of Cyrillic text.
+The default page size is `50000` tokens (large responses stay single-page
+unless they are truly huge); if your client harness truncates output at a
+byte budget, lower the limit to roughly `budget_bytes / 9` (e.g. `5000` for
+a 50 KB budget).
 
 ---
 

@@ -25,10 +25,12 @@
 
 use crate::error::{SlcError, SlcResult};
 use crate::llm::LlmClient;
-use crate::model::{content_hash, DocMeta, Document, DocumentCategory, Seat, SeatStatus, UsageStats};
+use crate::model::{
+    DocMeta, Document, DocumentCategory, Seat, SeatStatus, UsageStats, content_hash,
+};
 use crate::storage::StorageBackend;
 use crate::tasks::normalize_task_status;
-use bson::{doc, Bson, Document as BsonDoc};
+use bson::{Bson, Document as BsonDoc, doc};
 use chrono::{DateTime, Utc};
 use mongodb::{Client, Collection};
 use serde_json::{Map, Value, json};
@@ -81,13 +83,7 @@ fn human_id(prefix: &str, fm: &Map<String, Value>, body: &str) -> String {
     let slug: String = raw
         .to_lowercase()
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c
-            } else {
-                '_'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect::<String>()
         .split('_')
         .filter(|s| !s.is_empty())
@@ -157,7 +153,10 @@ pub async fn migrate_legacy_vault(
                 .unwrap_or("legacy_doc")
                 .to_string();
             let new_id = human_id(category_prefix(cat), &fm, &body);
-            let seat = fm.get("seat_id").and_then(|v| v.as_str()).map(str::to_string);
+            let seat = fm
+                .get("seat_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             let mut meta = crate::model::DocMeta::default();
             if let Some(t) = fm.get("doc_type").and_then(|v| v.as_str()) {
                 meta.doc_type = Some(t.to_string());
@@ -165,13 +164,14 @@ pub async fn migrate_legacy_vault(
             let tags: Vec<String> = fm
                 .get("tags")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
             let mut doc = Document::new(new_id.clone(), cat, body, meta, tags, seat);
-            doc.metadata.extra.insert(
-                "legacy_id".into(),
-                json!(old_id),
-            );
+            doc.metadata.extra.insert("legacy_id".into(), json!(old_id));
             if let Err(e) = target.kb_upsert(&doc).await {
                 report.errors.push(format!("kb upsert {new_id}: {e}"));
             } else {
@@ -188,7 +188,9 @@ pub async fn migrate_legacy_vault(
                 if path.extension().and_then(|e| e.to_str()) != Some("md") {
                     continue;
                 }
-                let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+                let Ok(raw) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
                 let (fm, body) = parse_legacy_md(&raw);
                 let old_id = fm
                     .get("document_id")
@@ -196,7 +198,10 @@ pub async fn migrate_legacy_vault(
                     .unwrap_or("legacy_ev")
                     .to_string();
                 let new_id = human_id("history_", &fm, &body);
-                let seat = fm.get("seat_id").and_then(|v| v.as_str()).map(str::to_string);
+                let seat = fm
+                    .get("seat_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
                 let doc = Document::new(
                     new_id.clone(),
                     DocumentCategory::History,
@@ -206,7 +211,9 @@ pub async fn migrate_legacy_vault(
                     seat,
                 );
                 if let Err(e) = target.episodic_upsert(&doc).await {
-                    report.errors.push(format!("episodic {new_id} ({old_id}): {e}"));
+                    report
+                        .errors
+                        .push(format!("episodic {new_id} ({old_id}): {e}"));
                 } else {
                     report.documents += 1;
                 }
@@ -221,9 +228,14 @@ pub async fn migrate_legacy_vault(
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let (fm, body) = parse_legacy_md(&raw);
-            let seat = fm.get("seat_id").and_then(|v| v.as_str()).unwrap_or("legacy");
+            let seat = fm
+                .get("seat_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("legacy");
             let focus_id = fm
                 .get("focus_id")
                 .and_then(|v| v.as_str())
@@ -256,7 +268,9 @@ pub async fn migrate_legacy_vault(
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let (fm, _body) = parse_legacy_md(&raw);
             let seat_id = fm
                 .get("seat_id")
@@ -266,7 +280,11 @@ pub async fn migrate_legacy_vault(
             let now = Utc::now();
             let seat = Seat {
                 seat_id,
-                name: fm.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed").to_string(),
+                name: fm
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unnamed")
+                    .to_string(),
                 status: SeatStatus::Active,
                 created_at: now,
                 last_accessed: now,
@@ -291,7 +309,11 @@ pub async fn migrate_legacy_vault(
     // ── ideas / embeddings — skipped by design ──
     if src.join("ideas").is_dir() {
         report.skipped_ideas = std::fs::read_dir(src.join("ideas"))
-            .map(|it| it.flatten().filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md")).count())
+            .map(|it| {
+                it.flatten()
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+                    .count()
+            })
             .unwrap_or(0);
     }
     if src.join("embeddings").is_dir() {
@@ -358,7 +380,9 @@ fn bson_to_json(v: &Bson) -> Value {
         Bson::String(s) => json!(s),
         Bson::Array(a) => Value::Array(a.iter().map(bson_to_json).collect()),
         Bson::Document(d) => Value::Object(
-            d.iter().map(|(k, x)| (k.clone(), bson_to_json(x))).collect(),
+            d.iter()
+                .map(|(k, x)| (k.clone(), bson_to_json(x)))
+                .collect(),
         ),
         Bson::Boolean(b) => json!(b),
         Bson::Int32(i) => json!(i),
@@ -386,7 +410,11 @@ fn bson_i64(v: &Bson) -> Option<i64> {
 
 fn bson_strs(d: &BsonDoc, key: &str) -> Vec<String> {
     d.get_array(key)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -395,8 +423,9 @@ fn extract_legacy_doc(raw: &BsonDoc) -> Option<LegacyDoc> {
     let category = raw.get_str("category").ok().map(String::from);
     let content = match raw.get("content") {
         Some(Bson::String(s)) => s.clone(),
-        Some(other) => serde_json::to_string_pretty(&bson_to_json(other))
-            .unwrap_or_else(|_| other.to_string()),
+        Some(other) => {
+            serde_json::to_string_pretty(&bson_to_json(other)).unwrap_or_else(|_| other.to_string())
+        }
         None => String::new(),
     };
     let mut metadata = raw
@@ -606,7 +635,8 @@ fn restore_seat_anchor(seat: &mut Seat, id_map: &HashMap<String, String>) -> boo
             }
             restored = true;
         } else {
-            seat.metadata.insert("legacy_active_task_id".into(), json!(old));
+            seat.metadata
+                .insert("legacy_active_task_id".into(), json!(old));
         }
     }
     if let Some(old) = document {
@@ -638,7 +668,11 @@ fn extract_legacy_seat(raw: &BsonDoc) -> Option<Seat> {
         .get_datetime("last_accessed")
         .ok()
         .map(|d| d.to_chrono())
-        .or_else(|| raw.get_datetime("last_activity").ok().map(|d| d.to_chrono()))
+        .or_else(|| {
+            raw.get_datetime("last_activity")
+                .ok()
+                .map(|d| d.to_chrono())
+        })
         .unwrap_or(created_at);
 
     let mut metadata = raw
@@ -651,7 +685,10 @@ fn extract_legacy_seat(raw: &BsonDoc) -> Option<Seat> {
         }
     }
     if let Ok(exp) = raw.get_datetime("expires_at") {
-        metadata.insert("legacy_expires_at".into(), json!(exp.to_chrono().to_rfc3339()));
+        metadata.insert(
+            "legacy_expires_at".into(),
+            json!(exp.to_chrono().to_rfc3339()),
+        );
     }
     if let Ok(task) = raw.get_str("active_task_id") {
         metadata.insert("legacy_active_task_id".into(), json!(task));
@@ -665,7 +702,9 @@ fn extract_legacy_seat(raw: &BsonDoc) -> Option<Seat> {
     let mut total_tokens = 0i64;
     let mut tools_used = Map::new();
     for key in ["usage_stats", "statistics"] {
-        let Ok(us) = raw.get_document(key) else { continue };
+        let Ok(us) = raw.get_document(key) else {
+            continue;
+        };
         for (k, v) in us.iter() {
             match k.as_str() {
                 "total_requests" => {
@@ -784,7 +823,11 @@ pub async fn migrate_legacy_mongo(
             let new_id = unique(
                 if project_id.trim().is_empty() {
                     let slug = slugify(&name);
-                    if slug.is_empty() { "project".to_string() } else { slug }
+                    if slug.is_empty() {
+                        "project".to_string()
+                    } else {
+                        slug
+                    }
                 } else {
                     project_id.clone()
                 },
@@ -844,9 +887,16 @@ pub async fn migrate_legacy_mongo(
             };
             let name = raw.get_str("name").unwrap_or("").to_string();
             let description = raw.get_str("description").unwrap_or("").to_string();
-            let new_id =
-                task_new_id(&raw, &task_id, &name, &description, llm, rename_with_ai, &mut used)
-                    .await;
+            let new_id = task_new_id(
+                &raw,
+                &task_id,
+                &name,
+                &description,
+                llm,
+                rename_with_ai,
+                &mut used,
+            )
+            .await;
             id_map.insert(task_id.clone(), new_id.clone());
             let mut meta = DocMeta::default();
             meta.extra.insert("legacy_id".into(), json!(task_id));
@@ -879,7 +929,8 @@ pub async fn migrate_legacy_mongo(
                     .get_document("metadata")
                     .and_then(|m| m.get_document("original_data"))
                 {
-                    content = serde_json::to_string_pretty(&bson_doc_to_map(od)).unwrap_or_default();
+                    content =
+                        serde_json::to_string_pretty(&bson_doc_to_map(od)).unwrap_or_default();
                 }
             }
             let seat_id = raw.get_str("seat_id").ok().map(String::from);
@@ -926,7 +977,9 @@ pub async fn migrate_legacy_mongo(
         let raw: BsonDoc = cursor
             .deserialize_current()
             .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
-        let Some(doc) = extract_legacy_doc(&raw) else { continue };
+        let Some(doc) = extract_legacy_doc(&raw) else {
+            continue;
+        };
         if doc.deleted_at.is_some() {
             report.skipped_deleted += 1;
             continue;
@@ -949,11 +1002,12 @@ pub async fn migrate_legacy_mongo(
         }
         let ai = if rename_with_ai {
             match llm {
-                Some(l) => match tokio::time::timeout(Duration::from_secs(30), ai_slug(l, &doc)).await
-                {
-                    Ok(Some(slug)) => Some(slug),
-                    _ => None,
-                },
+                Some(l) => {
+                    match tokio::time::timeout(Duration::from_secs(30), ai_slug(l, &doc)).await {
+                        Ok(Some(slug)) => Some(slug),
+                        _ => None,
+                    }
+                }
                 None => None,
             }
         } else {
@@ -986,7 +1040,9 @@ pub async fn migrate_legacy_mongo(
                     report.documents += 1;
                 }
             }
-            Err(e) => report.errors.push(format!("{} ({e})", document.document_id)),
+            Err(e) => report
+                .errors
+                .push(format!("{} ({e})", document.document_id)),
         }
     }
 
@@ -1003,7 +1059,9 @@ pub async fn migrate_legacy_mongo(
                     report.tasks += 1;
                 }
             }
-            Err(e) => report.errors.push(format!("{} ({e})", document.document_id)),
+            Err(e) => report
+                .errors
+                .push(format!("{} ({e})", document.document_id)),
         }
     }
 
@@ -1021,7 +1079,9 @@ pub async fn migrate_legacy_mongo(
         let raw: BsonDoc = cursor
             .deserialize_current()
             .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
-        let Some(mut seat) = extract_legacy_seat(&raw) else { continue };
+        let Some(mut seat) = extract_legacy_seat(&raw) else {
+            continue;
+        };
         // Task ids were renamed — restore the legacy active-task anchor.
         restore_seat_anchor(&mut seat, &id_map);
         if let Err(e) = target.insert_seat(&seat).await {
@@ -1145,7 +1205,11 @@ mod tests {
         // Human-readable ids: slug from the name/title (here the legacy id
         // already equals the slug, so the same document is found by it).
         // No category prefixes anymore — the folder tree carries context.
-        let proj = store.kb_get("vassista_plan").await.unwrap().expect("project doc");
+        let proj = store
+            .kb_get("vassista_plan")
+            .await
+            .unwrap()
+            .expect("project doc");
         assert_eq!(proj.category, DocumentCategory::Project);
         let by_new = store
             .kb_find(
@@ -1163,24 +1227,43 @@ mod tests {
         assert_eq!(by_new[0].content, "План платформы Vassista");
         assert_eq!(by_new[0].seat_id.as_deref(), Some("seat_a"));
 
-        let skill = store.kb_get("rust_basics").await.unwrap().expect("slugged skill id");
+        let skill = store
+            .kb_get("rust_basics")
+            .await
+            .unwrap()
+            .expect("slugged skill id");
         assert_eq!(skill.category, DocumentCategory::Skill);
         assert_eq!(skill.content, "Как работать с borrow checker");
 
         // Legacy id preserved in metadata.
-        assert_eq!(skill.metadata.extra.get("legacy_id").and_then(|v| v.as_str()), Some("skill_rust"));
+        assert_eq!(
+            skill
+                .metadata
+                .extra
+                .get("legacy_id")
+                .and_then(|v| v.as_str()),
+            Some("skill_rust")
+        );
 
         // Episodic in the episodic store, not the KB.
         assert_eq!(
             store
-                .kb_find(&Default::default(), &crate::storage::DocSort::by_created(crate::storage::SortDir::Desc), 10)
+                .kb_find(
+                    &Default::default(),
+                    &crate::storage::DocSort::by_created(crate::storage::SortDir::Desc),
+                    10
+                )
                 .await
                 .unwrap()
                 .len(),
             3
         );
         let ev = store
-            .episodic_find(&Default::default(), &crate::storage::DocSort::by_created(crate::storage::SortDir::Desc), 10)
+            .episodic_find(
+                &Default::default(),
+                &crate::storage::DocSort::by_created(crate::storage::SortDir::Desc),
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(ev.len(), 1);
@@ -1189,7 +1272,11 @@ mod tests {
         assert_eq!(ev[0].document_id, "history_legacy_ev_abc");
 
         // Focus record written.
-        let focus = store.get_record("focuses", "foc_123").await.unwrap().expect("focus record");
+        let focus = store
+            .get_record("focuses", "foc_123")
+            .await
+            .unwrap()
+            .expect("focus record");
         assert_eq!(focus["title"], "Миграция SLC");
         assert_eq!(focus["priority"], 3);
 
@@ -1327,7 +1414,10 @@ mod tests {
         };
         let s2 = extract_legacy_seat(&raw2).unwrap();
         assert_eq!(s2.metadata["legacy_active_task_id"], "task_eb36fa40");
-        assert!(s2.active_task_id.is_none(), "указатель на легаси-таску в metadata");
+        assert!(
+            s2.active_task_id.is_none(),
+            "указатель на легаси-таску в metadata"
+        );
         assert_eq!(s2.context["context_limit_chars"], 8000);
         assert_eq!(s2.usage_stats.total_requests, 1237);
         assert!(s2.metadata.get("legacy_status").is_none());
@@ -1343,13 +1433,20 @@ mod tests {
         let a = unique("doc_x".into(), &mut used);
         let b = unique("doc_x".into(), &mut used);
         let c = unique("doc_x".into(), &mut used);
-        assert_eq!((a.as_str(), b.as_str(), c.as_str()), ("doc_x", "doc_x_2", "doc_x_3"));
+        assert_eq!(
+            (a.as_str(), b.as_str(), c.as_str()),
+            ("doc_x", "doc_x_2", "doc_x_3")
+        );
 
         let h = history_id("history_d5ae1bb1a5f52096", None);
         assert!(h.starts_with("history_undated_"), "{h}");
         let h2 = history_id(
             "history_d5ae1bb1a5f52096",
-            Some(DateTime::parse_from_rfc3339("2026-03-10T09:49:34Z").unwrap().with_timezone(&Utc)),
+            Some(
+                DateTime::parse_from_rfc3339("2026-03-10T09:49:34Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
         );
         assert_eq!(h2, "history_2026_03_10_1bb1a5f52096", "{h2}");
         assert_ne!(h, h2);
@@ -1374,8 +1471,11 @@ mod tests {
         };
         let mut used = HashSet::new();
         let ai = new_kb_id(&d, Some("migration_slc_plan".into()), &mut used);
-        assert_eq!(ai, "migration_slc_plan", "AI-слаг без категорийного префикса");
-        // Without AI the external id contract is kept regardless of the title.
+        assert_eq!(
+            ai, "migration_slc_plan",
+            "AI-слаг без категорийного префикса"
+        );
+        // Without AI, the id's external contract is preserved regardless of the heading.
         let fb = new_kb_id(&d, None, &mut used);
         assert_eq!(fb, "doc_a1b2c3");
         // Cyrillic text without a title — fallback to the meaningful legacy id.
@@ -1418,30 +1518,72 @@ mod tests {
     fn hierarchical_default_folders() {
         // Knowledge categories live under docs/ (no prefix, folders carry context).
         assert_eq!(
-            Document::new("manifest", DocumentCategory::Core, "x", Default::default(), vec![], None)
-                .default_folder(),
+            Document::new(
+                "manifest",
+                DocumentCategory::Core,
+                "x",
+                Default::default(),
+                vec![],
+                None
+            )
+            .default_folder(),
             "docs/core"
         );
         assert_eq!(
-            Document::new("notes", DocumentCategory::Custom, "x", Default::default(), vec![], None)
-                .default_folder(),
+            Document::new(
+                "notes",
+                DocumentCategory::Custom,
+                "x",
+                Default::default(),
+                vec![],
+                None
+            )
+            .default_folder(),
             "docs/custom"
         );
         assert_eq!(
-            Document::new("guide", DocumentCategory::Documentation, "x", Default::default(), vec![], None)
-                .default_folder(),
+            Document::new(
+                "guide",
+                DocumentCategory::Documentation,
+                "x",
+                Default::default(),
+                vec![],
+                None
+            )
+            .default_folder(),
             "docs"
         );
         assert_eq!(
-            Document::new("audit", DocumentCategory::Task, "x", Default::default(), vec![], None)
-                .default_folder(),
+            Document::new(
+                "audit",
+                DocumentCategory::Task,
+                "x",
+                Default::default(),
+                vec![],
+                None
+            )
+            .default_folder(),
             "tasks"
         );
 
         // Project note: docs/projects/<slug>/ (legacy `project_` stripped).
-        let proj = Document::new("slc", DocumentCategory::Project, "x", Default::default(), vec![], None);
+        let proj = Document::new(
+            "slc",
+            DocumentCategory::Project,
+            "x",
+            Default::default(),
+            vec![],
+            None,
+        );
         assert_eq!(proj.default_folder(), "docs/projects/slc");
-        let mut proj2 = Document::new("project_slc", DocumentCategory::Project, "x", Default::default(), vec![], None);
+        let mut proj2 = Document::new(
+            "project_slc",
+            DocumentCategory::Project,
+            "x",
+            Default::default(),
+            vec![],
+            None,
+        );
         assert_eq!(proj2.default_folder(), "docs/projects/slc");
         // Explicit metadata.project wins even for a project note.
         let mut m = DocMeta::default();
@@ -1452,14 +1594,29 @@ mod tests {
         // Docs bound to a project go inside its folder, per-category subfolder.
         let mut meta = DocMeta::default();
         meta.extra.insert("project".into(), json!("slc"));
-        let task = Document::new("migration", DocumentCategory::Task, "x", meta.clone(), vec![], None);
+        let task = Document::new(
+            "migration",
+            DocumentCategory::Task,
+            "x",
+            meta.clone(),
+            vec![],
+            None,
+        );
         assert_eq!(task.default_folder(), "docs/projects/slc/tasks");
-        let note = Document::new("mcp-setup", DocumentCategory::Documentation, "x", meta, vec![], None);
+        let note = Document::new(
+            "mcp-setup",
+            DocumentCategory::Documentation,
+            "x",
+            meta,
+            vec![],
+            None,
+        );
         assert_eq!(note.default_folder(), "docs/projects/slc/docs");
 
         // project slug is sanitized — cannot escape the projects tree.
         let mut evil = DocMeta::default();
-        evil.extra.insert("project".into(), json!("../../etc/passwd"));
+        evil.extra
+            .insert("project".into(), json!("../../etc/passwd"));
         let d = Document::new("x", DocumentCategory::Custom, "x", evil, vec![], None);
         assert_eq!(d.default_folder(), "docs/projects/etc_passwd/custom");
     }
@@ -1492,7 +1649,10 @@ mod tests {
         assert_eq!(out.auto_load, vec!["mcp_setup", "missing"]);
         assert_eq!(out.metadata.doc_type.as_deref(), Some("plan"));
         assert_eq!(out.metadata.extra["legacy_id"], "custom_old");
-        assert_eq!(out.metadata.extra["project"], "slc", "привязка к проекту сохраняется");
+        assert_eq!(
+            out.metadata.extra["project"], "slc",
+            "привязка к проекту сохраняется"
+        );
         assert_eq!(out.version, 2);
         assert_eq!(out.default_folder(), "docs/projects/slc/docs");
     }
@@ -1548,15 +1708,30 @@ mod tests {
         // Empty name/description → fallback to task_id.
         let raw3 = bson::doc! { "task_id": "cellframe_staking_security_audit" };
         let mut used3 = HashSet::new();
-        let id3 = task_new_id(&raw3, "cellframe_staking_security_audit", "", "", None, false, &mut used3).await;
+        let id3 = task_new_id(
+            &raw3,
+            "cellframe_staking_security_audit",
+            "",
+            "",
+            None,
+            false,
+            &mut used3,
+        )
+        .await;
         assert_eq!(id3, "cellframe_staking_security_audit");
     }
 
     #[test]
     fn restore_seat_anchor_uses_renamed_task_ids() {
         let mut map = HashMap::new();
-        map.insert("task_15c3c8ca".to_string(), "voip_bridge_one_way_audio".to_string());
-        map.insert("project_legacy".to_string(), "project_preserved".to_string());
+        map.insert(
+            "task_15c3c8ca".to_string(),
+            "voip_bridge_one_way_audio".to_string(),
+        );
+        map.insert(
+            "project_legacy".to_string(),
+            "project_preserved".to_string(),
+        );
         let mut seat = Seat {
             seat_id: "seat_a".into(),
             name: "dev".into(),
@@ -1576,8 +1751,14 @@ mod tests {
             usage_stats: UsageStats::default(),
         };
         assert!(restore_seat_anchor(&mut seat, &map));
-        assert_eq!(seat.active_task_id.as_deref(), Some("voip_bridge_one_way_audio"));
-        assert_eq!(seat.active_document_id.as_deref(), Some("project_preserved"));
+        assert_eq!(
+            seat.active_task_id.as_deref(),
+            Some("voip_bridge_one_way_audio")
+        );
+        assert_eq!(
+            seat.active_document_id.as_deref(),
+            Some("project_preserved")
+        );
         assert!(seat.metadata.get("legacy_active_task_id").is_none());
         assert!(seat.metadata.get("legacy_active_document_id").is_none());
 

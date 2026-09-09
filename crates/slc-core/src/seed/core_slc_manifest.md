@@ -135,8 +135,11 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 - `set_page_limit(page_token_limit)` — persisted default page size (the
   operator's `SLC_PAGE_TOKEN_LIMIT` environment value has precedence)
 - `get_page_settings` — server defaults and effective connection settings
-- When `_pagination.total_pages > 1`, retrieve every remaining page in order
-  with `get_page` before interpreting or acting on the result.
+- When `_pagination.has_more=true`, the response ends with the exact next
+  `mcp__slc__get_page({...})` invocation. Execute that command immediately,
+  then follow the command at the end of the next page. Do not interpret, act
+  on, summarize, or update the document until a page reports
+  `_pagination.has_more=false`.
 
 ### Other
 - `seat_info` — seat info + usage stats
@@ -163,11 +166,11 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 | `SLC_CONTEXT_LIMIT_TOKENS` | `100000` | Fallback context budget when neither the connection nor seat specifies one |
 | `SLC_PAGINATION_ENABLED` | `true` | Enable pagination for large list-shaped MCP tool results |
 | `SLC_PAGE_TOKEN_LIMIT` | `50000` | Approximate page size and pagination threshold in tokens |
-| `SLC_LLM` | auto | Provider: hash/ollama/lmstudio/candle |
+| `SLC_LLM` | auto | Provider for non-sampling paths: hash/ollama/lmstudio/candle |
 | `LMSTUDIO_URL` | — | LM Studio URL |
 | `LMSTUDIO_MODEL` | `google/gemma-4-e4b` | Reasoning model |
 | `LMSTUDIO_EMBED_MODEL` | `text-embedding-nomic-embed-text-v1.5` | Embedding model |
-| `SLC_MCP_SAMPLING` | `false` | Fallback to MCP client inference |
+| `SLC_MCP_SAMPLING` | `false` | Use the authenticated seat's MCP client for reasoning; no dedicated generative endpoint |
 | `SLC_AI_ORGANIZE` | `true` | AI folder determination on add_document |
 | `SLC_SEAT_TTL_SECONDS` | `86400` | Seat TTL (0 = never expire) |
 | `SLC_SEARCH_MIN_SCORE` | `0.20` | Minimum search score |

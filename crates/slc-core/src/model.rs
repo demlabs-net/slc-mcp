@@ -173,7 +173,15 @@ impl Document {
         tags: Vec<String>,
         seat_id: Option<String>,
     ) -> Self {
-        Document::with_folder(document_id, category, None, content, metadata, tags, seat_id)
+        Document::with_folder(
+            document_id,
+            category,
+            None,
+            content,
+            metadata,
+            tags,
+            seat_id,
+        )
     }
 
     pub fn with_folder(
@@ -226,7 +234,11 @@ impl Document {
             let slug = self
                 .project_slug()
                 .or_else(|| {
-                    slugify_ascii(self.document_id.strip_prefix("project_").unwrap_or(&self.document_id))
+                    slugify_ascii(
+                        self.document_id
+                            .strip_prefix("project_")
+                            .unwrap_or(&self.document_id),
+                    )
                 })
                 .unwrap_or_else(|| "project".into());
             return format!("docs/projects/{slug}");
@@ -443,11 +455,7 @@ pub fn slugify_ascii(raw: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join("_");
     let slug = slug.chars().take(48).collect::<String>();
-    if slug.is_empty() {
-        None
-    } else {
-        Some(slug)
-    }
+    if slug.is_empty() { None } else { Some(slug) }
 }
 
 /// sha256 hex of the document content — dedup / content identity only.
@@ -469,12 +477,39 @@ pub fn unique_id(prefix: &str) -> String {
 /// Cyrillic → Latin transliteration (for readable ids from Russian names).
 fn translit_char(c: char, upper: bool) -> Option<String> {
     const LOWER: &[(&str, &str)] = &[
-        ("а", "a"), ("б", "b"), ("в", "v"), ("г", "g"), ("д", "d"), ("е", "e"),
-        ("ё", "yo"), ("ж", "zh"), ("з", "z"), ("и", "i"), ("й", "y"), ("к", "k"),
-        ("л", "l"), ("м", "m"), ("н", "n"), ("о", "o"), ("п", "p"), ("р", "r"),
-        ("с", "s"), ("т", "t"), ("у", "u"), ("ф", "f"), ("х", "h"), ("ц", "ts"),
-        ("ч", "ch"), ("ш", "sh"), ("щ", "sch"), ("ъ", ""), ("ы", "y"), ("ь", ""),
-        ("э", "e"), ("ю", "yu"), ("я", "ya"),
+        ("а", "a"),
+        ("б", "b"),
+        ("в", "v"),
+        ("г", "g"),
+        ("д", "d"),
+        ("е", "e"),
+        ("ё", "yo"),
+        ("ж", "zh"),
+        ("з", "z"),
+        ("и", "i"),
+        ("й", "y"),
+        ("к", "k"),
+        ("л", "l"),
+        ("м", "m"),
+        ("н", "n"),
+        ("о", "o"),
+        ("п", "p"),
+        ("р", "r"),
+        ("с", "s"),
+        ("т", "t"),
+        ("у", "u"),
+        ("ф", "f"),
+        ("х", "h"),
+        ("ц", "ts"),
+        ("ч", "ch"),
+        ("ш", "sh"),
+        ("щ", "sch"),
+        ("ъ", ""),
+        ("ы", "y"),
+        ("ь", ""),
+        ("э", "e"),
+        ("ю", "yu"),
+        ("я", "ya"),
     ];
     let lower: String = c.to_lowercase().collect();
     for (ru, lat) in LOWER {

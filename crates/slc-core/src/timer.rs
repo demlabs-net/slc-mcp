@@ -14,10 +14,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration as StdDuration;
-
 
 /// A timer handler — called when the timer fires.
 #[async_trait]
@@ -87,9 +86,8 @@ impl TimerRegistry {
             timer_type,
             interval_seconds,
             last_fired_at: None,
-            next_fire_at: next_fire_at.unwrap_or_else(|| {
-                now + chrono::Duration::seconds(interval_seconds.unwrap_or(0))
-            }),
+            next_fire_at: next_fire_at
+                .unwrap_or_else(|| now + chrono::Duration::seconds(interval_seconds.unwrap_or(0))),
             is_active: true,
             metadata: metadata.as_object().cloned().unwrap_or_default(),
             created_at: now,
@@ -112,7 +110,9 @@ impl TimerRegistry {
             if interval <= 0 {
                 continue;
             }
-            let id = self.register(t, seat_id, Some(interval), None, Value::Null).await?;
+            let id = self
+                .register(t, seat_id, Some(interval), None, Value::Null)
+                .await?;
             created.push(id);
         }
         Ok(created)
@@ -149,7 +149,13 @@ impl TimerRegistry {
 
     /// Cancel all active timers for a seat whose metadata key == value
     /// (e.g. `reminder_id`). Returns the number cancelled.
-    pub async fn cancel_by_metadata(&self, seat_id: &str, timer_type: TimerType, key: &str, value: &str) -> SlcResult<usize> {
+    pub async fn cancel_by_metadata(
+        &self,
+        seat_id: &str,
+        timer_type: TimerType,
+        key: &str,
+        value: &str,
+    ) -> SlcResult<usize> {
         let timers = self.store.active_timers(Some(seat_id)).await?;
         let mut cancelled = 0;
         for timer in timers {
@@ -184,7 +190,9 @@ impl TimerRegistry {
             loop {
                 let now = Utc::now();
                 if timer.next_fire_at > now {
-                    let dur = (timer.next_fire_at - now).to_std().unwrap_or(StdDuration::ZERO);
+                    let dur = (timer.next_fire_at - now)
+                        .to_std()
+                        .unwrap_or(StdDuration::ZERO);
                     tokio::time::sleep(dur).await;
                 }
                 let _ = store.set_timer_fired(&timer.timer_id, Utc::now()).await;
@@ -193,7 +201,11 @@ impl TimerRegistry {
                 let handler = handlers.read().unwrap().get(&timer.timer_type).cloned();
                 if let Some(handler) = handler {
                     if let Err(e) = handler.handle(&timer).await {
-                        tracing::warn!("timer {} ({}) handler error: {e}", timer.timer_id, timer.timer_type.as_str());
+                        tracing::warn!(
+                            "timer {} ({}) handler error: {e}",
+                            timer.timer_id,
+                            timer.timer_type.as_str()
+                        );
                     }
                 }
                 match timer.interval_seconds.filter(|i| *i > 0) {
@@ -247,7 +259,11 @@ pub struct AsyncFnHandler<F> {
 
 impl<F> AsyncFnHandler<F>
 where
-    F: Fn(&PersistedTimer) -> std::pin::Pin<Box<dyn std::future::Future<Output = SlcResult<()>> + Send>> + Send + Sync,
+    F: Fn(
+            &PersistedTimer,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SlcResult<()>> + Send>>
+        + Send
+        + Sync,
 {
     pub fn new(f: F) -> Self {
         AsyncFnHandler { f }
@@ -257,7 +273,11 @@ where
 #[async_trait]
 impl<F> TimerHandler for AsyncFnHandler<F>
 where
-    F: Fn(&PersistedTimer) -> std::pin::Pin<Box<dyn std::future::Future<Output = SlcResult<()>> + Send>> + Send + Sync,
+    F: Fn(
+            &PersistedTimer,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SlcResult<()>> + Send>>
+        + Send
+        + Sync,
 {
     async fn handle(&self, timer: &PersistedTimer) -> SlcResult<()> {
         (self.f)(timer).await
@@ -270,11 +290,12 @@ where
 mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteStore;
+    use tokio::sync::Notify;
 
-    /// Yield repeatedly so spawned tasks can reach their await points, then
-    /// advance the paused clock deterministically.
+    /// Yield repeatedly so a timer task can finish its storage update after
+    /// notifying the test handler.
     async fn yield_a_bit() {
-        for _ in 0..32 {
+        for _ in 0..16 {
             tokio::task::yield_now().await;
         }
     }
@@ -300,25 +321,35 @@ mod tests {
         let registry = TimerRegistry::new(store.clone());
         let fired = Arc::new(AtomicUsize::new(0));
         let fired2 = fired.clone();
+        let signal = Arc::new(Notify::new());
+        let signal2 = signal.clone();
         registry.set_handler(
             TimerType::HistoryCompression,
             Arc::new(FnHandler::new(move |_t| {
                 fired2.fetch_add(1, Ordering::Relaxed);
+                signal2.notify_one();
                 Ok(())
             })),
         );
 
         let tid = registry
-            .register(TimerType::HistoryCompression, "seat_t", Some(1), None, Value::Null)
+            .register(
+                TimerType::HistoryCompression,
+                "seat_t",
+                Some(1),
+                Some(Utc::now() - chrono::Duration::seconds(1)),
+                Value::Null,
+            )
             .await
             .unwrap();
         let _ = registry.start().await;
         assert_eq!(registry.spawned_count(), 1);
 
-        // advance until the first fire (next_fire_at = now + 1s); keep
-        // advancing while the spawned task may have registered its sleep late.
-        advance_until(60_000, || fired.load(Ordering::Relaxed) >= 1).await;
+        // Start overdue so awaiting the handler itself is the readiness
+        // barrier; this avoids racing a forced clock advance against spawn.
+        signal.notified().await;
         assert_eq!(fired.load(Ordering::Relaxed), 1, "first fire");
+        yield_a_bit().await;
 
         // periodic → still active and rescheduled
         let active = registry.list(Some("seat_t")).await.unwrap();
@@ -326,13 +357,17 @@ mod tests {
         assert!(active[0].is_active);
         assert!(active[0].last_fired_at.is_some());
 
-        // advance until the second fire (window must cover a late first
-        // fire plus the full reschedule interval)
-        advance_until(60_000, || fired.load(Ordering::Relaxed) >= 2).await;
+        // The first handler has completed and the periodic task has installed
+        // its next sleep, so advancing now exercises the reschedule path.
+        tokio::time::advance(StdDuration::from_secs(2)).await;
+        signal.notified().await;
         assert!(fired.load(Ordering::Relaxed) >= 2, "rescheduled fire");
 
         assert!(registry.cancel(&tid).await.unwrap());
-        assert!(registry.list(Some("seat_t")).await.unwrap().is_empty(), "cancelled → inactive");
+        assert!(
+            registry.list(Some("seat_t")).await.unwrap().is_empty(),
+            "cancelled → inactive"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -341,21 +376,38 @@ mod tests {
         let registry = TimerRegistry::new(store.clone());
         let fired = Arc::new(AtomicUsize::new(0));
         let fired2 = fired.clone();
+        let signal = Arc::new(Notify::new());
+        let signal2 = signal.clone();
         registry.set_handler(
             TimerType::Reminder,
             Arc::new(FnHandler::new(move |_t| {
                 fired2.fetch_add(1, Ordering::Relaxed);
+                signal2.notify_one();
                 Ok(())
             })),
         );
         let _ = registry
-            .register(TimerType::Reminder, "seat_o", None, Some(Utc::now() + chrono::Duration::seconds(1)), Value::Null)
+            .register(
+                TimerType::Reminder,
+                "seat_o",
+                None,
+                Some(Utc::now() - chrono::Duration::seconds(1)),
+                Value::Null,
+            )
             .await
             .unwrap();
         let _ = registry.start().await;
-        advance_until(4000, || fired.load(Ordering::Relaxed) >= 1).await;
+        signal.notified().await;
         assert_eq!(fired.load(Ordering::Relaxed), 1);
-        assert!(registry.list(Some("seat_o")).await.unwrap().is_empty(), "one-shot done → inactive");
+        let mut active = registry.list(Some("seat_o")).await.unwrap();
+        for _ in 0..128 {
+            if active.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            active = registry.list(Some("seat_o")).await.unwrap();
+        }
+        assert!(active.is_empty(), "one-shot done → inactive");
     }
 
     #[tokio::test]

@@ -4,15 +4,15 @@
 //! the "history is not RAG'd" invariant holds at the schema level. All ops
 //! run on a `spawn_blocking` worker (rusqlite is sync; the trait is async).
 
-use super::{DocFilter, DocSort, MetaPatch, SortField, SortDir, StorageBackend};
+use super::{DocFilter, DocSort, MetaPatch, SortDir, SortField, StorageBackend};
 use crate::error::{SlcError, SlcResult};
 use crate::model::{
-    content_hash, Document, DocumentCategory, EmbeddingRecord, EmbeddingScope,
-    PersistedTimer, Seat, SeatStatus, TimerType, UsageStats,
+    Document, DocumentCategory, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat, SeatStatus,
+    TimerType, UsageStats, content_hash,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -126,7 +126,9 @@ impl SqliteStore {
         if !has_col {
             conn.execute("ALTER TABLE seats ADD COLUMN active_document_id TEXT", [])?;
         }
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// In-memory store (tests / embedded use).
@@ -148,7 +150,24 @@ impl SqliteStore {
 
 // ─────────────────────────────── row <-> model ───────────────────────────────
 
-fn doc_to_row(doc: &Document) -> SlcResult<(String, String, String, String, String, String, String, String, String, Option<String>, String, String, i64, Option<String>)> {
+fn doc_to_row(
+    doc: &Document,
+) -> SlcResult<(
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    i64,
+    Option<String>,
+)> {
     Ok((
         doc.document_id.clone(),
         doc.category.as_str().to_string(),
@@ -177,7 +196,11 @@ fn row_to_doc(row: &Row) -> rusqlite::Result<Document> {
     Ok(Document {
         document_id: row.get(0)?,
         category: DocumentCategory::parse(&category).ok_or_else(|| {
-            rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, format!("bad category {category}").into())
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                format!("bad category {category}").into(),
+            )
         })?,
         folder: Some(row.get(2)?),
         content: row.get(3)?,
@@ -211,9 +234,7 @@ fn build_where(f: &DocFilter) -> (String, Vec<String>) {
         if ids.is_empty() {
             clauses.push("0 = 1".to_string()); // empty allowlist matches nothing
         } else {
-            let placeholders: Vec<String> = (1..=ids.len())
-                .map(|i| format!("?{i}"))
-                .collect();
+            let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
             clauses.push(format!("document_id IN ({})", placeholders.join(", ")));
             params.extend(ids.iter().cloned());
         }
@@ -238,6 +259,38 @@ fn build_where(f: &DocFilter) -> (String, Vec<String>) {
         clauses.push("json_extract(metadata, '$.doc_type') = ?".to_string());
         params.push(dt.clone());
     }
+    for (key, value) in &f.extra_strings {
+        clauses.push(
+            "json_type(metadata, ?) = 'text' AND CAST(json_extract(metadata, ?) AS TEXT) = ?"
+                .to_string(),
+        );
+        let path = format!(
+            "$.{}",
+            serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string())
+        );
+        params.push(path.clone());
+        params.push(path);
+        params.push(value.clone());
+    }
+    for (key, values) in &f.extra_strings_not_in {
+        if values.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", values.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!(
+            "(json_type(metadata, ?) IS NULL OR json_type(metadata, ?) != 'text' OR CAST(json_extract(metadata, ?) AS TEXT) NOT IN ({placeholders}))"
+        ));
+        let path = format!(
+            "$.{}",
+            serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string())
+        );
+        params.push(path.clone());
+        params.push(path.clone());
+        params.push(path);
+        params.extend(values.iter().cloned());
+    }
     if let Some(archived) = f.archived {
         if archived {
             clauses.push("json_extract(metadata, '$.archived') = 1".to_string());
@@ -249,25 +302,43 @@ fn build_where(f: &DocFilter) -> (String, Vec<String>) {
         clauses.push("(json_extract(metadata, '$.consolidated') IS NULL OR json_extract(metadata, '$.consolidated') = 0)".to_string());
     }
     match f.has_compression_batch {
-        Some(true) => clauses.push("json_extract(metadata, '$.compression_batch_id') IS NOT NULL".to_string()),
-        Some(false) => clauses.push("json_extract(metadata, '$.compression_batch_id') IS NULL".to_string()),
+        Some(true) => {
+            clauses.push("json_extract(metadata, '$.compression_batch_id') IS NOT NULL".to_string())
+        }
+        Some(false) => {
+            clauses.push("json_extract(metadata, '$.compression_batch_id') IS NULL".to_string())
+        }
         None => {}
     }
     if !f.tags_any.is_empty() {
         // tags stored as JSON array — match if ANY listed tag is a member.
+        let first_param = params.len() + 1;
         let ors: Vec<String> = f
             .tags_any
             .iter()
-            .map(|_| format!("EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})", params.len() + 1))
+            .enumerate()
+            .map(|(offset, _)| {
+                format!(
+                    "EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})",
+                    first_param + offset
+                )
+            })
             .collect();
         clauses.push(format!("({})", ors.join(" OR ")));
         params.extend(f.tags_any.iter().cloned());
     }
     if !f.tags_all.is_empty() {
+        let first_param = params.len() + 1;
         let ands: Vec<String> = f
             .tags_all
             .iter()
-            .map(|_| format!("EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})", params.len() + 1))
+            .enumerate()
+            .map(|(offset, _)| {
+                format!(
+                    "EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?{})",
+                    first_param + offset
+                )
+            })
             .collect();
         clauses.push(format!("({})", ands.join(" AND ")));
         params.extend(f.tags_all.iter().cloned());
@@ -286,7 +357,11 @@ fn build_where(f: &DocFilter) -> (String, Vec<String>) {
         params.push(until.to_rfc3339());
     }
 
-    let where_sql = if clauses.is_empty() { String::new() } else { format!("WHERE {}", clauses.join(" AND ")) };
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    };
     (where_sql, params)
 }
 
@@ -304,7 +379,10 @@ fn order_dir(sort: &DocSort) -> &'static str {
 }
 
 fn kv_params(params: &[String]) -> Vec<&dyn rusqlite::types::ToSql> {
-    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect()
+    params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect()
 }
 
 // ─────────────────────────────── impl StorageBackend ───────────────────────────────
@@ -347,7 +425,11 @@ impl StorageBackend for SqliteStore {
     }
 
     async fn kb_update_content(&self, document_id: &str, content: &str) -> SlcResult<bool> {
-        let (id, content, hash) = (document_id.to_string(), content.to_string(), content_hash(content));
+        let (id, content, hash) = (
+            document_id.to_string(),
+            content.to_string(),
+            content_hash(content),
+        );
         self.blocking(move |conn| {
             let n = conn.execute(
                 "UPDATE documents SET content = ?2, content_hash = ?3, version = version + 1, updated_at = ?4
@@ -360,7 +442,10 @@ impl StorageBackend for SqliteStore {
     }
 
     async fn kb_upsert(&self, doc: &Document) -> SlcResult<bool> {
-        if self.kb_update_content(&doc.document_id, &doc.content).await? {
+        if self
+            .kb_update_content(&doc.document_id, &doc.content)
+            .await?
+        {
             return Ok(true);
         }
         self.kb_insert(doc).await?;
@@ -393,7 +478,12 @@ impl StorageBackend for SqliteStore {
         Ok(existed)
     }
 
-    async fn kb_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>> {
+    async fn kb_find(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+        limit: usize,
+    ) -> SlcResult<Vec<Document>> {
         let f = filter.clone();
         let sort = *sort;
         self.blocking(move |conn| {
@@ -547,7 +637,10 @@ impl StorageBackend for SqliteStore {
     async fn kb_cleanup_graveyard(&self, days: i64) -> SlcResult<u64> {
         let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
         self.blocking(move |conn| {
-            let n = conn.execute("DELETE FROM documents WHERE deleted_at IS NOT NULL AND deleted_at <= ?1", params![cutoff])?;
+            let n = conn.execute(
+                "DELETE FROM documents WHERE deleted_at IS NOT NULL AND deleted_at <= ?1",
+                params![cutoff],
+            )?;
             Ok(n as u64)
         })
         .await
@@ -580,7 +673,10 @@ impl StorageBackend for SqliteStore {
         // Upsert by unique NAME id (e.g. episodic_l4_{seat}).
         let row = doc_to_row(doc)?;
         let existing = self
-            .episodic_count(&DocFilter { seat_id: doc.seat_id.clone(), ..Default::default() })
+            .episodic_count(&DocFilter {
+                seat_id: doc.seat_id.clone(),
+                ..Default::default()
+            })
             .await;
         let _ = existing;
         self.blocking(move |conn| {
@@ -602,7 +698,12 @@ impl StorageBackend for SqliteStore {
         .await
     }
 
-    async fn episodic_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>> {
+    async fn episodic_find(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+        limit: usize,
+    ) -> SlcResult<Vec<Document>> {
         let f = filter.clone();
         let sort = *sort;
         self.blocking(move |conn| {
@@ -642,7 +743,9 @@ impl StorageBackend for SqliteStore {
     async fn episodic_patch_meta(&self, filter: &DocFilter, patch: &MetaPatch) -> SlcResult<usize> {
         let f = filter.clone();
         let patch = patch.clone();
-        let docs = self.episodic_find(&f, &DocSort::default(), usize::MAX).await?;
+        let docs = self
+            .episodic_find(&f, &DocSort::default(), usize::MAX)
+            .await?;
         let mut changed = 0;
         for doc in docs {
             let mut m = doc.metadata.clone();
@@ -682,7 +785,17 @@ impl StorageBackend for SqliteStore {
     // ── embeddings ──────────────────────────────────────────────
 
     async fn insert_embeddings(&self, records: &[EmbeddingRecord]) -> SlcResult<()> {
-        let rows: Vec<(String, i64, i64, String, String, i64, String, String, Option<String>)> = records
+        let rows: Vec<(
+            String,
+            i64,
+            i64,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            Option<String>,
+        )> = records
             .iter()
             .map(|r| {
                 Ok((
@@ -749,7 +862,11 @@ impl StorageBackend for SqliteStore {
         .await
     }
 
-    async fn all_embeddings(&self, scope: EmbeddingScope, seat_id: Option<&str>) -> SlcResult<Vec<EmbeddingRecord>> {
+    async fn all_embeddings(
+        &self,
+        scope: EmbeddingScope,
+        seat_id: Option<&str>,
+    ) -> SlcResult<Vec<EmbeddingRecord>> {
         let scope_str = match scope {
             EmbeddingScope::Public => "public",
             EmbeddingScope::Private => "private",
@@ -783,7 +900,19 @@ impl StorageBackend for SqliteStore {
     // ── seats ───────────────────────────────────────────────────
 
     async fn insert_seat(&self, seat: &Seat) -> SlcResult<()> {
-        let (seat_id, name, status, created_at, last_accessed, expires_at, metadata, active_task_id, context, usage_stats, active_document_id) = (
+        let (
+            seat_id,
+            name,
+            status,
+            created_at,
+            last_accessed,
+            expires_at,
+            metadata,
+            active_task_id,
+            context,
+            usage_stats,
+            active_document_id,
+        ) = (
             seat.seat_id.clone(),
             seat.name.clone(),
             seat.status.as_str().to_string(),
@@ -810,7 +939,13 @@ impl StorageBackend for SqliteStore {
     async fn get_seat(&self, seat_id: &str) -> SlcResult<Option<Seat>> {
         let id = seat_id.to_string();
         self.blocking(move |conn| {
-            let row = conn.query_row("SELECT * FROM seats WHERE seat_id = ?1", params![id], row_to_seat).optional()?;
+            let row = conn
+                .query_row(
+                    "SELECT * FROM seats WHERE seat_id = ?1",
+                    params![id],
+                    row_to_seat,
+                )
+                .optional()?;
             Ok(row)
         })
         .await
@@ -847,7 +982,10 @@ impl StorageBackend for SqliteStore {
         let id = seat_id.to_string();
         let status = status.as_str().to_string();
         self.blocking(move |conn| {
-            let n = conn.execute("UPDATE seats SET status = ?2 WHERE seat_id = ?1", params![id, status])?;
+            let n = conn.execute(
+                "UPDATE seats SET status = ?2 WHERE seat_id = ?1",
+                params![id, status],
+            )?;
             Ok(n > 0)
         })
         .await
@@ -866,7 +1004,11 @@ impl StorageBackend for SqliteStore {
         .await
     }
 
-    async fn set_seat_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool> {
+    async fn set_seat_active_document(
+        &self,
+        seat_id: &str,
+        document_id: Option<&str>,
+    ) -> SlcResult<bool> {
         let (id, doc) = (seat_id.to_string(), document_id.map(String::from));
         self.blocking(move |conn| {
             let n = conn.execute(
@@ -881,11 +1023,18 @@ impl StorageBackend for SqliteStore {
     async fn get_seat_active_document(&self, seat_id: &str) -> SlcResult<Option<String>> {
         let id = seat_id.to_string();
         self.blocking(move |conn| {
-            let row = conn.query_row(
-                "SELECT active_document_id, active_task_id FROM seats WHERE seat_id = ?1",
-                params![id],
-                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
-            ).optional()?;
+            let row = conn
+                .query_row(
+                    "SELECT active_document_id, active_task_id FROM seats WHERE seat_id = ?1",
+                    params![id],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .optional()?;
             // Unified field first; fall back to the legacy task pointer so
             // seats activated before the migration keep working.
             Ok(row.and_then(|(doc, task)| doc.or(task)))
@@ -893,14 +1042,25 @@ impl StorageBackend for SqliteStore {
         .await
     }
 
-    async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool> {
+    async fn incr_seat_stats(
+        &self,
+        seat_id: &str,
+        tool_name: &str,
+        tokens_used: i64,
+    ) -> SlcResult<bool> {
         let id = seat_id.to_string();
         let tool = tool_name.to_string();
         self.blocking(move |conn| {
             let stats: Option<String> = conn
-                .query_row("SELECT usage_stats FROM seats WHERE seat_id = ?1", params![id], |r| r.get(0))
+                .query_row(
+                    "SELECT usage_stats FROM seats WHERE seat_id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
                 .optional()?;
-            let mut stats: UsageStats = stats.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+            let mut stats: UsageStats = stats
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
             stats.total_requests += 1;
             stats.total_tokens += tokens_used;
             let count = stats
@@ -909,7 +1069,9 @@ impl StorageBackend for SqliteStore {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0)
                 + 1;
-            stats.tools_used.insert(tool, serde_json::Value::from(count));
+            stats
+                .tools_used
+                .insert(tool, serde_json::Value::from(count));
             let json = serde_json::to_string(&stats)?;
             let n = conn.execute(
                 "UPDATE seats SET usage_stats = ?2, last_accessed = ?3 WHERE seat_id = ?1",
@@ -923,7 +1085,17 @@ impl StorageBackend for SqliteStore {
     // ── timers ──────────────────────────────────────────────────
 
     async fn insert_timer(&self, timer: &PersistedTimer) -> SlcResult<()> {
-        let (timer_id, seat_id, timer_type, interval_seconds, last_fired_at, next_fire_at, is_active, metadata, created_at) = (
+        let (
+            timer_id,
+            seat_id,
+            timer_type,
+            interval_seconds,
+            last_fired_at,
+            next_fire_at,
+            is_active,
+            metadata,
+            created_at,
+        ) = (
             timer.timer_id.clone(),
             timer.seat_id.clone(),
             timer.timer_type.as_str().to_string(),
@@ -949,7 +1121,11 @@ impl StorageBackend for SqliteStore {
         let id = timer_id.to_string();
         self.blocking(move |conn| {
             let row = conn
-                .query_row("SELECT * FROM timers WHERE timer_id = ?1", params![id], row_to_timer)
+                .query_row(
+                    "SELECT * FROM timers WHERE timer_id = ?1",
+                    params![id],
+                    row_to_timer,
+                )
                 .optional()?;
             Ok(row)
         })
@@ -1003,7 +1179,11 @@ impl StorageBackend for SqliteStore {
         let (c, k) = (collection.to_string(), key.to_string());
         self.blocking(move |conn| {
             let v: Option<String> = conn
-                .query_row("SELECT value FROM records WHERE collection = ?1 AND key = ?2", params![c, k], |r| r.get(0))
+                .query_row(
+                    "SELECT value FROM records WHERE collection = ?1 AND key = ?2",
+                    params![c, k],
+                    |r| r.get(0),
+                )
                 .optional()?;
             Ok(v.and_then(|s| serde_json::from_str(&s).ok()))
         })
@@ -1013,8 +1193,11 @@ impl StorageBackend for SqliteStore {
     async fn list_records(&self, collection: &str) -> SlcResult<Vec<(String, Value)>> {
         let c = collection.to_string();
         self.blocking(move |conn| {
-            let mut stmt = conn.prepare("SELECT key, value FROM records WHERE collection = ?1 ORDER BY key")?;
-            let rows = stmt.query_map(params![c], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut stmt =
+                conn.prepare("SELECT key, value FROM records WHERE collection = ?1 ORDER BY key")?;
+            let rows = stmt.query_map(params![c], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
             let mut out = Vec::new();
             for row in rows {
                 let (k, v) = row?;
@@ -1030,7 +1213,10 @@ impl StorageBackend for SqliteStore {
     async fn delete_record(&self, collection: &str, key: &str) -> SlcResult<bool> {
         let (c, k) = (collection.to_string(), key.to_string());
         self.blocking(move |conn| {
-            let n = conn.execute("DELETE FROM records WHERE collection = ?1 AND key = ?2", params![c, k])?;
+            let n = conn.execute(
+                "DELETE FROM records WHERE collection = ?1 AND key = ?2",
+                params![c, k],
+            )?;
             Ok(n > 0)
         })
         .await
@@ -1038,7 +1224,8 @@ impl StorageBackend for SqliteStore {
 
     async fn health_check(&self) -> bool {
         self.blocking(|conn| {
-            conn.query_row("SELECT 1", [], |_| Ok(())).map_err(|e| SlcError::Storage(e.to_string()))?;
+            conn.query_row("SELECT 1", [], |_| Ok(()))
+                .map_err(|e| SlcError::Storage(e.to_string()))?;
             Ok(())
         })
         .await
@@ -1063,7 +1250,11 @@ fn row_to_embedding(row: &Row) -> rusqlite::Result<EmbeddingRecord> {
         generated_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
-        scope: if scope == "private" { EmbeddingScope::Private } else { EmbeddingScope::Public },
+        scope: if scope == "private" {
+            EmbeddingScope::Private
+        } else {
+            EmbeddingScope::Public
+        },
         seat_id: row.get(8)?,
     })
 }
@@ -1076,11 +1267,20 @@ fn row_to_seat(row: &Row) -> rusqlite::Result<Seat> {
         status: SeatStatus::parse(status.trim_matches('"')),
         created_at: dt(row.get::<_, String>(3)?),
         last_accessed: dt(row.get::<_, String>(4)?),
-        expires_at: row.get::<_, Option<String>>(5)?.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|d| d.with_timezone(&Utc)),
-        metadata: row.get::<_, String>(6).map(|s| serde_json::from_str(&s).unwrap_or_default())?,
+        expires_at: row
+            .get::<_, Option<String>>(5)?
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|d| d.with_timezone(&Utc)),
+        metadata: row
+            .get::<_, String>(6)
+            .map(|s| serde_json::from_str(&s).unwrap_or_default())?,
         active_task_id: row.get(7)?,
-        context: row.get::<_, String>(8).map(|s| serde_json::from_str(&s).unwrap_or_default())?,
-        usage_stats: row.get::<_, String>(9).map(|s| serde_json::from_str(&s).unwrap_or_default())?,
+        context: row
+            .get::<_, String>(8)
+            .map(|s| serde_json::from_str(&s).unwrap_or_default())?,
+        usage_stats: row
+            .get::<_, String>(9)
+            .map(|s| serde_json::from_str(&s).unwrap_or_default())?,
         active_document_id: row.get(10)?,
     })
 }
@@ -1097,10 +1297,15 @@ fn row_to_timer(row: &Row) -> rusqlite::Result<PersistedTimer> {
             _ => TimerType::Reminder,
         },
         interval_seconds: row.get(3)?,
-        last_fired_at: row.get::<_, Option<String>>(4)?.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|d| d.with_timezone(&Utc)),
+        last_fired_at: row
+            .get::<_, Option<String>>(4)?
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|d| d.with_timezone(&Utc)),
         next_fire_at: dt(row.get::<_, String>(5)?),
         is_active: row.get::<_, i64>(6)? != 0,
-        metadata: row.get::<_, String>(7).map(|s| serde_json::from_str(&s).unwrap_or_default())?,
+        metadata: row
+            .get::<_, String>(7)
+            .map(|s| serde_json::from_str(&s).unwrap_or_default())?,
         created_at: dt(row.get::<_, String>(8)?),
     })
 }
@@ -1123,6 +1328,11 @@ mod tests {
 
         let mut meta = DocMeta::default();
         meta.doc_type = Some("notes".into());
+        meta.extra
+            .insert("assignee".into(), Value::String("junior".into()));
+        meta.extra
+            .insert("status".into(), Value::String("PENDING".into()));
+        meta.extra.insert("attempts".into(), Value::from(1));
         let doc = Document::new(
             "proj_vassista",
             DocumentCategory::Project,
@@ -1150,9 +1360,66 @@ mod tests {
         // Visibility: public doc visible to any seat.
         let f = DocFilter::visible_to("seat_a");
         assert_eq!(store.kb_count(&f).await.unwrap(), 1);
+        let workflow_filter = DocFilter {
+            extra_strings: std::collections::BTreeMap::from([(
+                "assignee".to_string(),
+                "junior".to_string(),
+            )]),
+            extra_strings_not_in: std::collections::BTreeMap::from([(
+                "status".to_string(),
+                vec!["COMPLETED".to_string(), "FAILED".to_string()],
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(store.kb_count(&workflow_filter).await.unwrap(), 1);
+        let terminal_filter = DocFilter {
+            extra_strings_not_in: std::collections::BTreeMap::from([(
+                "status".to_string(),
+                vec!["PENDING".to_string()],
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(store.kb_count(&terminal_filter).await.unwrap(), 0);
+        let numeric_is_not_a_string = DocFilter {
+            extra_strings: std::collections::BTreeMap::from([(
+                "attempts".to_string(),
+                "1".to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(store.kb_count(&numeric_is_not_a_string).await.unwrap(), 0);
+        let numeric_is_retained_by_string_exclusion = DocFilter {
+            extra_strings_not_in: std::collections::BTreeMap::from([(
+                "attempts".to_string(),
+                vec!["1".to_string()],
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .kb_count(&numeric_is_retained_by_string_exclusion)
+                .await
+                .unwrap(),
+            1
+        );
+        let any_tag_filter = DocFilter {
+            tags_any: vec!["missing".to_string(), "memory:semantic".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(store.kb_count(&any_tag_filter).await.unwrap(), 1);
+        let all_tag_filter = DocFilter {
+            tags_all: vec!["priority:high".to_string(), "memory:semantic".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(store.kb_count(&all_tag_filter).await.unwrap(), 1);
 
         // Content update bumps version.
-        assert!(store.kb_update_content("proj_vassista", "v2").await.unwrap());
+        assert!(
+            store
+                .kb_update_content("proj_vassista", "v2")
+                .await
+                .unwrap()
+        );
         let d = store.kb_get("proj_vassista").await.unwrap().unwrap();
         assert_eq!(d.version, 2);
         assert_eq!(d.content_hash, crate::model::content_hash("v2"));
@@ -1192,7 +1459,10 @@ mod tests {
             has_compression_batch: Some(false),
             ..Default::default()
         };
-        let docs = store.episodic_find(&f, &DocSort::by_created(SortDir::Asc), 500).await.unwrap();
+        let docs = store
+            .episodic_find(&f, &DocSort::by_created(SortDir::Asc), 500)
+            .await
+            .unwrap();
         assert_eq!(docs.len(), 5);
 
         // KB search never sees episodic docs.
@@ -1208,7 +1478,10 @@ mod tests {
         assert_eq!(changed, 5);
         assert_eq!(
             store
-                .episodic_count(&DocFilter { has_compression_batch: Some(false), ..Default::default() })
+                .episodic_count(&DocFilter {
+                    has_compression_batch: Some(false),
+                    ..Default::default()
+                })
                 .await
                 .unwrap(),
             0

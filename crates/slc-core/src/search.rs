@@ -704,31 +704,61 @@ mod relevance_gate {
     #[tokio::test]
     async fn irrelevant_query_returns_nothing() {
         let svc = seeded(&[
-            ("fact_voice", "Меня зовут Дмитрий, обращайся ко мне по имени"),
-            ("note_coffee", "Пользователь предпочитает чёрный кофе без сахара"),
+            (
+                "fact_voice",
+                "Меня зовут Дмитрий, обращайся ко мне по имени",
+            ),
+            (
+                "note_coffee",
+                "Пользователь предпочитает чёрный кофе без сахара",
+            ),
         ])
         .await;
         // No token/n-gram overlap with either doc — pure embedding noise
         // must not survive the gate.
         for q in ["привет", "рецепт пасты карбонара"] {
             let hits = svc.search(q, None, None, 5, None).await.unwrap();
-            assert!(hits.is_empty(), "Q={q:?} leaked: {:?}", hits.iter().map(|h| (&h.document.document_id, h.score)).collect::<Vec<_>>());
+            assert!(
+                hits.is_empty(),
+                "Q={q:?} leaked: {:?}",
+                hits.iter()
+                    .map(|h| (&h.document.document_id, h.score))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
     #[tokio::test]
     async fn strong_hit_kept_weak_tail_dropped() {
         let svc = seeded(&[
-            ("fact_voice", "Меня зовут Дмитрий, обращайся ко мне по имени"),
-            ("note_coffee", "Пользователь предпочитает чёрный кофе без сахара"),
+            (
+                "fact_voice",
+                "Меня зовут Дмитрий, обращайся ко мне по имени",
+            ),
+            (
+                "note_coffee",
+                "Пользователь предпочитает чёрный кофе без сахара",
+            ),
         ])
         .await;
         // Text overlap with the query plus shared n-grams: the fact doc
         // is clearly relevant; the coffee note shares no tokens and its
         // hash-noise must fall below the relative gap.
-        let hits = svc.search("как меня зовут", None, None, 5, None).await.unwrap();
-        let ids: Vec<&str> = hits.iter().map(|h| h.document.document_id.as_str()).collect();
-        assert!(ids.contains(&"fact_voice"), "relevant doc must survive: {ids:?}");
-        assert!(!ids.contains(&"note_coffee"), "irrelevant tail must be gated out: {ids:?}");
+        let hits = svc
+            .search("как меня зовут", None, None, 5, None)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits
+            .iter()
+            .map(|h| h.document.document_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"fact_voice"),
+            "relevant doc must survive: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"note_coffee"),
+            "irrelevant tail must be gated out: {ids:?}"
+        );
     }
 }

@@ -4,10 +4,10 @@
 
 use crate::server::AppState;
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::{Value, json};
 use slc_core::{DocFilter, DocSort, DocumentCategory, SlcEngine, SortDir};
@@ -36,11 +36,29 @@ fn bad(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
 }
 
-/// Resolve the request seat id.
-/// - full mode (SLC_AUTH=full): Bearer JWT → user → seat
-///   `user_<user_id>` (persistent); no valid token → 401.
-/// - seat mode: X-Seat-ID header → slc_seat cookie → generated seat
-///   (when generating we set Set-Cookie so the UI keeps the same seat).
+fn forbidden(msg: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, msg.into())
+}
+
+/// HTTP status for a typed engine error (tasks/documents):
+/// a real "not found" — 404, foreign objects without rights — 403, invalid
+/// input (workflow append-only etc.) — 400, limits — 409.
+fn slc_error_status(error: &slc_core::SlcError) -> StatusCode {
+    use slc_core::SlcError;
+    match error {
+        SlcError::NotFound(_) => StatusCode::NOT_FOUND,
+        SlcError::PermissionDenied(_) => StatusCode::FORBIDDEN,
+        SlcError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        SlcError::Limit(_) => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// The request's seat id.
+/// - full mode (SLC_AUTH=full): Bearer-JWT → user → seat
+///   `user_<user_id>` (persistent); without a valid token — 401.
+/// - seat mode: the X-Seat-ID header → the slc_seat cookie → generated
+///   (on generation we set Set-Cookie so the UI keeps the same seat).
 pub async fn resolve_seat(
     state: &AppState,
     headers: &HeaderMap,
@@ -50,7 +68,10 @@ pub async fn resolve_seat(
             .auth
             .user_from_bearer(bearer_from(headers).as_deref())
             .ok_or_else(|| {
-                ApiError(StatusCode::UNAUTHORIZED, "Invalid authentication credentials".into())
+                ApiError(
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid authentication credentials".into(),
+                )
             })?;
         let seat_id = user.user_id.clone();
         state
@@ -60,6 +81,35 @@ pub async fn resolve_seat(
             .await
             .map_err(|e| internal(e.to_string()))?;
         return Ok((seat_id, None));
+    }
+    // An enabled seat-token registry must not be bypassed via the REST API's
+    // legacy header/cookie identity path. Full web authentication above keeps
+    // its independent JWT identity; seat mode uses the same bound MCP bearer.
+    if std::env::var_os("SLC_MCP_SEAT_TOKENS").is_some() {
+        let seat = headers
+            .get("x-seat-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
+        let authorization = bearer_from(headers);
+        let token = authorization
+            .as_deref()
+            .and_then(|v| v.strip_prefix("Bearer "));
+        let principal = slc_core::authenticate(slc_core::AuthMode::BearerPlusSeat, seat, token)
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid authentication credentials".into(),
+                )
+            })?;
+        state
+            .engine
+            .seats
+            .ensure_seat(&principal.seat_id)
+            .await
+            .map_err(|e| internal(e.to_string()))?;
+        return Ok((principal.seat_id, None));
     }
     let seat_id = if let Some(v) = headers.get("x-seat-id").and_then(|v| v.to_str().ok()) {
         if !v.trim().is_empty() {
@@ -90,7 +140,9 @@ pub async fn resolve_seat(
     let cookie = if has_cookie(&seat_id, headers) {
         None
     } else {
-        Some(format!("slc_seat={seat_id}; Path=/; Max-Age=31536000; SameSite=Lax"))
+        Some(format!(
+            "slc_seat={seat_id}; Path=/; Max-Age=31536000; SameSite=Lax"
+        ))
     };
     return Ok((seat_id, cookie));
 }
@@ -113,7 +165,6 @@ fn seat_from_cookie(headers: &HeaderMap) -> Option<String> {
 fn has_cookie(seat_id: &str, headers: &HeaderMap) -> bool {
     seat_from_cookie(headers).as_deref() == Some(seat_id)
 }
-
 
 fn bearer_from(headers: &HeaderMap) -> Option<String> {
     headers
@@ -152,10 +203,7 @@ fn with_seat_cookie(resp: Json<Value>, cookie: Option<String>) -> Response {
 /// was generated.
 macro_rules! seat_handler {
     ($name:ident, $state:ident, $seat:ident, $body:block) => {
-        pub async fn $name(
-            State($state): State<Arc<AppState>>,
-            headers: HeaderMap,
-        ) -> Response {
+        pub async fn $name(State($state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
             let (seat, cookie) = match resolve_seat(&$state, &headers).await {
                 Ok(x) => x,
                 Err(e) => return e.into_response(),
@@ -210,7 +258,12 @@ seat_handler!(stats, state, seat, {
         .episodic_count(&DocFilter::default())
         .await
         .map_err(|e| internal(e.to_string()))?;
-    let seats = engine.seats.list_active(1000).await.map_err(|e| internal(e.to_string()))?.len();
+    let seats = engine
+        .seats
+        .list_active(1000)
+        .await
+        .map_err(|e| internal(e.to_string()))?
+        .len();
     json!({
         "total": total,
         "by_category": by_cat,
@@ -223,11 +276,21 @@ seat_handler!(stats, state, seat, {
 
 seat_handler!(context, state, seat, {
     let engine = &state.engine;
-    let limit = engine.context_limit_for(&seat).await.map_err(|e| internal(e.to_string()))?;
-    let active = engine.seats.get_active_document(&seat).await.map_err(|e| internal(e.to_string()))?;
+    let limit = engine
+        .context_limit_for(&seat)
+        .await
+        .map_err(|e| internal(e.to_string()))?;
+    let active = engine
+        .seats
+        .get_active_document(&seat)
+        .await
+        .map_err(|e| internal(e.to_string()))?;
     let projects = project_list(engine).await?;
     let tasks = task_list(engine).await?;
-    let pending = engine.pending_notification_count(&seat).await.map_err(|e| internal(e.to_string()))?;
+    let pending = engine
+        .pending_notification_count(&seat)
+        .await
+        .map_err(|e| internal(e.to_string()))?;
     json!({
         "seat": seat,
         "limit_tokens": limit,
@@ -271,7 +334,11 @@ pub async fn list_documents(
         Err(e) => return e.into_response(),
     };
     let engine = &state.engine;
-    let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200).min(500);
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(200)
+        .min(500);
     let filter = DocFilter {
         category: q.get("category").and_then(|s| DocumentCategory::parse(s)),
         visible_to: Some(seat.clone()),
@@ -284,7 +351,10 @@ pub async fn list_documents(
     {
         Ok(docs) => {
             let folder = q.get("folder").filter(|s| !s.is_empty());
-            let query = q.get("query").map(|s| s.to_lowercase()).filter(|s| !s.is_empty());
+            let query = q
+                .get("query")
+                .map(|s| s.to_lowercase())
+                .filter(|s| !s.is_empty());
             let out: Vec<Value> = docs
                 .iter()
                 .filter(|d| folder.map_or(true, |f| d.folder.as_deref() == Some(f)))
@@ -307,7 +377,10 @@ pub async fn list_documents(
                     })
                 })
                 .collect();
-            with_seat_cookie(Json(json!({"success": true, "documents": out, "count": out.len()})), cookie)
+            with_seat_cookie(
+                Json(json!({"success": true, "documents": out, "count": out.len()})),
+                cookie,
+            )
         }
         Err(e) => internal(e.to_string()).into_response(),
     }
@@ -355,7 +428,10 @@ pub async fn add_document(
         Err(e) => return e.into_response(),
     };
     let engine = &state.engine;
-    let id = body.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
+    let id = body
+        .get("document_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if id.is_empty() {
         return bad("document_id required").into_response();
     }
@@ -365,7 +441,10 @@ pub async fn add_document(
         .and_then(DocumentCategory::parse)
         .unwrap_or(DocumentCategory::Custom);
     let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    let folder = body.get("folder").and_then(|v| v.as_str()).map(String::from);
+    let folder = body
+        .get("folder")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let mut doc = slc_core::Document::with_folder(
         id,
         cat,
@@ -407,18 +486,38 @@ pub async fn update_document(
         Err(e) => return internal(e.to_string()).into_response(),
     };
     let mut doc = doc;
+    if !engine.can_write_document(&seat, &doc) {
+        return forbidden(format!("seat {seat} has no right to update document {id}"))
+            .into_response();
+    }
+    if slc_core::tasks::is_workflow_task(&doc) {
+        return ApiError(
+            StatusCode::CONFLICT,
+            "workflow tasks are append-only; use task_message, report_task, or cancel_task".into(),
+        )
+        .into_response();
+    }
     if let Some(c) = body.get("content").and_then(|v| v.as_str()) {
         doc.content = c.to_string();
         doc.content_hash = slc_core::content_hash(c);
     }
     if let Some(t) = body.get("tags").and_then(|v| v.as_array()) {
-        doc.tags = t.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        doc.tags = t
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
     }
     if let Some(al) = body.get("auto_load").and_then(|v| v.as_array()) {
-        doc.auto_load = al.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        doc.auto_load = al
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
     }
     if let Some(r) = body.get("references").and_then(|v| v.as_array()) {
-        doc.references = r.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        doc.references = r
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
     }
     if let Some(m) = body.get("metadata").and_then(|v| v.as_object()) {
         for (k, v) in m {
@@ -426,6 +525,12 @@ pub async fn update_document(
         }
     }
     if let Some(s) = body.get("seat_id").and_then(|v| v.as_str()) {
+        if !s.is_empty() && !engine.can_manage_target(&seat, s) {
+            return forbidden(format!(
+                "seat {seat} has no right to assign document {id} to seat {s}"
+            ))
+            .into_response();
+        }
         doc.seat_id = if s.is_empty() { None } else { Some(s.into()) };
     }
     doc.updated_at = chrono::Utc::now();
@@ -454,6 +559,17 @@ pub async fn delete_document(
         if !engine.can_read_document(&seat, &d) {
             return ApiError(StatusCode::NOT_FOUND, format!("not found: {id}")).into_response();
         }
+        if slc_core::tasks::is_workflow_task(&d) {
+            return ApiError(
+                StatusCode::CONFLICT,
+                "workflow tasks cannot be deleted; preserve their event history".into(),
+            )
+            .into_response();
+        }
+        if !engine.can_write_document(&seat, &d) {
+            return forbidden(format!("seat {seat} has no right to delete document {id}"))
+                .into_response();
+        }
     }
     let purge = q.get("purge").map(|v| v == "true").unwrap_or(false);
     let res = if purge {
@@ -465,7 +581,10 @@ pub async fn delete_document(
         Ok(ok) => ok,
         Err(e) => return internal(e.to_string()).into_response(),
     };
-    with_seat_cookie(Json(json!({"success": ok, "document_id": id, "purged": purge})), cookie)
+    with_seat_cookie(
+        Json(json!({"success": ok, "document_id": id, "purged": purge})),
+        cookie,
+    )
 }
 
 pub async fn search(
@@ -481,7 +600,10 @@ pub async fn search(
     if query.is_empty() {
         return bad("q required").into_response();
     }
-    let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(10);
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(10);
     match state.engine.search(&query, Some(&seat), limit).await {
         Ok(hits) => with_seat_cookie(
             Json(json!({
@@ -510,10 +632,23 @@ pub async fn list_tasks(
         Ok(x) => x,
         Err(e) => return e.into_response(),
     };
-    let project_id = q.get("project_id").filter(|s| !s.is_empty()).map(String::as_str);
-    let status = q.get("status").filter(|s| !s.is_empty()).map(String::as_str);
-    let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200);
-    match state.engine.task_list(&seat, project_id, status, limit).await {
+    let project_id = q
+        .get("project_id")
+        .filter(|s| !s.is_empty())
+        .map(String::as_str);
+    let status = q
+        .get("status")
+        .filter(|s| !s.is_empty())
+        .map(String::as_str);
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(200);
+    match state
+        .engine
+        .task_list(&seat, project_id, status, limit)
+        .await
+    {
         Ok(tasks) => with_seat_cookie(
             Json(json!({
                 "success": true,
@@ -542,12 +677,19 @@ pub async fn create_task(
     if name.is_empty() {
         return bad("name required").into_response();
     }
-    let description = body.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let description = body
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let project_id = body.get("project_id").and_then(|v| v.as_str());
     let auto_load: Vec<String> = body
         .get("auto_load")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let metadata = body.get("metadata").cloned().unwrap_or(json!({}));
     match state
@@ -583,13 +725,15 @@ pub async fn update_task(
         .get("project_id")
         .and_then(|v| v.as_str())
         .map(|p| if p.is_empty() { None } else { Some(p) });
-    let auto_load = body
-        .get("auto_load")
-        .map(|v| {
-            v.as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>())
-                .unwrap_or_default()
-        });
+    let auto_load = body.get("auto_load").map(|v| {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
     let status = body.get("status").and_then(|v| v.as_str());
     let metadata = body.get("metadata").cloned();
     match state
@@ -607,12 +751,11 @@ pub async fn update_task(
         )
         .await
     {
-        Ok(Some(_)) => {
+        Ok(_) => {
             let _ = state.engine.reembed_document(&id).await;
             with_seat_cookie(Json(json!({"success": true, "task_id": id})), cookie)
         }
-        Ok(None) => ApiError(StatusCode::NOT_FOUND, format!("task not found: {id}")).into_response(),
-        Err(e) => internal(e.to_string()).into_response(),
+        Err(e) => ApiError(slc_error_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -627,10 +770,12 @@ pub async fn delete_task(
     };
     match state.engine.task_delete(&seat, &id).await {
         Ok(ok) => with_seat_cookie(
-            Json(json!({"success": ok, "task_id": id, "message": if ok { "Task deleted" } else { "Task not found" }})),
+            Json(
+                json!({"success": ok, "task_id": id, "message": if ok { "Task deleted" } else { "Task not found" }}),
+            ),
             cookie,
         ),
-        Err(e) => internal(e.to_string()).into_response(),
+        Err(e) => ApiError(slc_error_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -643,7 +788,10 @@ pub async fn list_projects(
         Ok(x) => x,
         Err(e) => return e.into_response(),
     };
-    let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200);
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(200);
     match state.engine.project_list(&seat, None, limit).await {
         Ok(projects) => with_seat_cookie(
             Json(json!({
@@ -673,11 +821,18 @@ pub async fn create_project(
     if name.is_empty() {
         return bad("name required").into_response();
     }
-    let description = body.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let description = body
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let auto_load: Vec<String> = body
         .get("auto_load")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let metadata = body.get("metadata").cloned().unwrap_or(json!({}));
     match state
@@ -709,13 +864,15 @@ pub async fn update_project(
     let name = body.get("name").and_then(|v| v.as_str());
     let description = body.get("description").and_then(|v| v.as_str());
     let description_patch = body.get("description_patch").cloned();
-    let auto_load = body
-        .get("auto_load")
-        .map(|v| {
-            v.as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>())
-                .unwrap_or_default()
-        });
+    let auto_load = body.get("auto_load").map(|v| {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
     let status = body.get("status").and_then(|v| v.as_str());
     let metadata = body.get("metadata").cloned();
     match state
@@ -736,7 +893,9 @@ pub async fn update_project(
             let _ = state.engine.reembed_document(&id).await;
             with_seat_cookie(Json(json!({"success": true, "project_id": id})), cookie)
         }
-        Ok(None) => ApiError(StatusCode::NOT_FOUND, format!("project not found: {id}")).into_response(),
+        Ok(None) => {
+            ApiError(StatusCode::NOT_FOUND, format!("project not found: {id}")).into_response()
+        }
         Err(e) => internal(e.to_string()).into_response(),
     }
 }
@@ -752,7 +911,9 @@ pub async fn delete_project(
     };
     match state.engine.project_delete(&seat, &id).await {
         Ok(ok) => with_seat_cookie(
-            Json(json!({"success": ok, "project_id": id, "message": if ok { "Project deleted" } else { "Project not found" }})),
+            Json(
+                json!({"success": ok, "project_id": id, "message": if ok { "Project deleted" } else { "Project not found" }}),
+            ),
             cookie,
         ),
         Err(e) => internal(e.to_string()).into_response(),
@@ -797,7 +958,11 @@ seat_handler!(pop_notifications, state, seat, {
 });
 
 seat_handler!(reminder_list, state, seat, {
-    let reminders = state.engine.reminder_list(&seat).await.map_err(|e| internal(e.to_string()))?;
+    let reminders = state
+        .engine
+        .reminder_list(&seat)
+        .await
+        .map_err(|e| internal(e.to_string()))?;
     json!({
         "reminders": reminders.iter().map(|r| json!({
             "reminder_id": r.reminder_id,
@@ -832,7 +997,9 @@ pub async fn reminder_create(
         .await
     {
         Ok(r) => with_seat_cookie(
-            Json(json!({"success": true, "reminder_id": r.reminder_id, "remind_at": r.remind_at.to_rfc3339()})),
+            Json(
+                json!({"success": true, "reminder_id": r.reminder_id, "remind_at": r.remind_at.to_rfc3339()}),
+            ),
             cookie,
         ),
         Err(e) => internal(e.to_string()).into_response(),
@@ -855,7 +1022,11 @@ pub async fn reminder_cancel(
 }
 
 seat_handler!(focus_list, state, seat, {
-    let focuses = state.engine.focus_list(&seat, None).await.map_err(|e| internal(e.to_string()))?;
+    let focuses = state
+        .engine
+        .focus_list(&seat, None)
+        .await
+        .map_err(|e| internal(e.to_string()))?;
     json!({
         "focuses": focuses.iter().map(|f| json!({
             "focus_id": f.focus_id,
@@ -880,12 +1051,19 @@ pub async fn focus_add(
     if title.is_empty() {
         return bad("title required").into_response();
     }
-    let description = body.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let description = body
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let priority = body.get("priority").and_then(|v| v.as_i64()).unwrap_or(5);
     let depends_on: Vec<String> = body
         .get("depends_on")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let mind_type = body.get("mind_type").and_then(|v| v.as_str());
     match state
@@ -914,16 +1092,25 @@ pub async fn focus_update(
     let title = body.get("title").and_then(|v| v.as_str());
     let description = body.get("description").and_then(|v| v.as_str());
     let priority = body.get("priority").and_then(|v| v.as_i64());
-    let depends_on = body
-        .get("depends_on")
-        .map(|v| {
-            v.as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>())
-                .unwrap_or_default()
-        });
+    let depends_on = body.get("depends_on").map(|v| {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
     match state
         .engine
-        .focus_update(&seat, &id, title, description, priority, depends_on.as_deref())
+        .focus_update(
+            &seat,
+            &id,
+            title,
+            description,
+            priority,
+            depends_on.as_deref(),
+        )
         .await
     {
         Ok(ok) => with_seat_cookie(Json(json!({"success": ok, "focus_id": id})), cookie),
@@ -992,7 +1179,9 @@ pub async fn sse_events(
         }
     };
     axum::response::Sse::new(stream)
-        .keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .keep_alive(
+            axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+        )
         .into_response()
 }
 
