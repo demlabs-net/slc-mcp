@@ -39,6 +39,20 @@ fn forbidden(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::FORBIDDEN, msg.into())
 }
 
+/// HTTP-статус для типизированной ошибки движка (задачи/документы):
+/// реальное «не найдено» — 404, чужие объекты без прав — 403, невалидный
+/// ввод (workflow append-only и т.п.) — 400, лимиты — 409.
+fn slc_error_status(error: &slc_core::SlcError) -> StatusCode {
+    use slc_core::SlcError;
+    match error {
+        SlcError::NotFound(_) => StatusCode::NOT_FOUND,
+        SlcError::PermissionDenied(_) => StatusCode::FORBIDDEN,
+        SlcError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        SlcError::Limit(_) => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 /// Seat-id запроса.
 /// - full-режим (SLC_AUTH=full): Bearer-JWT → пользователь → сид
 ///   `user_<user_id>` (persistent); без валидного токена — 401.
@@ -720,14 +734,11 @@ pub async fn update_task(
         )
         .await
     {
-        Ok(Some(_)) => {
+        Ok(_) => {
             let _ = state.engine.reembed_document(&id).await;
             with_seat_cookie(Json(json!({"success": true, "task_id": id})), cookie)
         }
-        Ok(None) => {
-            ApiError(StatusCode::NOT_FOUND, format!("task not found: {id}")).into_response()
-        }
-        Err(e) => internal(e.to_string()).into_response(),
+        Err(e) => ApiError(slc_error_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -747,7 +758,7 @@ pub async fn delete_task(
             ),
             cookie,
         ),
-        Err(e) => internal(e.to_string()).into_response(),
+        Err(e) => ApiError(slc_error_status(&e), e.to_string()).into_response(),
     }
 }
 

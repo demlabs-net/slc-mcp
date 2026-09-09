@@ -17,7 +17,6 @@ use serde_json::{Value, json};
 use slc_core::{
     DocFilter, DocMeta, DocSort, Document, DocumentCategory, SlcEngine, SortDir, TaskListScope,
 };
-use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::{auth, webui};
@@ -524,7 +523,16 @@ async fn mcp_request(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let seat = seat_hdr.clone().unwrap_or_default();
-            call_tool(engine, &seat, name, &args, &state.events, pagination).await
+            // Application errors (typed SlcError failures) are returned as
+            // regular MCP tool results with `isError: true`, so clients and
+            // models always receive the actionable text instead of a bare
+            // JSON-RPC exception. Protocol-level failures (unknown tool,
+            // malformed arguments, storage bootstrap) stay JSON-RPC errors.
+            match call_tool(engine, &seat, name, &args, &state.events, pagination).await {
+                Ok(result) => Ok(result),
+                Err(error) if error.get("kind").is_some() => Ok(tool_error_result(name, &error)),
+                Err(error) => Err(error),
+            }
         }
         _ => Err(json!({"code": -32601, "message": format!("method not found: {method}")})),
     };
@@ -761,7 +769,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_task",
-            "description": "Read a workflow task visible to the caller as its issuer, assignee, or authorized coordinator.",
+            "description": "Read a task visible to the caller as its issuer, assignee, or authorized coordinator. MANAGER FULL ACCESS: a manager seat (operator role with an explicit target in SLC_SEAT_MANAGE_ACL) may read tasks of every managed seat, including workflow tasks in IN_WORK. Unknown task ids and missing rights are explicit application errors (isError=true).",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"}
             },"required":["task_id"]}
@@ -809,7 +817,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "list_task_events",
-            "description": "Read the immutable SLC event stream for a visible task: assignment, start, messages, progress, and terminal reports.",
+            "description": "Read the immutable SLC event stream for a visible task: assignment, start, messages, progress, terminal reports, and authorized manager updates (update kind).",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "limit": {"type":"number","default":100,"minimum":1,"maximum":500}
@@ -824,7 +832,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_task",
-            "description": "Update an existing task. Edit its body only through ordered diff operations: append, prepend, replace_section, or remove_section by markdown heading.",
+            "description": "Update an existing task. Edit its body only through ordered diff operations: append, prepend, replace_section, or remove_section by markdown heading. MANAGER FULL ACCESS: a manager seat (operator role with an explicit target in SLC_SEAT_MANAGE_ACL) may update tasks of every managed seat, including workflow tasks that are IN_WORK — such updates are persisted canonically through the workflow event store (a durable update audit event is appended, nothing is silently dropped) and the task projection is refreshed. Task owners and non-managers keep the append-only workflow contract: they edit workflow tasks through task_message/report_task/cancel_task. Workflow task status stays event-governed (start_task/report_task/cancel_task); pass status only for legacy (non-workflow) tasks. Application errors (unknown task, missing rights, workflow conflicts) come back with isError=true and an actionable Russian message.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "name": {"type":"string"},
@@ -841,7 +849,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "delete_task",
-            "description": "Delete a task",
+            "description": "Delete a task. The owner may delete its own legacy (non-workflow) tasks; MANAGER FULL ACCESS: a manager seat (operator role with an explicit target in SLC_SEAT_MANAGE_ACL) may delete legacy tasks of every managed seat. Workflow tasks are never deleted — their event history is preserved (explicit error); missing rights and unknown ids never masquerade as each other.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"}
             },"required":["task_id"]}
@@ -892,13 +900,13 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "list_tasks",
-            "description": "List SLC-owned tasks visible to the caller, including delegated tasks by issuer/assignee. Legacy target_seat remains available for private-seat inspection by an operator.",
+            "description": "List SLC-owned tasks visible to the caller, including delegated tasks by issuer/assignee. Legacy target_seat remains available for private-seat inspection: an operator (manager) may list tasks of every explicitly allowed subordinate seat (SLC_SEAT_MANAGE_ACL target) with target_seat; without it, the visible scope includes workflow tasks of all managed seats plus the caller's own/issued work.",
             "inputSchema": {"type":"object","properties":{
                 "project_id": {"type":"string"},
                 "status": {"type":"string","enum":["PENDING","IN_WORK","COMPLETED","BLOCKED","FAILED","CANCELLED","pending","in_progress","completed","blocked","failed","cancelled"]},
-                "scope": {"type":"string","enum":["visible","assigned","issued"],"default":"visible"},
-                "assignee": {"type":"string"},
-                "issuer": {"type":"string"},
+                "scope": {"type":"string","enum":["visible","assigned","issued"],"default":"visible","description":"visible (default): all tasks visible to the caller incl. tasks of managed seats; assigned: only tasks assigned to the caller's principal; issued: only tasks issued by the caller's principal"},
+                "assignee": {"type":"string","description":"stable workflow principal"},
+                "issuer": {"type":"string","description":"stable workflow principal"},
                 "limit": {"type":"number","default":50},
                 "target_seat": {"type":"string","description":"current seat by default; cross-seat access requires operator role and SLC_SEAT_MANAGE_ACL"}
             },"required":[]}
@@ -1362,8 +1370,13 @@ name and generate the new slug.
 A seat with the server-configured `operator` role may manage another seat's
 active task/document, project status, and focus archive state only when the
 target is explicitly allowed by `SLC_SEAT_MANAGE_ACL`. The role alone grants no
-global authority. Omit `target_seat` for the caller's own state, and use
-`seat_roles` to inspect the effective role and allowed targets.
+global authority. With an allowed target, the manager additionally has FULL
+read and update access to that seat's tasks and documents — including its
+workflow tasks in `IN_WORK`: such `update_task` edits are persisted canonically
+through the workflow event store (a durable `update` audit event is appended,
+never a silent drop or a rewrite behind the event stream). Omit `target_seat`
+for the caller's own state, and use `seat_roles` to inspect the effective role
+and allowed targets.
 "#;
 
 // Bound inspected links (including duplicates/missing targets), not just loaded
@@ -2605,7 +2618,14 @@ async fn call_tool(
             let auto_load = args.get("auto_load").map(|_| str_array(args, "auto_load"));
             let status = args.get("status").and_then(|v| v.as_str());
             let metadata = args.get("metadata").cloned();
-            match engine
+            // Полные manager-семантики в движке: свой/публичный объект либо
+            // менеджер (operator + SLC_SEAT_MANAGE_ACL) любого управляемого
+            // сида, включая workflow-задачи в IN_WORK (канонический маршрут
+            // через workflow-хранилище с аудит-событием). Неизвестный id —
+            // отдельная явная ошибка NotFound, чужая задача без прав —
+            // PermissionDenied, workflow-статусы — событиями start/report/
+            // cancel. Все application-ошибки возвращаются как isError:true.
+            let updated = engine
                 .task_update(
                     seat_id,
                     task_id,
@@ -2618,15 +2638,10 @@ async fn call_tool(
                     metadata.as_ref(),
                 )
                 .await
-                .map_err(json_err)?
-            {
-                Some(_) => {
-                    // Тело изменилось — пере-эмбеддинг для семантического поиска.
-                    let _ = engine.reembed_document(task_id).await;
-                    json!({"success": true, "task_id": task_id, "message": "Task updated"})
-                }
-                None => json!({"success": false, "error": format!("Task not found: {task_id}")}),
-            }
+                .map_err(json_err)?;
+            // Тело изменилось — пере-эмбеддинг для семантического поиска.
+            let _ = engine.reembed_document(task_id).await;
+            json!({"success": true, "task_id": task_id, "name": updated.name, "message": "Task updated"})
         }
         "delete_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -2677,7 +2692,16 @@ async fn call_tool(
                 .require_seat_manage(seat_id, target)
                 .await
                 .map_err(json_err)?;
-            match engine.task_get_active(target).await.map_err(json_err)? {
+            let active = engine.task_get_active(target).await.map_err(json_err)?;
+            let active = if let Some(task) = active {
+                match engine.get_document(&task.task_id).await.map_err(json_err)? {
+                    Some(doc) if engine.can_read_document(seat_id, &doc) => Some(task),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match active {
                 Some(t) => {
                     json!({"success": true, "has_active_task": true, "target_seat": target, "task_id": t.task_id, "name": t.name, "description": t.description, "status": t.status, "project_id": t.project_id})
                 }
@@ -2732,7 +2756,8 @@ async fn call_tool(
                 .require_seat_manage(seat_id, target)
                 .await
                 .map_err(json_err)?;
-            match engine.document_get_active(target).await.map_err(json_err)? {
+            match engine.document_get_active(target).await.map_err(json_err)?
+                .filter(|doc| engine.can_read_document(seat_id, doc)) {
                 Some(d) => {
                     json!({"success": true, "has_active_document": true, "target_seat": target, "document_id": d.document_id, "category": d.category.as_str(), "content": d.content, "tags": d.tags})
                 }
@@ -3185,18 +3210,32 @@ async fn call_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let Some(mut doc) = engine.get_document(id).await.map_err(json_err)? else {
-                return Err(
-                    json!({"code": -32602, "message": format!("document not found: {id}")}),
-                );
+                return Err(json!({
+                    "code": -32004,
+                    "kind": "not_found",
+                    "message": format!("document not found: {id}")
+                }));
             };
+<<<<<<< HEAD
             if !engine.can_write_document(seat_id, &doc) {
                 return Err(json_err(slc_core::SlcError::PermissionDenied(format!(
                     "seat {seat_id} has no right to update document {id}"
                 ))));
+=======
+            // Тот же контракт, что и у задач: свой/публичный документ либо
+            // менеджер управляемого сида (operator + SLC_SEAT_MANAGE_ACL).
+            if !engine.can_read_document(seat_id, &doc) {
+                return Err(json!({
+                    "code": -32003,
+                    "kind": "permission_denied",
+                    "message": format!("document {id} belongs to another seat; only its owner or a manager (operator role with an SLC_SEAT_MANAGE_ACL target for that seat) may update it")
+                }));
+>>>>>>> origin/fix/roy1-manager-full-task-access
             }
             if slc_core::tasks::is_workflow_task(&doc) {
                 return Err(json!({
-                    "code": -32602,
+                    "code": -32002,
+                    "kind": "invalid_input",
                     "message": "workflow tasks are append-only; use task_message, report_task, or cancel_task"
                 }));
             }
@@ -3255,6 +3294,7 @@ async fn call_tool(
                 .unwrap_or("");
             let purge = args.get("purge").and_then(|v| v.as_bool()).unwrap_or(false);
             if let Some(doc) = engine.store().kb_get(id).await.map_err(json_err)? {
+<<<<<<< HEAD
                 if !engine.can_write_document(seat_id, &doc) {
                     return Err(json_err(slc_core::SlcError::PermissionDenied(format!(
                         "seat {seat_id} has no right to delete document {id}"
@@ -3263,6 +3303,20 @@ async fn call_tool(
                 if slc_core::tasks::is_workflow_task(&doc) {
                     return Err(json!({
                         "code": -32602,
+=======
+                // Свой/публичный документ либо менеджер управляемого сида.
+                if !engine.can_read_document(seat_id, &doc) {
+                    return Err(json!({
+                        "code": -32003,
+                        "kind": "permission_denied",
+                        "message": format!("document {id} belongs to another seat; only its owner or a manager (operator role with an SLC_SEAT_MANAGE_ACL target for that seat) may delete it")
+                    }));
+                }
+                if slc_core::tasks::is_workflow_task(&doc) {
+                    return Err(json!({
+                        "code": -32002,
+                        "kind": "invalid_input",
+>>>>>>> origin/fix/roy1-manager-full-task-access
                         "message": "workflow tasks cannot be deleted; preserve their event history"
                     }));
                 }
@@ -3694,7 +3748,72 @@ fn pagination_followup_instruction(pagination: &Value) -> Option<String> {
 }
 
 fn json_err(e: slc_core::SlcError) -> Value {
-    json!({"code": -32000, "message": e.to_string()})
+    use slc_core::SlcError;
+    let (code, kind) = match &e {
+        SlcError::NotFound(_) => (-32004, "not_found"),
+        SlcError::PermissionDenied(_) => (-32003, "permission_denied"),
+        SlcError::InvalidInput(_) => (-32002, "invalid_input"),
+        SlcError::Limit(_) => (-32005, "limit_reached"),
+        SlcError::Storage(_) => (-32000, "storage"),
+        SlcError::Config(_) => (-32000, "config"),
+        SlcError::Llm(_) => (-32000, "llm"),
+        SlcError::Parse(_) => (-32000, "parse"),
+        SlcError::Json(_) | SlcError::Io(_) => (-32000, "storage"),
+    };
+    json!({"code": code, "kind": kind, "message": e.to_string()})
+}
+
+/// Build the `CallToolResult` for an application error: the text content the
+/// model can act on plus `isError: true`. Messages are actionable and Russian
+/// for the ACL/workflow classes the fix targets; everything else keeps the
+/// engine's original message under a neutral prefix.
+fn tool_error_result(tool: &str, error: &Value) -> Value {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("tool error");
+    let kind = error.get("kind").and_then(Value::as_str).unwrap_or("");
+    let text = ru_error_text(tool, kind, message);
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "isError": true,
+    })
+}
+
+/// Russian, actionable error text for application failures. Keeps the
+/// original engine message (technical detail) and adds what the caller can do
+/// next — never a bare "not found" hiding an ACL problem.
+fn ru_error_text(tool: &str, kind: &str, message: &str) -> String {
+    match kind {
+        "permission_denied" => format!(
+            "Доступ запрещён ({tool}): {message}\n\
+             Действие: чужие задачи/документы может менять только их владелец или менеджер — \
+             сид с ролью operator и явной целью в SLC_SEAT_MANAGE_ACL (у менеджера роя полный \
+             доступ к задачам/документам управляемых сидов). Уточнения по чужой workflow-задаче \
+             передавайте через task_message (recipient = assignee или issuer); незапущенную \
+             задачу можно отменить через cancel_task."
+        ),
+        "not_found" => format!(
+            "Не найдено ({tool}): {message}\n\
+             Действие: проверьте идентификатор — для задач get_task/list_tasks, для документов \
+             get_document/list_documents. Если объект существует под другим id, передавайте \
+             фактический id."
+        ),
+        "invalid_input"
+            if message.contains("workflow") || message.contains("append-only") =>
+        {
+            format!(
+                "{message}\n\
+                 Действие: workflow-задачи изменяются только событиями. Менеджер управляемого \
+                 сида может обновить имя/содержимое/auto_load/metadata через update_task — \
+                 правка фиксируется аудит-событием в workflow-хранилище (не теряется). Статус \
+                 workflow-задачи переводится только start_task/report_task/cancel_task; \
+                 уточнения — task_message."
+            )
+        }
+        "limit_reached" => format!("Превышен лимит ({tool}): {message}"),
+        _ => format!("Ошибка {tool}: {message}"),
+    }
 }
 
 fn parse_mind(s: &str) -> Option<slc_core::MindType> {
@@ -4543,5 +4662,348 @@ mod seat_filter_tests {
         assert!(!serialized.contains("private report"));
         assert!(serialized.contains("list_task_events"));
 
+    }
+
+    fn catalog() -> std::collections::HashMap<String, Value> {
+        tools()
+            .into_iter()
+            .map(|tool| {
+                let name = tool["name"].as_str().unwrap_or("").to_string();
+                (name, tool)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_catalog_describes_manager_full_access_truthfully() {
+        let catalog = catalog();
+        // update_task обязан заявлять полный доступ менеджера и workflow-маршрут.
+        let update = catalog["update_task"]["description"].as_str().unwrap();
+        assert!(update.contains("MANAGER FULL ACCESS"), "{update}");
+        assert!(update.contains("SLC_SEAT_MANAGE_ACL"), "{update}");
+        assert!(update.contains("workflow event store"), "{update}");
+        assert!(update.contains("IN_WORK"), "{update}");
+        // get/delete/list задач заявляют только то, что реализовано.
+        assert!(catalog["get_task"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("SLC_SEAT_MANAGE_ACL"));
+        assert!(catalog["get_task"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("IN_WORK"));
+        assert!(catalog["delete_task"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("SLC_SEAT_MANAGE_ACL"));
+        let list = catalog["list_tasks"]["description"].as_str().unwrap();
+        assert!(list.contains("target_seat"), "{list}");
+        assert!(list.contains("SLC_SEAT_MANAGE_ACL"), "{list}");
+        // update_task по-прежнему требует task_id.
+        assert!(catalog["update_task"]["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("task_id")));
+    }
+
+    #[tokio::test]
+    async fn ru_application_errors_are_iserror_results_with_actionable_text() {
+        use slc_core::SlcError;
+        let denied = tool_error_result(
+            "update_task",
+            &json_err(SlcError::PermissionDenied(
+                "task x belongs to another seat".into(),
+            )),
+        );
+        assert_eq!(denied["isError"], true);
+        let text = denied["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Доступ запрещён"), "{text}");
+        assert!(text.contains("task_message"), "{text}");
+        assert!(text.contains("SLC_SEAT_MANAGE_ACL"), "{text}");
+
+        let missing = tool_error_result(
+            "update_task",
+            &json_err(SlcError::NotFound("task not found: nope".into())),
+        );
+        assert_eq!(missing["isError"], true);
+        assert!(
+            missing["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Не найдено")
+        );
+
+        let append_only = tool_error_result(
+            "update_task",
+            &json_err(SlcError::InvalidInput(
+                "workflow tasks are append-only; use task_message, report_task, or cancel_task"
+                    .into(),
+            )),
+        );
+        let text = append_only["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("append-only"), "{text}");
+        assert!(text.contains("workflow"), "{text}");
+        // Русское, пригодное к действию: указаны канонические инструменты.
+        assert!(text.contains("report_task"), "{text}");
+        assert!(text.contains("task_message"), "{text}");
+
+        // Общая ошибка без kind остаётся JSON-RPC (не конвертируется).
+        let generic = json!({"code": -32602, "message": "bad arguments"});
+        assert!(generic.get("kind").is_none());
+    }
+
+    /// Engine helper — рой менеджера над контактором/аналитиком.
+    async fn swarm_engine() -> SlcEngine {
+        use slc_core::storage::sqlite::SqliteStore;
+        use slc_core::{MockLlm, SlcConfig, StorageBackend};
+        use slc_core::roles::SeatRole;
+        use std::collections::{HashMap, HashSet};
+
+        let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
+        let mut config = SlcConfig::default()
+            .with_seat_role("seat-manager", SeatRole::Operator)
+            .with_seat_manage_target("seat-manager", "seat-contactor")
+            .with_seat_manage_target("seat-manager", "seat-analyst");
+        config.principal_seats = HashMap::from([
+            ("manager".into(), "seat-manager".into()),
+            ("contactor".into(), "seat-contactor".into()),
+            ("analyst".into(), "seat-analyst".into()),
+        ]);
+        config.task_assign_acl = HashMap::from([("manager".into(), HashSet::from(["*".into()]))]);
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        engine.ensure_seat("seat-outsider").await.unwrap();
+        engine
+    }
+
+    fn tool_policy() -> PaginationPolicy {
+        PaginationPolicy {
+            enabled: false,
+            page_token_limit: None,
+            context_token_limit: None,
+        }
+    }
+
+    /// call_tool-текст как JSON (успешные вызовы отдают JSON-текст).
+    async fn tool_json(engine: &SlcEngine, seat: &str, name: &str, args: Value) -> Value {
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let result = call_tool(engine, seat, name, &args, &events, tool_policy())
+            .await
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap_or_else(|_| panic!("tool {name} returned non-JSON: {text}"))
+    }
+
+    #[tokio::test]
+    async fn manager_update_task_routes_workflow_task_and_persists_for_reload() {
+        let engine = swarm_engine().await;
+        let assigned = tool_json(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            json!({"assignee":"contactor","name":"Prepare pitch","idempotency_key":"tool-assign-1"}),
+        )
+        .await;
+        let task_id = assigned["task"]["task_id"].as_str().unwrap().to_string();
+        tool_json(
+            &engine,
+            "seat-contactor",
+            "start_task",
+            json!({"task_id": task_id, "idempotency_key": "tool-start-1"}),
+        )
+        .await;
+
+        // Менеджер правит workflow-задачу контактора (IN_WORK) через update_task.
+        let updated = tool_json(
+            &engine,
+            "seat-manager",
+            "update_task",
+            json!({
+                "task_id": task_id,
+                "name": "Prepare pitch v2",
+                "diff": [{"op":"append","content":"## Правки менеджера\nучтено"}],
+                "metadata": {"priority":"high"},
+            }),
+        )
+        .await;
+        assert_eq!(updated["success"], true, "{updated}");
+
+        // Переживает перезагрузку: контактор и менеджер видят правку.
+        for seat in ["seat-contactor", "seat-manager"] {
+            let fetched = tool_json(&engine, seat, "get_task", json!({"task_id": task_id})).await;
+            assert_eq!(fetched["task"]["name"], "Prepare pitch v2", "{seat}");
+            assert!(fetched["task"]["description"].as_str().unwrap().contains("учтено"));
+            assert_eq!(fetched["task"]["status"], "IN_WORK");
+        }
+        // Аудит-событие update лежит в workflow-хранилище.
+        let events = tool_json(
+            &engine,
+            "seat-contactor",
+            "list_task_events",
+            json!({"task_id": task_id}),
+        )
+        .await;
+        assert!(
+            events["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["kind"] == "update" && e["actor"] == "manager"),
+            "{events}"
+        );
+
+        // Владелец на append-only: update_task отклоняется с kind invalid_input.
+        let owner_blocked = call_tool(
+            &engine,
+            "seat-contactor",
+            "update_task",
+            &json!({"task_id": task_id, "name": "hijacked"}),
+            &tokio::sync::broadcast::channel::<Value>(8).0,
+            tool_policy(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(owner_blocked["kind"], "invalid_input");
+        assert!(owner_blocked["message"].as_str().unwrap().contains("append-only"));
+    }
+
+    #[tokio::test]
+    async fn update_task_denials_and_notfound_are_distinct_typed_errors() {
+        let engine = swarm_engine().await;
+        let created = tool_json(
+            &engine,
+            "seat-contactor",
+            "create_task",
+            json!({"name": "private note"}),
+        )
+        .await;
+        let task_id = created["task_id"].as_str().unwrap().to_string();
+
+        // Аутсайдер и аналитик не могут править задачу контактора.
+        for outsider in ["seat-outsider", "seat-analyst"] {
+            let err = call_tool(
+                &engine,
+                outsider,
+                "update_task",
+                &json!({"task_id": task_id, "name": "rewritten"}),
+                &tokio::sync::broadcast::channel::<Value>(8).0,
+                tool_policy(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err["kind"], "permission_denied", "{outsider}: {err}");
+        }
+        // Несуществующая задача — отдельная явная not_found.
+        let err = call_tool(
+            &engine,
+            "seat-manager",
+            "update_task",
+            &json!({"task_id": "task_no_such_id"}),
+            &tokio::sync::broadcast::channel::<Value>(8).0,
+            tool_policy(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err["kind"], "not_found");
+        assert!(err["message"].as_str().unwrap().contains("task not found"));
+    }
+
+    #[tokio::test]
+    async fn manager_get_list_delete_semantics_across_managed_seats() {
+        let engine = swarm_engine().await;
+        let contactor_task =
+            tool_json(&engine, "seat-contactor", "create_task", json!({"name": "c1"})).await;
+        let analyst_task =
+            tool_json(&engine, "seat-analyst", "create_task", json!({"name": "a1"})).await;
+        let workflow = tool_json(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            json!({"assignee":"contactor","name":"wf1","idempotency_key":"tool-list-assign"}),
+        )
+        .await;
+        let wf_id = workflow["task"]["task_id"].as_str().unwrap().to_string();
+        tool_json(
+            &engine,
+            "seat-contactor",
+            "start_task",
+            json!({"task_id": wf_id, "idempotency_key": "tool-list-start"}),
+        )
+        .await;
+
+        // Менеджер читает и листит задачи управляемых сидов (включая IN_WORK):
+        // Visible scope покрывает workflow-задачи, target_seat — обычные.
+        let listed = tool_json(
+            &engine,
+            "seat-manager",
+            "list_tasks",
+            json!({"scope": "visible"}),
+        )
+        .await;
+        assert!(
+            listed["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["task_id"] == wf_id),
+            "{listed}"
+        );
+        let per_seat_contactor = tool_json(
+            &engine,
+            "seat-manager",
+            "list_tasks",
+            json!({"target_seat": "seat-contactor"}),
+        )
+        .await;
+        let per_seat_ids: Vec<&str> = per_seat_contactor["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["task_id"].as_str())
+            .collect();
+        assert!(
+            per_seat_ids.contains(&contactor_task["task_id"].as_str().unwrap()),
+            "{per_seat_ids:?}"
+        );
+        assert!(per_seat_ids.contains(&wf_id.as_str()), "{per_seat_ids:?}");
+        let per_seat_analyst = tool_json(
+            &engine,
+            "seat-manager",
+            "list_tasks",
+            json!({"target_seat": "seat-analyst"}),
+        )
+        .await;
+        assert_eq!(per_seat_analyst["count"], 1);
+
+        // Менеджер удаляет обычную задачу управляемого сида; workflow —
+        // нет (история событий), владелец своей — да.
+        let deleted = tool_json(
+            &engine,
+            "seat-manager",
+            "delete_task",
+            json!({"task_id": analyst_task["task_id"]}),
+        )
+        .await;
+        assert_eq!(deleted["success"], true);
+        let workflow_delete = call_tool(
+            &engine,
+            "seat-manager",
+            "delete_task",
+            &json!({"task_id": wf_id}),
+            &tokio::sync::broadcast::channel::<Value>(8).0,
+            tool_policy(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(workflow_delete["kind"], "invalid_input");
+        let still_there = tool_json(&engine, "seat-contactor", "get_task", json!({"task_id": wf_id})).await;
+        assert_eq!(still_there["success"], true);
+        let owner_deleted = tool_json(
+            &engine,
+            "seat-contactor",
+            "delete_task",
+            json!({"task_id": contactor_task["task_id"]}),
+        )
+        .await;
+        assert_eq!(owner_deleted["success"], true);
     }
 }
