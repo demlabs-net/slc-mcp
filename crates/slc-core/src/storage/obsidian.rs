@@ -290,8 +290,9 @@ impl ObsidianVaultStore {
                         .strip_prefix(&self.root)
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    // Obsidian-заметки без SLC-frontmatter (нет `id`) получают
-                    // document_id из имени файла, чтобы весь волт был в индексе.
+                    // Obsidian notes without SLC frontmatter (no `id`) get a
+                    // document_id derived from the file name, so the whole
+                    // vault ends up in the index.
                     let derived_name = explicit_id.is_none().then(|| {
                         path.file_stem()
                             .map(|s| s.to_string_lossy().to_string())
@@ -369,7 +370,7 @@ impl ObsidianVaultStore {
                         }
                         std::collections::hash_map::Entry::Occupied(mut slot) => {
                             if explicit_id.is_some() && !slot.get().explicit_id {
-                                // явный id (SLC-документ) перекрывает производный
+                                // explicit id (SLC document) overrides the derived one
                                 slot.insert(entry);
                             } else if explicit_id.is_some() && slot.get().explicit_id {
                                 return Err(SlcError::Storage(format!(
@@ -377,7 +378,7 @@ impl ObsidianVaultStore {
                                     slot.get().folder, entry.folder
                                 )));
                             }
-                            // производный id уже занят: оставляем первый файл
+                            // derived id already taken: keep the first file
                         }
                     }
                 }
@@ -847,7 +848,7 @@ impl StorageBackend for ObsidianVaultStore {
     }
 
     async fn kb_rename(&self, old_id: &str, new_id: &str) -> SlcResult<bool> {
-        // Вся работа с guard — в блоке без await (future должен быть Send).
+        // All work with the guard stays in a block without await (the future must be Send).
         let renamed = {
             let mut index = self.index.lock().unwrap();
             let Some(entry) = index.get(old_id).cloned() else {

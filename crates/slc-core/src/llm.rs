@@ -14,13 +14,13 @@ use crate::error::{SlcError, SlcResult};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-/// Роль текста при эмбеддинге. Некоторые модели (e5-семейство) требуют
-/// префиксов `query:`/`passage:` — запросы и документы кодируются по-разному.
+/// The role of the text being embedded. Some models (e5 family) require
+/// `query:`/`passage:` prefixes — queries and documents are encoded differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddingKind {
-    /// Пользовательский запрос (поисковый).
+    /// A user query (search).
     Query,
-    /// Индексируемый документ/факт.
+    /// An indexed document/fact.
     Passage,
 }
 
@@ -152,9 +152,9 @@ pub fn lmstudio_chat_body(model: &str, prompt: &str) -> serde_json::Value {
         "messages": [{"role": "user", "content": prompt}],
         "stream": false,
     });
-    // Reasoning-модели (nemotron и др.) по умолчанию генерируют длинную
-    // цепочку рассуждений, оставляя `content` пустым до её завершения.
-    // Для коротких задач (нейминг id при миграции) можно отключить:
+    // Reasoning models (nemotron and others) generate a long reasoning chain
+    // by default, leaving `content` empty until it completes. For short tasks
+    // (naming ids during migration) it can be disabled:
     // LMSTUDIO_REASONING_EFFORT=none.
     if let Ok(effort) = std::env::var("LMSTUDIO_REASONING_EFFORT") {
         if !effort.is_empty() {
@@ -363,15 +363,15 @@ impl LlmClient for MockLlm {
     }
 }
 
-/// LlmClient, который запрашивает инференс у MCP-КЛИЕНТА через sampling —
-/// фоллбэк для машин без локального GPU/LLM-сервера (слабые компы,
-/// виртуалки). Модель-клиента делает вызов за сервер; эмбеддинги через
-/// sampling невозможны — `generate_embedding` возвращает ошибку, и поиск
-/// честно деградирует в text-only (BM25).
+/// An LlmClient that requests inference FROM THE MCP CLIENT via sampling —
+/// a fallback for machines without a local GPU/LLM server (weak computers,
+/// VMs). The client-side model performs the call on the server's behalf;
+/// embeddings via sampling are impossible — `generate_embedding` returns an
+/// error, and search honestly degrades to text-only (BM25).
 pub struct McpSamplingLlm {
-    /// Sampling-запросы наружу (сервер пересылает их клиенту по SSE).
+    /// Outbound sampling requests (the server forwards them to the client via SSE).
     pub outbound: tokio::sync::mpsc::Sender<Value>,
-    /// Ожидающие ответа запросы (id → канал ответа). Общий с сервером.
+    /// Requests awaiting an answer (id → response channel). Shared with the server.
     pub pending: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
     >,
@@ -430,8 +430,8 @@ impl LlmClient for McpSamplingLlm {
     /// contents and must never leak to other seats.
     async fn reason_for(&self, seat: &str, prompt: &str) -> SlcResult<String> {
         if seat.is_empty() {
-            // Событие с пустым сидом никто не получит (deny-by-default) —
-            // мгновенный отказ вместо 60-секундного ожидания.
+            // An event with an empty seat would be received by nobody
+            // (deny-by-default) — fail instantly instead of a 60-second wait.
             return Err(SlcError::Storage(
                 "sampling requires a non-empty seat (X-Seat-ID)".into(),
             ));
@@ -571,8 +571,8 @@ mod tests {
 
     #[tokio::test]
     async fn sampling_without_seat_fails_fast() {
-        // Пустой сид: событие с seat_id="" никто не получил бы (deny-by-default)
-        // — раньше это висело 60 секунд, теперь мгновенный Err.
+        // Empty seat: an event with seat_id="" would be received by nobody
+        // (deny-by-default) — it used to hang for 60 seconds, now an instant Err.
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let llm = McpSamplingLlm::new(tx, pending.clone());
@@ -584,7 +584,7 @@ mod tests {
             "must fail fast"
         );
         assert!(pending.lock().unwrap().is_empty());
-        // reason() без сита — тот же быстрый отказ.
+        // reason() without a seat — the same fast failure.
         assert!(llm.reason("текст").await.is_err());
     }
 

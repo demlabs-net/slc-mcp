@@ -466,7 +466,7 @@ pub fn unique_id(prefix: &str) -> String {
     format!("{prefix}_{}", &u[..12])
 }
 
-/// Кириллица → латиница (для говорящих id из русских названий).
+/// Cyrillic → Latin transliteration (for readable ids from Russian names).
 fn translit_char(c: char, upper: bool) -> Option<String> {
     const LOWER: &[(&str, &str)] = &[
         ("а", "a"), ("б", "b"), ("в", "v"), ("г", "g"), ("д", "d"), ("е", "e"),
@@ -494,9 +494,9 @@ fn translit_char(c: char, upper: bool) -> Option<String> {
     None
 }
 
-/// Говорящий слаг из названия: транслит кириллицы, lowercase, не-буквы → `_`,
-/// пустые сегменты схлопываются, до 48 символов. Пустой результат → `task`-
-/// стиль callers должен заменить на unique_id.
+/// Human-readable slug from a name: Cyrillic transliteration, lowercase,
+/// non-letters → `_`, empty segments collapse, up to 48 characters. If the
+/// result is empty, `task`-style callers should use a unique_id instead.
 pub fn slug_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {

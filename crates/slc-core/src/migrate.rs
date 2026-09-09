@@ -3,25 +3,25 @@
 //! The legacy Obsidian vault layout (see `slc-mcp.legacy`):
 //!
 //! ```text
-//! vault/<collection>/<stem>.md      — документ = markdown + YAML frontmatter
-//! vault/embeddings/…                — JSON-файлы (перегенерируются, не мигрируем)
-//! vault/.slc-index/…                — индексы (пересоздаются)
+//! vault/<collection>/<stem>.md      — a document = markdown + YAML frontmatter
+//! vault/embeddings/…                — JSON files (regenerated, not migrated)
+//! vault/.slc-index/…                — indexes (recreated)
 //! ```
 //!
-//! Collections: `focuses`, `ideas` (убраны из новой модели — пропускаются),
+//! Collections: `focuses`, `ideas` (removed from the new model — skipped),
 //! `knowledge_base`, `seats`, `history` / episodic, `tasks`, `projects`.
 //!
 //! Migration rules (user-approved):
 //!
-//! - **id переделываются в нормальные человекочитаемые имена**: из
-//!   frontmatter `name`/`title` или первой строки тела строится slug
-//!   с префиксом категории (`project_…`, `task_…`, `skill_…`, `doc_…`);
-//!   пустые/мусорные имена — детерминированный fallback на старый id.
-//! - **в Obsidian vault цель** — документы раскладываются по папкам
-//!   категорий (`projects/`, `tasks/`, `skills/`, `knowledge/`, `history/…`,
-//!   `focuses/`, `seats/`), как делает новый `ObsidianVaultStore`.
-//! - **embeddings и идеи не переносятся** (перегенерация; концепция идей
-//!   удалена).
+//! - **ids are reworked into proper human-readable names**: from the
+//!   frontmatter `name`/`title` or the first line of the body a slug is
+//!   built with a category prefix (`project_…`, `task_…`, `skill_…`,
+//!   `doc_…`); empty/garbage names — deterministic fallback to the old id.
+//! - **target: an Obsidian vault** — documents are laid out into category
+//!   folders (`projects/`, `tasks/`, `skills/`, `knowledge/`, `history/…`,
+//!   `focuses/`, `seats/`), like the new `ObsidianVaultStore` does.
+//! - **embeddings and ideas are not carried over** (regeneration; the ideas
+//!   concept is removed).
 
 use crate::error::{SlcError, SlcResult};
 use crate::llm::LlmClient;
@@ -1375,10 +1375,10 @@ mod tests {
         let mut used = HashSet::new();
         let ai = new_kb_id(&d, Some("migration_slc_plan".into()), &mut used);
         assert_eq!(ai, "migration_slc_plan", "AI-слаг без категорийного префикса");
-        // Без AI внешний контракт id сохраняется независимо от заголовка.
+        // Without AI the external id contract is kept regardless of the title.
         let fb = new_kb_id(&d, None, &mut used);
         assert_eq!(fb, "doc_a1b2c3");
-        // Киррилический текст без заголовка — fallback на осмысленный legacy id.
+        // Cyrillic text without a title — fallback to the meaningful legacy id.
         let d2 = LegacyDoc {
             document_id: "doc_a1b2c3".into(),
             content: "просто кириллический текст".into(),
@@ -1400,7 +1400,7 @@ mod tests {
         };
         let slug = ai_slug(&llm, &d).await.unwrap();
         assert_eq!(slug, "simple_name");
-        // Не-ASCII ответ модели → пустой slug → None (fallback на детерминированный).
+        // Non-ASCII model answer → empty slug → None (fallback to the deterministic one).
         let llm2 = MockLlm::new(vec!["Простое-имя".to_string()]);
         assert!(ai_slug(&llm2, &d).await.is_none());
     }
@@ -1532,7 +1532,7 @@ mod tests {
         )
         .await;
         assert_eq!(id, "task_15c3c8ca");
-        // Уникальность: повтор → суффикс.
+        // Uniqueness: repeat → suffix.
         let id2 = task_new_id(
             &raw,
             "task_15c3c8ca",
@@ -1545,7 +1545,7 @@ mod tests {
         .await;
         assert_eq!(id2, "task_15c3c8ca_2");
 
-        // Пустые name/description → fallback на task_id.
+        // Empty name/description → fallback to task_id.
         let raw3 = bson::doc! { "task_id": "cellframe_staking_security_audit" };
         let mut used3 = HashSet::new();
         let id3 = task_new_id(&raw3, "cellframe_staking_security_audit", "", "", None, false, &mut used3).await;
@@ -1581,7 +1581,7 @@ mod tests {
         assert!(seat.metadata.get("legacy_active_task_id").is_none());
         assert!(seat.metadata.get("legacy_active_document_id").is_none());
 
-        // Ссылка на несуществующую задачу → legacy-ключ остаётся.
+        // A link to a nonexistent task → the legacy key stays.
         let mut seat2 = Seat {
             seat_id: "seat_b".into(),
             name: "dev".into(),

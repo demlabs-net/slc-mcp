@@ -21,12 +21,12 @@ const CORE_DOCS: [(&str, &[&str]); 4] = [
     ("core_slc_best_practice", &["best-practice", "guide", "patterns", "core"]),
 ];
 
-/// Текущая версия сида. bump = перезапись системных core-документов.
-/// v3: манифест синхронизирован с кодом (токены).
-/// v4: убран байтовый guard вывода — бюджет только токеновый.
+/// Current seed version. Bump = the system core documents get rewritten.
+/// v3: manifest synced with the code (tokens).
+/// v4: removed the byte-size output guard — the budget is token-only now.
 const SEED_VERSION: i64 = 4;
 
-/// v1-документы, которых больше нет в комплекте (легаси JSON-сид).
+/// v1 documents no longer shipped in the bundle (legacy JSON seed).
 const LEGACY_V1_DOCS: [&str; 5] = [
     "core_ai_behavior_correction",
     "core_development_standards",
@@ -72,7 +72,7 @@ pub async fn ensure_core_documents(store: &dyn StorageBackend) -> SlcResult<usiz
         store.kb_replace(&doc).await?;
         inserted += 1;
     }
-    // Уборка легаси v1-документов (мягко, в graveyard — восстановимы).
+    // Clean up legacy v1 documents (soft delete into the graveyard — recoverable).
     for id in LEGACY_V1_DOCS {
         let _ = store.kb_soft_delete(id).await;
     }
@@ -108,7 +108,7 @@ mod tests {
         assert_eq!(n2, 0, "no duplicates on second open");
         let mut doc = store.kb_get("core_ai_behavior").await.unwrap().unwrap();
         doc.content = "пользовательская версия".into();
-        // Пользовательская правка сохраняет seed_version → не перезатирается.
+        // A user edit keeps seed_version → not overwritten.
         store.kb_insert(&doc).await.unwrap();
         assert_eq!(ensure_core_documents(store.as_ref()).await.unwrap(), 0);
         let after = store.kb_get("core_ai_behavior").await.unwrap().unwrap();
@@ -119,7 +119,7 @@ mod tests {
     async fn legacy_v1_seed_is_migrated_and_cleaned() {
         let store: std::sync::Arc<dyn StorageBackend> =
             std::sync::Arc::new(SqliteStore::in_memory().unwrap());
-        // v1-манифест (огромный JSON, без seed_version) + легаси-документ.
+        // v1 manifest (huge JSON, no seed_version) + legacy document.
         let mut meta = DocMeta::default();
         meta.doc_type = Some("core".into());
         store
@@ -153,9 +153,9 @@ mod tests {
             manifest.metadata.extra.get("seed_version").and_then(|v| v.as_i64()),
             Some(SEED_VERSION)
         );
-        // Легаси-документ ушёл в graveyard (мягкое удаление).
+        // Legacy document went to the graveyard (soft delete).
         assert!(store.kb_get("core_reflection_system").await.unwrap().is_none());
-        // Повторный прогон — идемпотентен.
+        // Second run — idempotent.
         assert_eq!(ensure_core_documents(store.as_ref()).await.unwrap(), 0);
     }
 }

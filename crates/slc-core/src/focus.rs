@@ -154,7 +154,7 @@ impl<S: StorageBackend> FocusManager<S> {
         Ok(true)
     }
 
-    /// Вручную архивировать/разархивировать фокус (владелец — seat_id).
+    /// Manually archive/unarchive a focus (owner — seat_id).
     pub async fn set_archived(
         &self,
         focus_id: &str,

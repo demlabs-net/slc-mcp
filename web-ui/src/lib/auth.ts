@@ -1,7 +1,7 @@
-// Auth-состояние SPA (порт легаси web-ui/src/lib/auth.ts).
-// Режимы сервера: seat (X-Seat-ID, логин не нужен) и full (JWT + Yandex).
-// Boot-проверка: GET /api/auth/me — 200 с user → full; 200 с auth_mode=seat
-// → seat; 401 → full без сессии → показать Login.
+// SPA auth state (port of legacy web-ui/src/lib/auth.ts).
+// Server modes: seat (X-Seat-ID, no login needed) and full (JWT + Yandex).
+// Boot check: GET /api/auth/me — 200 with user → full; 200 with auth_mode=seat
+// → seat; 401 → full without a session → show Login.
 
 import { writable, derived } from 'svelte/store';
 import { api, getAccessToken, setAccessToken } from './api';
@@ -126,13 +126,13 @@ export function logout() {
 }
 
 /**
- * Boot-проверка: OAuth-callback → токены из localStorage → режим сервера.
+ * Boot check: OAuth callback → tokens from localStorage → server mode.
  */
 export async function checkAuth(): Promise<boolean> {
   // 1) OAuth callback (?auth_code=)
   if (await handleOAuthCallback()) return true;
 
-  // 2) Сохранённые токены (full-режим)
+  // 2) Stored tokens (full mode)
   if (stored.accessToken) {
     setAccessToken(stored.accessToken);
     try {
@@ -146,7 +146,7 @@ export async function checkAuth(): Promise<boolean> {
       });
       return true;
     } catch {
-      // Просрочен access → refresh; не вышло → login page
+      // Expired access → refresh; on failure → login page
       setAccessToken(null);
       if (await refreshTokens()) return true;
       auth.set({ user: null, accessToken: null, refreshToken: stored.refreshToken, mode: 'full', loading: false });
@@ -154,7 +154,7 @@ export async function checkAuth(): Promise<boolean> {
     }
   }
 
-  // 3) Без токенов: /api/auth/me решает режим (seat-режим всегда 200)
+  // 3) No tokens: /api/auth/me decides the mode (seat mode always 200)
   try {
     const res = await api.auth.me();
     if (res?.auth_mode === 'seat') {
@@ -166,14 +166,14 @@ export async function checkAuth(): Promise<boolean> {
       return true;
     }
   } catch {}
-  // 401 → full-режим, нужен логин
+  // 401 → full mode, login required
   auth.set({ user: null, accessToken: null, refreshToken: null, mode: 'full', loading: false });
   return false;
 }
 
 /**
- * OAuth callback: /?auth_code=… → POST /api/auth/exchange → токены.
- * Токены никогда не появляются в URL (легаси-флоу).
+ * OAuth callback: /?auth_code=… → POST /api/auth/exchange → tokens.
+ * Tokens never appear in the URL (legacy flow).
  */
 export async function handleOAuthCallback(): Promise<boolean> {
   const urlParams = new URLSearchParams(window.location.search);
@@ -206,7 +206,7 @@ export function hasRole(...roles: string[]): boolean {
   return roles.some(r => groups.includes(r));
 }
 
-/** Access-токен для EventSource и прочего (не через fetch). */
+/** Access token for EventSource and similar (not via fetch). */
 export function tokenForStream(): string {
   return getAccessToken() || '';
 }

@@ -1,13 +1,13 @@
-//! Модели авторизации — 1:1 с легаси `src/auth/models.py`.
+//! Auth models — 1:1 with legacy `src/auth/models.py`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// Группы с admin-правами (легаси `ADMIN_GROUP_NAMES`).
+/// Groups with admin rights (legacy `ADMIN_GROUP_NAMES`).
 pub const ADMIN_GROUP_NAMES: [&str; 2] = ["admins", "superadmins"];
 
-/// Пользователь (легаси `User`, Mongo `users` → vault `.slc/auth/users.json`).
+/// User (legacy `User`, Mongo `users` → vault `.slc/auth/users.json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub user_id: String,
@@ -29,7 +29,7 @@ pub struct User {
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub last_login: Option<DateTime<Utc>>,
-    /// SHA-256 последнего refresh-токена (ротация, легаси
+    /// SHA-256 of the last refresh token (rotation; legacy
     /// `last_refresh_token_hash`).
     #[serde(default)]
     pub last_refresh_token_hash: Option<String>,
@@ -40,7 +40,7 @@ fn default_true() -> bool {
 }
 
 impl User {
-    /// Безопасное представление для API (без password_hash).
+    /// Safe representation for the API (without password_hash).
     pub fn public_json(&self, permissions: Vec<String>) -> Value {
         serde_json::json!({
             "user_id": self.user_id,
@@ -55,7 +55,7 @@ impl User {
     }
 }
 
-/// Правило allowlist OAuth (легаси `OAuthAccessRule`, коллекция
+/// OAuth allowlist rule (legacy `OAuthAccessRule`, collection
 /// `oauth_access_rules` → vault `.slc/auth/oauth_rules.json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthAccessRule {
@@ -63,7 +63,7 @@ pub struct OAuthAccessRule {
     /// login | email | domain | ya360_org | ya360_group
     #[serde(rename = "type")]
     pub rule_type: String,
-    /// Нормализовано: strip().lower().
+    /// Normalized: strip().lower().
     pub value: String,
     #[serde(default = "default_users")]
     pub default_groups: Vec<String>,
@@ -78,7 +78,7 @@ fn default_users() -> Vec<String> {
     vec!["users".into()]
 }
 
-/// Запись audit (легаси `AuditLog` → vault `.slc/auth/audit.jsonl`).
+/// Audit entry (legacy `AuditLog` → vault `.slc/auth/audit.jsonl`).
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEntry {
     pub log_id: String,
@@ -99,7 +99,7 @@ pub struct AuditEntry {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Предопределённые группы (легаси `PREDEFINED_GROUPS`).
+/// Predefined groups (legacy `PREDEFINED_GROUPS`).
 pub struct PredefinedGroup {
     pub name: &'static str,
     pub group_id: &'static str,
@@ -130,7 +130,8 @@ pub const PREDEFINED_GROUPS: &[PredefinedGroup] = &[
     PredefinedGroup { name: "viewers", group_id: "group_viewers", permissions: &["kb:read"] },
 ];
 
-/// Все пермишены группы (легаси `get_user_permissions`, union с дедупом).
+/// All permissions of a group set (legacy `get_user_permissions`, union with
+/// dedup).
 pub fn permissions_for_groups(groups: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for g in groups {
@@ -145,7 +146,7 @@ pub fn permissions_for_groups(groups: &[String]) -> Vec<String> {
     out
 }
 
-/// Проверка права (легаси `Policy.check_permission`): `*:*`, `resource:*`,
+/// Permission check (legacy `Policy.check_permission`): `*:*`, `resource:*`,
 /// `resource:action:scope`, `resource:action`.
 pub fn check_permission(groups: &[String], resource: &str, action: &str) -> bool {
     let perms = permissions_for_groups(groups);

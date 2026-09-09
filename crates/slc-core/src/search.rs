@@ -410,7 +410,7 @@ impl SearchService {
             count = stale.len(),
             "re-embedding documents from a previous embedding model"
         );
-        // Батч-пересборка (один forward на чанк).
+        // Batch rebuild (one forward per chunk).
         let mut docs = Vec::with_capacity(stale.len());
         for id in stale {
             if let Ok(Some(doc)) = self.store.kb_get(&id).await {
@@ -614,7 +614,7 @@ mod tests {
         for d in sample_docs() {
             store.kb_insert(&d).await.unwrap();
         }
-        // Записи от "старой модели" (dim=2) — как после смены эмбеддера.
+        // Records from the "old model" (dim=2) — like after switching embedders.
         for id in ["rust-patterns", "vassista-plan", "grocery-list"] {
             store
                 .insert_embeddings(&[crate::model::EmbeddingRecord {
@@ -723,7 +723,7 @@ mod relevance_gate {
             ("note_coffee", "Пользователь предпочитает чёрный кофе без сахара"),
         ])
         .await;
-        // Text overlap ("зовут"/"меня") plus shared n-grams: the fact doc
+        // Text overlap with the query plus shared n-grams: the fact doc
         // is clearly relevant; the coffee note shares no tokens and its
         // hash-noise must fall below the relative gap.
         let hits = svc.search("как меня зовут", None, None, 5, None).await.unwrap();

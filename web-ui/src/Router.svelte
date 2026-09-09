@@ -34,17 +34,17 @@
   const PageComponent = derived(currentRoute, $r => routes[$r] || Dashboard);
   const booted = derived(auth, $a => !$a.loading);
   const authed = derived(auth, $a => {
-    if ($a.mode === 'seat') return true; // seat-режим: логин не нужен
+    if ($a.mode === 'seat') return true; // seat mode: no login needed
     return !!$a.accessToken && !!$a.user;
   });
 
-  // Сид создаётся на клиенте (сервер авто-провиженит при первом запросе).
+  // The seat is created on the client (the server auto-provisions it on first request).
   getSeat();
 
   let checkDone = $state(false);
 
   onMount(async () => {
-    // Режим определяется по /api/auth/me (seat | full) + OAuth-callback.
+    // The mode is decided by /api/auth/me (seat | full) + the OAuth callback.
     await checkAuth();
     checkDone = true;
     const onHashChange = () => currentRoute.set(getRouteFromHash());

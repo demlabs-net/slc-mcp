@@ -94,32 +94,31 @@ enum Cmd {
         /// Legacy MongoDB database (default: slc_mcp).
         #[arg(long, default_value = "slc_mcp")]
         db: String,
-        /// Переименовать id документов БЗ в осмысленные с помощью reasoning-LLM
-        /// из .env (SLC_LLM/LMSTUDIO_URL/OLLAMA) и переписать auto_load/
-        /// references под новые id. History-доки (дневник) получают
-        /// детерминированные id (дата + хвост старого id).
+        /// Rename knowledge-base document ids into meaningful ones using a
+        /// reasoning LLM from .env (SLC_LLM/LMSTUDIO_URL/OLLAMA) and rewrite
+        /// auto_load/references under the new ids. History docs (diary) get
+        /// deterministic ids (date + tail of the old id).
         #[arg(long)]
         rename_with_ai: bool,
         /// Target Obsidian vault (default: $SLC_VAULT_PATH).
         #[arg(long)]
         to_vault: Option<PathBuf>,
     },
-    /// Консольный визард развертывания: выбрать провайдера эмбеддингов,
-    /// при необходимости скачать модель, записать .env. Без флагов —
-    /// интерактивно.
+    /// Console deployment wizard: pick an embeddings provider, download the
+    /// model if necessary, write .env. Without flags — interactive.
     Init {
-        /// Провайдер: candle | ollama | lmstudio | hash (без вопросов).
+        /// Provider: candle | ollama | lmstudio | hash (no questions).
         #[arg(long)]
         llm: Option<String>,
-        /// Устройство для candle: auto | cuda | metal | cpu.
+        /// Device for candle: auto | cuda | metal | cpu.
         #[arg(long)]
         device: Option<String>,
-        /// Модель для candle (HF repo id, напр. BAAI/bge-m3).
+        /// Model for candle (HF repo id, e.g. BAAI/bge-m3).
         #[arg(long)]
         model: Option<String>,
     },
-    /// Пересобрать эмбеддинги всех документов (или одного сита) текущим
-    /// провайдером — после смены модели в настройках.
+    /// Rebuild the embeddings of all documents (or of a single seat) with the
+    /// current provider — after a model change in the settings.
     ReindexEmbeddings {
         #[arg(long)]
         seat: Option<String>,
@@ -175,9 +174,9 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Serve { port, auto_commit } => {
-            // Флаг --auto-commit дополняет env OBSIDIAN_AUTO_GIT_COMMIT,
-            // а не перезаписывает его (иначе авто-коммит vault выключен
-            // всегда, когда флаг не передан).
+            // The --auto-commit flag supplements the OBSIDIAN_AUTO_GIT_COMMIT
+            // env var instead of overriding it (otherwise vault auto-commit
+            // would be off whenever the flag is not passed).
             config.auto_git_commit = auto_commit || config.auto_git_commit;
             let dist = std::env::var("SLC_WEBUI_DIST")
                 .unwrap_or_else(|_| "./web-ui/dist".into());
@@ -359,9 +358,9 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-// ── `slc-mcp init` — консольный визард развертывания ───────────────
+// ── `slc-mcp init` — console deployment wizard ───────────────
 
-/// Прочитать строку ответа (пустая строка → default).
+/// Read an answer line (empty line → default).
 fn ask(prompt: &str, default: &str) -> String {
     print!("{prompt}");
     if !default.is_empty() {
@@ -379,7 +378,7 @@ fn ask(prompt: &str, default: &str) -> String {
     }
 }
 
-/// Записать/обновить ключ в .env (cwd). Существующие строки заменяются.
+/// Write/update a key in .env (cwd). Existing lines are replaced.
 fn set_env_line(key: &str, value: &str) -> std::io::Result<PathBuf> {
     let path = std::env::current_dir()?.join(".env");
     let mut lines: Vec<String> = std::fs::read_to_string(&path)
@@ -404,7 +403,7 @@ async fn cmd_init(
 
     println!("── SLC setup ────────────────────────────────────────────");
 
-    // 1. Провайдер.
+    // 1. Provider.
     let llm = match llm_arg {
         Some(v) => v,
         None => ask(
@@ -426,13 +425,13 @@ async fn cmd_init(
     let mut model = model_arg;
 
     if llm == "candle" {
-        // 2. Устройство: показываем автодетект.
+        // 2. Device: show the autodetected one.
         let detected = slc_core::candle_emb::detect_device_name();
         println!("определено устройство: {detected}");
         if device.is_none() {
             device = Some(ask("устройство (auto|cuda|metal|cpu)", "auto"));
         }
-        // 3. Модель: дефолт по устройству.
+        // 3. Model: default depends on the device.
         let dev = device.as_deref().unwrap_or("auto");
         let default_model = slc_core::candle_emb::CandleEmbeddingLlm::default_model_for(dev);
         if model.is_none() {
@@ -440,7 +439,7 @@ async fn cmd_init(
         }
         let repo_id = model.as_deref().unwrap_or(&default_model).to_string();
 
-        // 4. Скачивание (единственное место, где качается модель).
+        // 4. Download (the only place where the model is downloaded).
         if !slc_core::candle_emb::model_is_cached(&repo_id) {
             println!("скачиваю модель {repo_id} в кэш Hugging Face…");
             slc_core::candle_emb::download_embedding_model(&repo_id).map_err(anyhow::Error::msg)?;
@@ -448,9 +447,9 @@ async fn cmd_init(
             println!("модель {repo_id} уже в кэше");
         }
 
-        // 5. Проверка: загрузить и сделать контрольный эмбеддинг ДО записи
-        //    .env — при провале (например, metal без layer-norm) конфигурация
-        //    не должна остаться в битом состоянии.
+        // 5. Verification: load the model and produce a test embedding BEFORE
+        //    writing .env — on failure (e.g. metal without layer-norm) the
+        //    configuration must not be left in a broken state.
         let llm: std::sync::Arc<dyn slc_core::LlmClient> = std::sync::Arc::new(
             slc_core::candle_emb::CandleEmbeddingLlm::with_config(&repo_id, dev),
         );
@@ -467,14 +466,14 @@ async fn cmd_init(
             Err(_) => anyhow::bail!("таймаут загрузки модели — .env не записан"),
         }
 
-        // 6. Запись в .env (после успешной проверки).
+        // 6. Write to .env (after a successful check).
         let env_path = set_env_line("SLC_LLM", "candle")?;
         set_env_line("SLC_EMBED_DEVICE", dev)?;
         set_env_line("SLC_EMBED_MODEL", &repo_id)?;
         println!("конфигурация записана в {}", env_path.display());
         println!("дальше: slc-mcp serve (эмбеддинги уже в кэше, автоскачивание не требуется)");
     } else {
-        // Внешний провайдер / hash: только .env.
+        // External provider / hash: .env only.
         let env_path = set_env_line("SLC_LLM", &llm)?;
         println!("конфигурация записана в {}", env_path.display());
         match llm.as_str() {

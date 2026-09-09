@@ -1,5 +1,5 @@
-//! Yandex OAuth2 — 1:1 с легаси `src/auth/oauth_yandex.py` + allowlist
-//! `_check_oauth_access` (правила > env-фолбэк).
+//! Yandex OAuth2 — 1:1 with legacy `src/auth/oauth_yandex.py` + the
+//! `_check_oauth_access` allowlist (rules > env fallback).
 
 use super::models::OAuthAccessRule;
 use anyhow::{Context, Result};
@@ -111,8 +111,8 @@ impl YandexOAuth {
         Ok(resp.json().await.context("yandex userinfo parse")?)
     }
 
-    /// Проверка allowlist по env (легаси `is_user_allowed`) — включая
-    /// «кварк»: `YANDEX_ALLOWED_GROUPS` парсится, но не проверяется.
+    /// Env-based allowlist check (legacy `is_user_allowed`) — including the
+    /// quirk: `YANDEX_ALLOWED_GROUPS` is parsed but never enforced.
     pub fn is_user_allowed(&self, info: &YandexUserInfo) -> bool {
         let login = info.login.clone().unwrap_or_default();
         let email = info.default_email.clone().unwrap_or_default();
@@ -130,8 +130,8 @@ impl YandexOAuth {
         false
     }
 
-    /// Allowlist по правилам БД (приоритет над env). Возвращает группы
-    /// первого подходящего правила. Лениво дёргает Y360 API для
+    /// Allowlist by DB rules (takes precedence over env). Returns the groups
+    /// of the first matching rule. Lazily calls the Y360 API for
     /// ya360_org/ya360_group.
     pub async fn check_rules(
         &self,
@@ -212,7 +212,7 @@ fn csv_env(key: &str) -> Vec<String> {
 }
 
 fn urlencode(s: &str) -> String {
-    // Достаточно для значений client_id/state (алфавитно-цифровые).
+    // Good enough for client_id/state values (alphanumeric).
     s.chars()
         .map(|c| match c {
             'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
@@ -227,7 +227,7 @@ fn urlencode(s: &str) -> String {
         .collect()
 }
 
-/// Yandex 360 Directory API (легаси `Yandex360DirectoryClient`).
+/// Yandex 360 Directory API (legacy `Yandex360DirectoryClient`).
 pub struct Yandex360Client {
     pub admin_token: String,
     pub client_id: String,
@@ -285,7 +285,7 @@ impl Yandex360Client {
         Ok(resp.json().await.context("y360 parse")?)
     }
 
-    /// Членство в организации (легаси `is_user_in_org`, пагинация 100/page).
+    /// Organization membership (legacy `is_user_in_org`, pagination 100/page).
     pub async fn is_user_in_org(&self, login: &str, email: &str) -> Result<bool> {
         let login_nick = login.split('@').next().unwrap_or(login).to_lowercase();
         let email_lower = email.to_lowercase();
@@ -310,7 +310,7 @@ impl Yandex360Client {
         Ok(false)
     }
 
-    /// Членство в группе (легаси `is_user_in_group`).
+    /// Group membership (legacy `is_user_in_group`).
     pub async fn is_user_in_group(&self, group_id: i64, login: &str, email: &str) -> Result<bool> {
         let login_nick = login.split('@').next().unwrap_or(login).to_lowercase();
         let email_lower = email.to_lowercase();
@@ -331,7 +331,7 @@ impl Yandex360Client {
         Ok(false)
     }
 
-    /// Список групп организации (для admin-статуса/правил).
+    /// List of organization groups (for admin status/rules).
     #[allow(dead_code)]
     pub async fn list_groups(&self) -> Result<Vec<serde_json::Value>> {
         let data = self

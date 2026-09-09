@@ -18,13 +18,13 @@ pub const COLLECTION: &str = "paginated_responses";
 
 /// Default page size. Clients with a smaller result budget can override it
 /// per connection with `X-SLC-Page-Token-Limit`.
-/// 5000 токенов × 3 симв/токен = 15K символов ≈ 45K байт UTF-8 (RU) —
-/// страница гарантированно влезает в типовой resultBudget харнеса
-/// (50K байт на вывод одного тула). Клиенты с большим бюджетом
-/// настраивают X-SLC-Page-Token-Limit / SLC_PAGE_TOKEN_LIMIT.
+/// 5000 tokens × 3 chars/token = 15K chars ≈ 45K bytes UTF-8 (RU) —
+/// the page is guaranteed to fit into a typical harness resultBudget
+/// (50K bytes for one tool's output). Clients with a bigger budget
+/// set X-SLC-Page-Token-Limit / SLC_PAGE_TOKEN_LIMIT.
 pub const DEFAULT_PAGE_TOKEN_LIMIT: usize = 5_000;
 
-/// Rough chars-per-token estimate (RU/EN смесь, как в движке).
+/// Rough chars-per-token estimate (RU/EN mix, as in the engine).
 pub const CHARS_PER_TOKEN: usize = 3;
 /// Auto-delete responses after this long.
 pub const TTL_SECONDS: i64 = 600; // 10 min
@@ -99,9 +99,9 @@ impl<S: StorageBackend> Paginator<S> {
             .unwrap_or(DEFAULT_PAGE_TOKEN_LIMIT))
     }
 
-    /// Разбить item по содержимому (`content`) на части ≤ `char_limit`
-    /// символов. Каждая часть помечается `part: "k/n"`; клиент склеивает
-    /// их по порядку. Не обрезка — все части отдаются через `get_page`.
+    /// Split an item by its contents (`content`) into parts ≤ `char_limit`
+    /// characters. Each part is marked `part: "k/n"`; the client reassembles
+    /// them in order. Not truncation — every part is served via `get_page`.
     fn split_item(item: &Value, char_limit: usize) -> Vec<Value> {
         let Some(content) = item.get("content").and_then(|v| v.as_str()) else {
             return vec![item.clone()];
@@ -159,17 +159,17 @@ impl<S: StorageBackend> Paginator<S> {
         };
         let list_key = find_list_key(&result);
         let char_limit = page_token_limit * CHARS_PER_TOKEN;
-        // Часть контента никогда не меньше 200 символов: защита от
-        // underflow (char_limit < 200) и от тысяч микро-страниц при
-        // экстремально малых лимитах.
+        // A content part is never smaller than 200 characters: protection
+        // against underflow (char_limit < 200) and against thousands of
+        // micro-pages under extremely small limits.
         let chunk_limit = char_limit.saturating_sub(200).max(200);
 
         if list_key.is_none() {
-            // Одиночный объект (например, get_document): если у него
-            // большой строковый `content` — режем ПО СОДЕРЖИМОМУ на части
-            // (поле `part: "k/n"`), каждая часть — страница get_page;
-            // клиент склеивает по порядку part — полный контент доходит
-            // без потерь даже при жёстком бюджете обвязки клиента.
+            // A single object (e.g. get_document): if it has a large string
+            // `content` — split BY CONTENT into parts (the `part: "k/n"`
+            // field); each part is a get_page page, and the client
+            // reassembles parts in order — the full content arrives
+            // lossless even under a tight client-side budget.
             if let Some(content) = result.get("content").and_then(|v| v.as_str()) {
                 if content.chars().count() > char_limit {
                     let parts = Self::split_item(&result, chunk_limit);
@@ -235,10 +235,10 @@ impl<S: StorageBackend> Paginator<S> {
         for item in items {
             let item_chars = estimate_chars(&item);
             if item_chars > char_limit {
-                // Один документ не влезает в страницу — режем ПО
-                // СОДЕРЖИМОМУ на части (не обрезка: каждая часть — своя
-                // страница, клиент забирает все через get_page и склеивает
-                // по `part k/n`).
+                // A single document does not fit in a page — split BY
+                // CONTENT into parts (not truncation: each part is its own
+                // page; the client fetches all via get_page and reassembles
+                // by `part k/n`).
                 flush(&mut pages, &mut current, &mut current_chars);
                 for part in Self::split_item(&item, chunk_limit) {
                     flush(&mut pages, &mut current, &mut current_chars);
@@ -305,8 +305,8 @@ impl<S: StorageBackend> Paginator<S> {
             "page": page,
             "total_pages": pages.len(),
         });
-        // Мета-инфо о том, КОГДА и ПРИ КАКОМ лимите создан кэш: клиент,
-        // получивший total_pages=1 из старого кэша, видит причину.
+        // Meta-info about WHEN and AT WHICH LIMIT the cache was created: a
+        // client that got total_pages=1 from an old cache sees the reason.
         if let Ok(Some(meta)) = self
             .store
             .get_record(COLLECTION, &format!("{response_id}:meta"))
@@ -395,9 +395,9 @@ fn estimate_chars(v: &Value) -> usize {
 /// First key whose value is a non-empty list.
 fn find_list_key(result: &Value) -> Option<String> {
     let obj = result.as_object()?;
-    // Только НЕПУСТЫЕ массивы считаются списками: пустые поля объекта
-    // (auto_load/references/tags у документа) иначе перехватывали бы
-    // пагинацию, и одиночный объект с большим content не резался бы.
+    // Only NON-EMPTY arrays count as lists: empty object fields (a
+    // document's auto_load/references/tags) would otherwise hijack
+    // pagination, and a single object with large content would never split.
     let non_empty = |v: &Value| v.as_array().is_some_and(|a| !a.is_empty());
     for key in ["results", "content", "items", "focuses", "reminders", "notifications", "tasks", "projects", "docs", "events"] {
         if let Some(v) = obj.get(key) {
@@ -457,24 +457,24 @@ mod tests {
 
     #[tokio::test]
     async fn big_item_splits_by_content() {
-        // Один документ больше лимита страницы — режется ПО СОДЕРЖИМОМУ
-        // на части с `part: "k/n"`; все части отдаются через get_page.
+        // A single document bigger than the page limit — split BY CONTENT
+        // into parts with `part: "k/n"`; all parts are served via get_page.
         let (p, _) = paginator();
-        let big = "абвгд ".repeat(4000); // ~24K символов
+        let big = "абвгд ".repeat(4000); // ~24K characters
         let data = json!({"results": [
             {"document_id": "big", "content": big},
             {"document_id": "small", "content": "мелкий"},
         ]});
         let result = p
-            .paginate_with_limit("s", "resp_big", &data, 2000) // 2000 ток × 3 = 6000 симв
+            .paginate_with_limit("s", "resp_big", &data, 2000) // 2000 tok × 3 = 6000 chars
             .await
             .unwrap();
         let total = result["_pagination"]["total_pages"].as_u64().unwrap();
         assert!(total >= 5, "big doc должен разбиться на части, total={total}");
-        // первая часть — chunk с part
+        // first part — chunk with part
         let first = result["results"][0].clone();
         assert!(first.get("part").is_some(), "часть должна быть помечена part");
-        // все части склеиваются в полный контент
+        // all parts reassemble into the full content
         let mut combined = String::new();
         for page in 1..=total {
             let pg = p.get_page("s", "resp_big", page as usize).await.unwrap();
@@ -487,12 +487,13 @@ mod tests {
 
     #[tokio::test]
     async fn get_page_reports_cached_limit_and_hint() {
-        // Кэш создан при лимите 2000; текущий лимит (default 5000) другой —
-        // get_page должен сообщить, при каком лимите создан кэш, и
-        // подсказать, что при обрезке нужно перевызвать исходный тул.
+        // Cache created at limit 2000; the current limit (default 5000)
+        // differs — get_page must report at which limit the cache was
+        // created and hint that the original tool must be re-invoked
+        // when output is being truncated.
         let (p, _) = paginator();
-        // List-кэш создан при БОЛЬШОМ лимите → одна страница (сценарий
-        // агента: update_context/list_documents при 300000 токенов).
+        // List cache created under a LARGE limit → one page (agent
+        // scenario: update_context/list_documents at 300000 tokens).
         let data = json!({"results": [
             {"document_id": "a", "content": "маленький"},
             {"document_id": "b", "content": "тоже"},
@@ -506,15 +507,15 @@ mod tests {
         let pag = &page1["_pagination"];
         assert_eq!(pag["response_page_token_limit"], 300_000);
         assert!(pag.get("response_created_at").is_some());
-        // cached(300000) != current(default 5000) → hint про перевызов.
+        // cached(300000) != current(default 5000) → hint about re-invocation.
         let hint = pag.get("hint").and_then(|v| v.as_str()).unwrap_or("");
         assert!(hint.contains("set_page_limit"), "hint: {hint}");
     }
 
     #[tokio::test]
     async fn tiny_page_limit_does_not_panic_and_chunks() {
-        // page_token_limit=1 → char_limit=3; без защиты был underflow
-        // (char_limit - 200) и паника в debug / мусор в release.
+        // page_token_limit=1 → char_limit=3; without the guard there was
+        // underflow (char_limit - 200) → panic in debug / garbage in release.
         let (p, _) = paginator();
         let big = "абвгд ".repeat(1000);
         let data = json!({"document_id": "doc_x", "content": big});
@@ -530,8 +531,8 @@ mod tests {
 
     #[tokio::test]
     async fn object_with_empty_arrays_still_splits_content() {
-        // get_document-ответ содержит пустые массивы (auto_load/
-        // references/tags) — они не должны перехватывать пагинацию.
+        // get_document response contains empty arrays (auto_load/
+        // references/tags) — they must not hijack pagination.
         let (p, _) = paginator();
         let big = "абвгд ".repeat(3000);
         let data = json!({"document_id": "doc_x", "category": "custom",
@@ -553,10 +554,10 @@ mod tests {
 
     #[tokio::test]
     async fn single_object_content_splits_into_parts() {
-        // get_document-подобный ответ (объект, не список) с большим
-        // content — режется по содержимому; склейка = полный контент.
+        // get_document-like response (object, not list) with large content —
+        // split by content; reassembly = full content.
         let (p, _) = paginator();
-        let big = "абвгд ".repeat(3000); // ~18K символов
+        let big = "абвгд ".repeat(3000); // ~18K characters
         let data = json!({"document_id": "doc_x", "category": "custom", "content": big});
         let result = p
             .paginate_with_limit("s", "resp_doc", &data, 2000)
@@ -603,8 +604,8 @@ mod tests {
 
     #[test]
     fn default_page_is_five_thousand_tokens() {
-        // 5K токенов × 3 симв = 15K символов ≈ 45K байт RU — страница
-        // влезает в типовой resultBudget харнеса (50K байт).
+        // 5K tokens × 3 chars = 15K chars ≈ 45K bytes RU — the page fits
+        // into a typical harness resultBudget (50K bytes).
         assert_eq!(DEFAULT_PAGE_TOKEN_LIMIT, 5_000);
     }
 }

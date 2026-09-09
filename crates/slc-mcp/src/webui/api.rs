@@ -1,5 +1,6 @@
-//! REST-хендлеры веб-морды: напрямую через движок того же процесса, что и
-//! MCP-сервер (один владелец vault — ноль конфликтов одновременного доступа).
+//! Web frontend REST handlers: go straight through the engine of the same
+//! process as the MCP server (single vault owner — zero concurrent-access
+//! conflicts).
 
 use crate::server::AppState;
 use axum::{
@@ -35,11 +36,11 @@ fn bad(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
 }
 
-/// Seat-id запроса.
-/// - full-режим (SLC_AUTH=full): Bearer-JWT → пользователь → сид
-///   `user_<user_id>` (persistent); без валидного токена — 401.
-/// - seat-режим: заголовок X-Seat-ID → кука slc_seat → сгенерированный
-///   (при генерации ставим Set-Cookie, чтобы UI держал тот же сид).
+/// Resolve the request seat id.
+/// - full mode (SLC_AUTH=full): Bearer JWT → user → seat
+///   `user_<user_id>` (persistent); no valid token → 401.
+/// - seat mode: X-Seat-ID header → slc_seat cookie → generated seat
+///   (when generating we set Set-Cookie so the UI keeps the same seat).
 pub async fn resolve_seat(
     state: &AppState,
     headers: &HeaderMap,
@@ -69,8 +70,8 @@ pub async fn resolve_seat(
     } else {
         seat_from_cookie(headers).unwrap_or_else(|| format!("slc_web_{}", uuid_like()))
     };
-    // Ленивое создание: существующий сид не трогаем (без перезаписи файла
-    // на каждый запрос); last_accessed обновляется в MCP-пути (ensure_seat).
+    // Lazy creation: leave an existing seat alone (no file rewrite on every
+    // request); last_accessed is updated in the MCP path (ensure_seat).
     if state
         .engine
         .seats
@@ -146,8 +147,9 @@ fn with_seat_cookie(resp: Json<Value>, cookie: Option<String>) -> Response {
     r
 }
 
-/// Хендлер с seat-id: резолвит сид, выполняет $body (доступны `state` и
-/// `seat` как ident-параметры) и отдаёт JSON + Set-Cookie при генерации.
+/// Seat-id handler: resolves the seat, runs $body (with `state` and `seat`
+/// available as ident parameters) and returns JSON + Set-Cookie when a seat
+/// was generated.
 macro_rules! seat_handler {
     ($name:ident, $state:ident, $seat:ident, $body:block) => {
         pub async fn $name(
@@ -944,15 +946,15 @@ pub async fn focus_remove(
     }
 }
 
-// ── SSE: лента уведомлений (поллинг каждые 5с, keep-alive) ────────────
+// ── SSE: notification feed (polling every 5 s, keep-alive) ────────────
 
 pub async fn sse_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    // EventSource не умеет заголовки — в full-режиме токен можно передать
-    // query-параметром (?token=). Подменяем заголовок до резолва сида.
+    // EventSource cannot send headers — in full mode the token may be passed
+    // as a query parameter (?token=). Swap the header before seat resolve.
     let mut headers = headers;
     if let Some(token) = q.get("token").filter(|t| !t.is_empty()) {
         if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {token}")) {

@@ -1,10 +1,11 @@
 # syntax=docker/dockerfile:1
-# SLC MCP server — бинарь собирается локально (`cargo deb -p slc-mcp -o dist`)
-# и доставляется .deb-пакетом; SPA (web-ui/dist) собирается локально и копируется
-# предсобранным. Внутри Docker компиляции нет. Хост и образ — Debian 13 (trixie).
+# SLC MCP server — the binary is built locally (`cargo deb -p slc-mcp -o dist`)
+# and shipped as a .deb package; the SPA (web-ui/dist) is built locally and
+# copied in prebuilt. There is no compilation inside Docker. Host and image
+# are Debian 13 (trixie).
 FROM debian:trixie-slim
 
-# git — авто-коммит волта (OBSIDIAN_AUTO_GIT_COMMIT=true) + push по ssh;
+# git — vault auto-commit (OBSIDIAN_AUTO_GIT_COMMIT=true) + ssh push;
 # curl — healthcheck; ca-certificates — TLS.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git curl openssh-client \

@@ -1,6 +1,6 @@
-//! Эндпоинты авторизации — 1:1 с легаси `src/api/routes/auth.py` +
-//! auth-часть `src/api/routes/admin.py`. В seat-режиме (SLC_AUTH=seat)
-//! auth-роуты отвечают 404, кроме `/me` (SPA определяет режим).
+//! Auth endpoints — 1:1 with legacy `src/api/routes/auth.py` +
+//! the auth part of `src/api/routes/admin.py`. In seat mode (SLC_AUTH=seat)
+//! auth routes return 404, except `/me` (the SPA detects the mode).
 
 use super::{
     AuthMode, audit_id_new, bearer_from, rule_id_new, user_has_permission, user_id_new,
@@ -40,7 +40,7 @@ fn internal(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg.into())
 }
 
-/// Auth недоступен в seat-режиме.
+/// Auth is unavailable in seat mode.
 fn auth_disabled() -> ApiError {
     ApiError(
         StatusCode::NOT_FOUND,
@@ -50,7 +50,7 @@ fn auth_disabled() -> ApiError {
 
 // ── helpers ────────────────────────────────────────────────────────────
 
-/// IP для audit/rate-limit (X-Forwarded-For за nginx).
+/// IP for audit/rate limit (X-Forwarded-For behind nginx).
 fn client_ip(headers: &HeaderMap) -> String {
     headers
         .get("x-forwarded-for")
@@ -60,7 +60,7 @@ fn client_ip(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// Текущий пользователь (full-режим) из Bearer-заголовка.
+/// Current user (full mode) from the Bearer header.
 fn current_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
     if state.auth.mode != AuthMode::Full {
         return Err(auth_disabled());
@@ -72,7 +72,7 @@ fn current_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError>
     }
 }
 
-/// Токены + пользователь (легаси LoginResponse).
+/// Tokens + user (legacy LoginResponse).
 fn login_response(state: &AppState, user: &User) -> Result<Json<Value>, ApiError> {
     let access = state
         .auth
@@ -84,7 +84,7 @@ fn login_response(state: &AppState, user: &User) -> Result<Json<Value>, ApiError
         .jwt
         .create_refresh_token(&user.user_id)
         .map_err(|e| internal(e))?;
-    // Легаси LoginResponse.user — только базовые поля.
+    // Legacy LoginResponse.user — only basic fields.
     let u = json!({
         "user_id": user.user_id,
         "username": user.username,
@@ -99,7 +99,7 @@ fn login_response(state: &AppState, user: &User) -> Result<Json<Value>, ApiError
     })))
 }
 
-/// Одноразовый код (32 байта hex).
+/// One-time code (32 bytes hex).
 fn random_code() -> String {
     let b: [u8; 32] = rand::random();
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -112,7 +112,7 @@ fn sha256_hex(s: &str) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Callback URI Яндекса с учётом прокси (легаси `_yandex_callback_uri`).
+/// Yandex callback URI with proxy awareness (legacy `_yandex_callback_uri`).
 fn yandex_callback_uri(headers: &HeaderMap) -> String {
     let scheme = headers
         .get("x-forwarded-proto")
@@ -183,7 +183,7 @@ pub async fn register(
         return bad("too many groups (max 20)").into_response();
     }
 
-    // AUTH_ENABLED=true → только admin (легаси auth.py:177-198).
+    // AUTH_ENABLED=true → admins only (legacy auth.py:177-198).
     let current = if state.auth.auth_enabled {
         let user = match current_user(state, &headers) {
             Ok(u) => u,
@@ -209,8 +209,8 @@ pub async fn register(
         None
     };
 
-    // Self-escalation: admin-группы назначает только superadmin
-    // (легаси auth.py:202-210).
+    // Self-escalation: only a superadmin may assign admin groups
+    // (legacy auth.py:202-210).
     if state.auth.auth_enabled
         && current.is_some()
         && requested.iter().any(|g| ADMIN_GROUP_NAMES.contains(&g.as_str()))
@@ -369,7 +369,7 @@ pub async fn refresh(
         return Err(forbidden("User account is disabled"));
     }
 
-    // Ротация с детектом replay (легаси auth.py:393-406).
+    // Rotation with replay detection (legacy auth.py:393-406).
     let token_hash = sha256_hex(token);
     if user.last_refresh_token_hash.as_deref() == Some(&token_hash) {
         user.last_refresh_token_hash = None;
@@ -407,8 +407,8 @@ pub async fn logout(
     Ok(Json(json!({"message": "Logged out successfully"})))
 }
 
-/// /me — в full-режиме профиль пользователя; в seat-режиме — сид
-/// (SPA по этому ответу понимает, показывать ли логин).
+/// /me — in full mode the user profile; in seat mode the seat
+/// (the SPA learns from this response whether to show a login).
 pub async fn me(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -473,7 +473,7 @@ pub async fn oauth_yandex_redirect(
     Redirect::to(&url).into_response()
 }
 
-/// Allowlist: правила БД > env (легаси `_check_oauth_access`).
+/// Allowlist: DB rules > env (legacy `_check_oauth_access`).
 async fn oauth_allowlist(
     state: &AppState,
     info: &super::oauth::YandexUserInfo,
@@ -488,8 +488,8 @@ async fn oauth_allowlist(
     None
 }
 
-/// Ошибка OAuth-логина: `NotAllowed(info)` — юзер не в allowlist
-/// (нужен для hint в callback-редиректе).
+/// OAuth login error: `NotAllowed(info)` — the user is not in the
+/// allowlist (needed for the hint in the callback redirect).
 enum OauthError {
     Api(ApiError),
     NotAllowed(super::oauth::YandexUserInfo),
@@ -598,8 +598,8 @@ async fn oauth_login(
     Ok(user)
 }
 
-/// GET /api/auth/oauth/yandex/callback?code&state — код → токены под
-/// одноразовым auth_code → редирект на фронт (легаси auth.py:627-738).
+/// GET /api/auth/oauth/yandex/callback?code&state — code → tokens under a
+/// one-time auth_code → redirect to the frontend (legacy auth.py:627-738).
 pub async fn oauth_yandex_callback(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -623,7 +623,7 @@ pub async fn oauth_yandex_callback(
         Ok(u) => u,
         Err(OauthError::Api(e)) => return e.into_response(),
         Err(OauthError::NotAllowed(info)) => {
-            // Как легаси: deny → редирект на логин с hint (login/email).
+            // As in legacy: deny → redirect to the login with a hint (login/email).
             let hint = info
                 .login
                 .or(info.default_email)
@@ -636,7 +636,7 @@ pub async fn oauth_yandex_callback(
             .into_response();
         }
     };
-    // Токены — только через одноразовый код (никогда в URL).
+    // Tokens — only via a one-time code (never in the URL).
     let access = state.auth.jwt.create_access_token(&user.user_id, &user.username, &user.groups);
     let refresh = state.auth.jwt.create_refresh_token(&user.user_id);
     match (access, refresh) {
@@ -672,8 +672,8 @@ fn urlencode(s: &str) -> String {
         .collect()
 }
 
-/// POST /api/auth/oauth/yandex {code} — SPA-поток, сразу LoginResponse
-/// (легаси auth.py:769-846).
+/// POST /api/auth/oauth/yandex {code} — SPA flow, returns a LoginResponse
+/// right away (legacy auth.py:769-846).
 pub async fn oauth_yandex_code(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -696,7 +696,7 @@ pub async fn oauth_yandex_code(
     }
 }
 
-/// POST /api/auth/exchange {code} — одноразовый код → токены (легаси
+/// POST /api/auth/exchange {code} — one-time code → tokens (legacy
 /// auth.py:741-766).
 pub async fn exchange(
     State(state): State<Arc<AppState>>,
@@ -719,7 +719,7 @@ pub async fn exchange(
     }
 }
 
-// ── admin: users / groups (легаси auth.py:849-934) ─────────────────────
+// ── admin: users / groups (legacy auth.py:849-934) ─────────────────────
 
 fn admin_required(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
     let user = current_user(state, headers)?;
@@ -756,8 +756,8 @@ pub async fn list_users(
     Ok(Json(json!({ "users": users })))
 }
 
-/// PUT /api/auth/users/{user_id}/groups — тело: голый JSON-массив строк
-/// (легаси-кварк).
+/// PUT /api/auth/users/{user_id}/groups — body: a bare JSON array of
+/// strings (legacy quirk).
 pub async fn update_user_groups(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -785,8 +785,8 @@ pub async fn update_user_groups(
     Ok(Json(json!({ "success": true })))
 }
 
-/// PUT /api/auth/users/{user_id}/active?is_active= — query-параметр
-/// (легаси-кварк).
+/// PUT /api/auth/users/{user_id}/active?is_active= — a query parameter
+/// (legacy quirk).
 pub async fn toggle_user_active(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -826,7 +826,7 @@ pub async fn list_groups(
     Ok(Json(json!({ "groups": groups })))
 }
 
-// ── admin: oauth rules (легаси admin.py) ───────────────────────────────
+// ── admin: oauth rules (legacy admin.py) ───────────────────────────────
 
 fn oauth_rule_types() -> [&'static str; 5] {
     ["login", "email", "domain", "ya360_org", "ya360_group"]
@@ -836,7 +836,7 @@ pub async fn oauth_rules_list(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> AuthResult {
-    // Легаси: admin-роуты требуют только аутентификацию (кварк 1:1).
+    // Legacy: admin routes require authentication only (1:1 quirk).
     current_user(state.as_ref(), &headers)?;
     let mut rules = state.auth.store.list_rules();
     rules.sort_by(|a, b| b.created_at.cmp(&a.created_at));

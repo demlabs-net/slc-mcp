@@ -274,7 +274,7 @@ mod tests {
     /// Yield repeatedly so spawned tasks can reach their await points, then
     /// advance the paused clock deterministically.
     async fn yield_a_bit() {
-        for _ in 0..8 {
+        for _ in 0..32 {
             tokio::task::yield_now().await;
         }
     }
@@ -285,11 +285,11 @@ mod tests {
     /// `sleep` late (after some steps already passed): a later step still
     /// advances past its deadline.
     async fn advance_until(total_ms: u64, cond: impl Fn() -> bool) {
-        for _ in 0..40 {
+        for _ in 0..120 {
             if cond() {
                 return;
             }
-            tokio::time::advance(StdDuration::from_millis(total_ms / 40)).await;
+            tokio::time::advance(StdDuration::from_millis(total_ms / 120)).await;
             yield_a_bit().await;
         }
     }
