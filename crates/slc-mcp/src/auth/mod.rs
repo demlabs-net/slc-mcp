@@ -80,7 +80,9 @@ pub struct PendingCode {
 
 impl PendingCodes {
     pub fn new() -> Self {
-        Self { map: Mutex::new(std::collections::HashMap::new()) }
+        Self {
+            map: Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     fn is_expired(created: chrono::DateTime<chrono::Utc>) -> bool {
@@ -125,7 +127,9 @@ impl AuthState {
         let store = Arc::new(store::AuthStore::new(vault_path));
         let jwt = jwt::JwtManager::from_env();
         if mode == AuthMode::Full && jwt.secret == jwt::DEFAULT_SECRET {
-            tracing::warn!("JWT_SECRET_KEY не задан — используется default-секрет (только для dev)");
+            tracing::warn!(
+                "JWT_SECRET_KEY не задан — используется default-секрет (только для dev)"
+            );
         }
         Self {
             mode,

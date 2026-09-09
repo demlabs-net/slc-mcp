@@ -107,8 +107,16 @@ pub struct PredefinedGroup {
 }
 
 pub const PREDEFINED_GROUPS: &[PredefinedGroup] = &[
-    PredefinedGroup { name: "superadmins", group_id: "group_superadmins", permissions: &["*:*"] },
-    PredefinedGroup { name: "admins", group_id: "group_admins", permissions: &["*:*"] },
+    PredefinedGroup {
+        name: "superadmins",
+        group_id: "group_superadmins",
+        permissions: &["*:*"],
+    },
+    PredefinedGroup {
+        name: "admins",
+        group_id: "group_admins",
+        permissions: &["*:*"],
+    },
     PredefinedGroup {
         name: "editors",
         group_id: "group_editors",
@@ -127,7 +135,11 @@ pub const PREDEFINED_GROUPS: &[PredefinedGroup] = &[
         group_id: "group_users",
         permissions: &["kb:read", "tasks:read", "seats:read:own"],
     },
-    PredefinedGroup { name: "viewers", group_id: "group_viewers", permissions: &["kb:read"] },
+    PredefinedGroup {
+        name: "viewers",
+        group_id: "group_viewers",
+        permissions: &["kb:read"],
+    },
 ];
 
 /// Все пермишены группы (легаси `get_user_permissions`, union с дедупом).
@@ -151,7 +163,7 @@ pub fn check_permission(groups: &[String], resource: &str, action: &str) -> bool
     let perms = permissions_for_groups(groups);
     let exact = format!("{resource}:{action}");
     let wildcard = format!("{resource}:*");
-    perms.iter().any(|p| {
-        p == "*:*" || p == &wildcard || p == &exact || p.starts_with(&format!("{exact}:"))
-    })
+    perms
+        .iter()
+        .any(|p| p == "*:*" || p == &wildcard || p == &exact || p.starts_with(&format!("{exact}:")))
 }

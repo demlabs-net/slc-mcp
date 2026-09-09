@@ -98,7 +98,11 @@ impl<S: StorageBackend> NotificationQueue<S> {
         let mut removed = 0;
         for n in all {
             if n.status == "delivered" && n.created_at < cutoff {
-                if self.store.delete_record(COLLECTION, &n.notification_id).await? {
+                if self
+                    .store
+                    .delete_record(COLLECTION, &n.notification_id)
+                    .await?
+                {
                     removed += 1;
                 }
             }
@@ -119,15 +123,28 @@ mod tests {
     use crate::storage::sqlite::SqliteStore;
     use serde_json::json;
 
-    fn queue() -> (NotificationQueue<std::sync::Arc<dyn StorageBackend>>, std::sync::Arc<dyn StorageBackend>) {
-        let store: std::sync::Arc<dyn StorageBackend> = std::sync::Arc::new(SqliteStore::in_memory().unwrap());
+    fn queue() -> (
+        NotificationQueue<std::sync::Arc<dyn StorageBackend>>,
+        std::sync::Arc<dyn StorageBackend>,
+    ) {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(SqliteStore::in_memory().unwrap());
         (NotificationQueue::new(store.clone()), store)
     }
 
     #[tokio::test]
     async fn push_pop_and_count() {
         let (q, _) = queue();
-        let id = q.push("seat_n", "REMINDER", "⏰ Reminder", "Do the thing", Default::default()).await.unwrap();
+        let id = q
+            .push(
+                "seat_n",
+                "REMINDER",
+                "⏰ Reminder",
+                "Do the thing",
+                Default::default(),
+            )
+            .await
+            .unwrap();
         assert!(id.starts_with("ntf_"));
         assert_eq!(q.count_pending("seat_n").await.unwrap(), 1);
 
@@ -141,8 +158,12 @@ mod tests {
     #[tokio::test]
     async fn seat_isolation() {
         let (q, _) = queue();
-        q.push("seat_a", "REMINDER", "t", "b", Default::default()).await.unwrap();
-        q.push("seat_b", "REMINDER", "t", "b", Default::default()).await.unwrap();
+        q.push("seat_a", "REMINDER", "t", "b", Default::default())
+            .await
+            .unwrap();
+        q.push("seat_b", "REMINDER", "t", "b", Default::default())
+            .await
+            .unwrap();
         assert_eq!(q.count_pending("seat_a").await.unwrap(), 1);
         assert_eq!(q.count_pending("seat_b").await.unwrap(), 1);
         let popped = q.pop_pending("seat_a", 5).await.unwrap();
@@ -156,9 +177,18 @@ mod tests {
         let (q, _) = queue();
         let mut meta = serde_json::Map::new();
         meta.insert("reminder_id".into(), json!("rem_abc"));
-        let id = q.push("seat_m", "REMINDER", "t", "b", meta.clone()).await.unwrap();
+        let id = q
+            .push("seat_m", "REMINDER", "t", "b", meta.clone())
+            .await
+            .unwrap();
         let popped = q.pop_pending("seat_m", 5).await.unwrap();
-        assert_eq!(popped[0].metadata.get("reminder_id").and_then(|v| v.as_str()), Some("rem_abc"));
+        assert_eq!(
+            popped[0]
+                .metadata
+                .get("reminder_id")
+                .and_then(|v| v.as_str()),
+            Some("rem_abc")
+        );
         assert_eq!(id, popped[0].notification_id);
         assert_eq!(q.cleanup("seat_m", TTL_SECONDS).await.unwrap(), 0);
     }

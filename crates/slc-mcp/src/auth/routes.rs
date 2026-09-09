@@ -2,21 +2,19 @@
 //! auth-часть `src/api/routes/admin.py`. В seat-режиме (SLC_AUTH=seat)
 //! auth-роуты отвечают 404, кроме `/me` (SPA определяет режим).
 
-use super::{
-    AuthMode, audit_id_new, bearer_from, rule_id_new, user_has_permission, user_id_new,
-    user_is_admin, user_is_superadmin, PendingCode,
-};
-use super::models::{
-    ADMIN_GROUP_NAMES, AuditEntry, OAuthAccessRule, User, permissions_for_groups,
-};
+use super::models::{ADMIN_GROUP_NAMES, AuditEntry, OAuthAccessRule, User, permissions_for_groups};
 use super::store::AuthStore;
+use super::{
+    AuthMode, PendingCode, audit_id_new, bearer_from, rule_id_new, user_has_permission,
+    user_id_new, user_is_admin, user_is_superadmin,
+};
 use crate::server::AppState;
 use crate::webui::api::ApiError;
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
-    Json,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -167,7 +165,11 @@ pub async fn register(
     let requested: Vec<String> = body
         .get("groups")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     if !(3..=50).contains(&username.chars().count()) {
@@ -213,7 +215,9 @@ pub async fn register(
     // (легаси auth.py:202-210).
     if state.auth.auth_enabled
         && current.is_some()
-        && requested.iter().any(|g| ADMIN_GROUP_NAMES.contains(&g.as_str()))
+        && requested
+            .iter()
+            .any(|g| ADMIN_GROUP_NAMES.contains(&g.as_str()))
         && !user_is_superadmin(current.as_ref().unwrap())
     {
         return forbidden("Only superadmins can assign admin/superadmin groups").into_response();
@@ -227,7 +231,11 @@ pub async fn register(
         return bad("Email already exists").into_response();
     }
 
-    let groups = if requested.is_empty() { vec!["users".into()] } else { requested };
+    let groups = if requested.is_empty() {
+        vec!["users".into()]
+    } else {
+        requested
+    };
     let now = chrono::Utc::now();
     let user = User {
         user_id: user_id_new(),
@@ -350,19 +358,24 @@ pub async fn login(
     }
 }
 
-pub async fn refresh(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> AuthResult {
+pub async fn refresh(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> AuthResult {
     if state.auth.mode != AuthMode::Full {
         return Err(auth_disabled());
     }
-    let token = body.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("");
+    let token = body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let user_id = match state.auth.jwt.verify_refresh(token) {
         Ok(id) => id,
         Err(_) => return Err(unauthorized("Invalid refresh token")),
     };
-    let Some(mut user) = state.auth.store.get_user(&user_id).map_err(|e| internal(e.to_string()))? else {
+    let Some(mut user) = state
+        .auth
+        .store
+        .get_user(&user_id)
+        .map_err(|e| internal(e.to_string()))?
+    else {
         return Err(unauthorized("User not found"));
     };
     if !user.is_active {
@@ -374,7 +387,9 @@ pub async fn refresh(
     if user.last_refresh_token_hash.as_deref() == Some(&token_hash) {
         user.last_refresh_token_hash = None;
         let _ = state.auth.store.update_user(&user);
-        return Err(unauthorized("Refresh token reuse detected. Please login again."));
+        return Err(unauthorized(
+            "Refresh token reuse detected. Please login again.",
+        ));
     }
     let new_refresh = state
         .auth
@@ -383,14 +398,15 @@ pub async fn refresh(
         .map_err(|e| internal(e))?;
     user.last_refresh_token_hash = Some(sha256_hex(&new_refresh));
     user.updated_at = chrono::Utc::now();
-    state.auth.store.update_user(&user).map_err(|e| internal(e.to_string()))?;
+    state
+        .auth
+        .store
+        .update_user(&user)
+        .map_err(|e| internal(e.to_string()))?;
     login_response(&state, &user)
 }
 
-pub async fn logout(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> AuthResult {
+pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AuthResult {
     let user = current_user(state.as_ref(), &headers)?;
     let _ = state.auth.store.append_audit(&AuditEntry {
         log_id: audit_id_new(),
@@ -409,10 +425,7 @@ pub async fn logout(
 
 /// /me — в full-режиме профиль пользователя; в seat-режиме — сид
 /// (SPA по этому ответу понимает, показывать ли логин).
-pub async fn me(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if state.auth.mode != AuthMode::Full {
         let seat = match crate::webui::api::resolve_seat(state.as_ref(), &headers).await {
             Ok((seat, _)) => seat,
@@ -466,7 +479,11 @@ pub async fn oauth_yandex_redirect(
     let csrf = random_code();
     state.auth.pending.put(
         csrf.clone(),
-        PendingCode { created_at: chrono::Utc::now(), access_token: None, refresh_token: None },
+        PendingCode {
+            created_at: chrono::Utc::now(),
+            access_token: None,
+            refresh_token: None,
+        },
     );
     let uri = yandex_callback_uri(&headers);
     let url = state.auth.oauth.get_authorize_url(&csrf, &uri);
@@ -521,7 +538,10 @@ async fn oauth_login(
         .map_err(|e| bad(format!("Failed to get user info from Yandex: {e}")))?;
 
     let login = info.login.clone().unwrap_or_default();
-    let email = info.default_email.clone().unwrap_or_else(|| format!("{login}@yandex.ru"));
+    let email = info
+        .default_email
+        .clone()
+        .unwrap_or_else(|| format!("{login}@yandex.ru"));
     let ip = client_ip(headers);
 
     let Some(groups) = oauth_allowlist(state, &info).await else {
@@ -560,7 +580,11 @@ async fn oauth_login(
             if avatar_url.is_some() {
                 u.avatar_url = avatar_url;
             }
-            state.auth.store.update_user(&u).map_err(|e| internal(e.to_string()))?;
+            state
+                .auth
+                .store
+                .update_user(&u)
+                .map_err(|e| internal(e.to_string()))?;
             u
         }
         None => {
@@ -579,7 +603,11 @@ async fn oauth_login(
                 last_login: Some(now),
                 last_refresh_token_hash: None,
             };
-            state.auth.store.insert_user(&u).map_err(|e| internal(e.to_string()))?;
+            state
+                .auth
+                .store
+                .insert_user(&u)
+                .map_err(|e| internal(e.to_string()))?;
             u
         }
     };
@@ -592,7 +620,10 @@ async fn oauth_login(
         success: true,
         ip_address: Some(ip),
         user_agent: None,
-        metadata: json!({"provider": "yandex"}).as_object().cloned().unwrap_or_default(),
+        metadata: json!({"provider": "yandex"})
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
         timestamp: chrono::Utc::now(),
     });
     Ok(user)
@@ -624,10 +655,7 @@ pub async fn oauth_yandex_callback(
         Err(OauthError::Api(e)) => return e.into_response(),
         Err(OauthError::NotAllowed(info)) => {
             // Как легаси: deny → редирект на логин с hint (login/email).
-            let hint = info
-                .login
-                .or(info.default_email)
-                .unwrap_or_default();
+            let hint = info.login.or(info.default_email).unwrap_or_default();
             return Redirect::to(&format!(
                 "{}/#/login?error=access_denied&hint={}",
                 frontend_base(&headers),
@@ -637,7 +665,10 @@ pub async fn oauth_yandex_callback(
         }
     };
     // Токены — только через одноразовый код (никогда в URL).
-    let access = state.auth.jwt.create_access_token(&user.user_id, &user.username, &user.groups);
+    let access = state
+        .auth
+        .jwt
+        .create_access_token(&user.user_id, &user.username, &user.groups);
     let refresh = state.auth.jwt.create_refresh_token(&user.user_id);
     match (access, refresh) {
         (Ok(a), Ok(r)) => {
@@ -650,10 +681,17 @@ pub async fn oauth_yandex_callback(
                     refresh_token: Some(r),
                 },
             );
-            Redirect::to(&format!("{}/?auth_code={auth_code}", frontend_base(&headers)))
-                .into_response()
+            Redirect::to(&format!(
+                "{}/?auth_code={auth_code}",
+                frontend_base(&headers)
+            ))
+            .into_response()
         }
-        _ => ApiError(StatusCode::INTERNAL_SERVER_ERROR, "token creation failed".into()).into_response(),
+        _ => ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "token creation failed".into(),
+        )
+        .into_response(),
     }
 }
 
@@ -698,10 +736,7 @@ pub async fn oauth_yandex_code(
 
 /// POST /api/auth/exchange {code} — одноразовый код → токены (легаси
 /// auth.py:741-766).
-pub async fn exchange(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> AuthResult {
+pub async fn exchange(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> AuthResult {
     if state.auth.mode != AuthMode::Full {
         return Err(auth_disabled());
     }
@@ -729,10 +764,7 @@ fn admin_required(state: &AppState, headers: &HeaderMap) -> Result<User, ApiErro
     Ok(user)
 }
 
-pub async fn list_users(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> AuthResult {
+pub async fn list_users(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AuthResult {
     admin_required(state.as_ref(), &headers)?;
     let users: Vec<Value> = state
         .auth
@@ -767,21 +799,37 @@ pub async fn update_user_groups(
     let actor = current_user(state.as_ref(), &headers)?;
     let groups: Vec<String> = body
         .as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-    if groups.iter().any(|g| ADMIN_GROUP_NAMES.contains(&g.as_str())) {
+    if groups
+        .iter()
+        .any(|g| ADMIN_GROUP_NAMES.contains(&g.as_str()))
+    {
         if !user_is_superadmin(&actor) {
             return Err(forbidden("Only superadmins can assign admin groups"));
         }
     } else if !user_has_permission(&actor, "admin", "write") {
         return Err(forbidden("Admin access required"));
     }
-    let Some(mut user) = state.auth.store.get_user(&user_id).map_err(|e| internal(e.to_string()))? else {
+    let Some(mut user) = state
+        .auth
+        .store
+        .get_user(&user_id)
+        .map_err(|e| internal(e.to_string()))?
+    else {
         return Err(not_found("User not found"));
     };
     user.groups = groups;
     user.updated_at = chrono::Utc::now();
-    state.auth.store.update_user(&user).map_err(|e| internal(e.to_string()))?;
+    state
+        .auth
+        .store
+        .update_user(&user)
+        .map_err(|e| internal(e.to_string()))?;
     Ok(Json(json!({ "success": true })))
 }
 
@@ -798,19 +846,25 @@ pub async fn toggle_user_active(
         return Err(forbidden("Admin access required"));
     }
     let is_active = q.get("is_active").map(|v| v == "true").unwrap_or(false);
-    let Some(mut user) = state.auth.store.get_user(&user_id).map_err(|e| internal(e.to_string()))? else {
+    let Some(mut user) = state
+        .auth
+        .store
+        .get_user(&user_id)
+        .map_err(|e| internal(e.to_string()))?
+    else {
         return Err(not_found("User not found"));
     };
     user.is_active = is_active;
     user.updated_at = chrono::Utc::now();
-    state.auth.store.update_user(&user).map_err(|e| internal(e.to_string()))?;
+    state
+        .auth
+        .store
+        .update_user(&user)
+        .map_err(|e| internal(e.to_string()))?;
     Ok(Json(json!({ "success": true })))
 }
 
-pub async fn list_groups(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> AuthResult {
+pub async fn list_groups(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AuthResult {
     admin_required(state.as_ref(), &headers)?;
     let groups: Vec<Value> = super::models::PREDEFINED_GROUPS
         .iter()
@@ -857,18 +911,34 @@ pub async fn oauth_rule_create(
         Err(e) => return e.into_response(),
     };
     let rule_type = body.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    let value = body.get("value").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+    let value = body
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
     let default_groups: Vec<String> = body
         .get("default_groups")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .filter(|v: &Vec<String>| !v.is_empty())
         .unwrap_or_else(|| vec!["users".into()]);
-    let description = body.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let description = body
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     if !oauth_rule_types().contains(&rule_type) {
-        return bad(format!("type must be one of: {}", oauth_rule_types().join(", ")))
-            .into_response();
+        return bad(format!(
+            "type must be one of: {}",
+            oauth_rule_types().join(", ")
+        ))
+        .into_response();
     }
     if value.is_empty() {
         return bad("value required").into_response();
@@ -909,14 +979,27 @@ pub async fn oauth_rule_update(
 ) -> AuthResult {
     current_user(state.as_ref(), &headers)?;
     let rule_type = body.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    let value = body.get("value").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+    let value = body
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
     let default_groups: Vec<String> = body
         .get("default_groups")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .filter(|v: &Vec<String>| !v.is_empty())
         .unwrap_or_else(|| vec!["users".into()]);
-    let description = body.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let description = body
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     if !oauth_rule_types().contains(&rule_type) || value.is_empty() {
         return Err(bad("invalid rule"));
     }
@@ -961,10 +1044,7 @@ pub async fn oauth_rule_delete(
     Ok(Json(json!({ "deleted": true, "rule_id": rule_id })))
 }
 
-pub async fn ya360_status(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> AuthResult {
+pub async fn ya360_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> AuthResult {
     current_user(state.as_ref(), &headers)?;
     let y360 = state.auth.oauth.y360.as_ref();
     Ok(Json(json!({

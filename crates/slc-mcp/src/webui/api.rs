@@ -39,6 +39,20 @@ fn forbidden(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::FORBIDDEN, msg.into())
 }
 
+/// HTTP-статус для типизированной ошибки движка (задачи/документы):
+/// реальное «не найдено» — 404, чужие объекты без прав — 403, невалидный
+/// ввод (workflow append-only и т.п.) — 400, лимиты — 409.
+fn slc_error_status(error: &slc_core::SlcError) -> StatusCode {
+    use slc_core::SlcError;
+    match error {
+        SlcError::NotFound(_) => StatusCode::NOT_FOUND,
+        SlcError::PermissionDenied(_) => StatusCode::FORBIDDEN,
+        SlcError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        SlcError::Limit(_) => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 /// Seat-id запроса.
 /// - full-режим (SLC_AUTH=full): Bearer-JWT → пользователь → сид
 ///   `user_<user_id>` (persistent); без валидного токена — 401.
@@ -66,6 +80,35 @@ pub async fn resolve_seat(
             .await
             .map_err(|e| internal(e.to_string()))?;
         return Ok((seat_id, None));
+    }
+    // An enabled seat-token registry must not be bypassed via the REST API's
+    // legacy header/cookie identity path. Full web authentication above keeps
+    // its independent JWT identity; seat mode uses the same bound MCP bearer.
+    if std::env::var_os("SLC_MCP_SEAT_TOKENS").is_some() {
+        let seat = headers
+            .get("x-seat-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
+        let authorization = bearer_from(headers);
+        let token = authorization
+            .as_deref()
+            .and_then(|v| v.strip_prefix("Bearer "));
+        let principal = slc_core::authenticate(slc_core::AuthMode::BearerPlusSeat, seat, token)
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid authentication credentials".into(),
+                )
+            })?;
+        state
+            .engine
+            .seats
+            .ensure_seat(&principal.seat_id)
+            .await
+            .map_err(|e| internal(e.to_string()))?;
+        return Ok((principal.seat_id, None));
     }
     let seat_id = if let Some(v) = headers.get("x-seat-id").and_then(|v| v.to_str().ok()) {
         if !v.trim().is_empty() {
@@ -706,14 +749,11 @@ pub async fn update_task(
         )
         .await
     {
-        Ok(Some(_)) => {
+        Ok(_) => {
             let _ = state.engine.reembed_document(&id).await;
             with_seat_cookie(Json(json!({"success": true, "task_id": id})), cookie)
         }
-        Ok(None) => {
-            ApiError(StatusCode::NOT_FOUND, format!("task not found: {id}")).into_response()
-        }
-        Err(e) => internal(e.to_string()).into_response(),
+        Err(e) => ApiError(slc_error_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -733,7 +773,7 @@ pub async fn delete_task(
             ),
             cookie,
         ),
-        Err(e) => internal(e.to_string()).into_response(),
+        Err(e) => ApiError(slc_error_status(&e), e.to_string()).into_response(),
     }
 }
 

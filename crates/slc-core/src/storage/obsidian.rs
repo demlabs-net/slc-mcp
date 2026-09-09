@@ -27,18 +27,18 @@
 use super::{DocFilter, DocSort, MetaPatch, SortDir, StorageBackend};
 use crate::error::{SlcError, SlcResult};
 use crate::model::{
-    content_hash, Document, DocumentCategory, EmbeddingRecord, EmbeddingScope,
-    PersistedTimer, Seat, SeatStatus,
+    Document, DocumentCategory, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat, SeatStatus,
+    content_hash,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GIT_INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
@@ -75,11 +75,7 @@ fn atomic_replace(temp_dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result
         .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "invalid vault file name"))?;
     for _ in 0..32 {
         let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = temp_dir.join(format!(
-            "{file_name}.{}.{}",
-            std::process::id(),
-            sequence
-        ));
+        let temporary = temp_dir.join(format!("{file_name}.{}.{}", std::process::id(), sequence));
         let mut file = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -233,10 +229,7 @@ fn run_vault_git_commit(root: &Path, author: &str) {
             .output()
     };
     let failed = |out: &std::process::Output| {
-        tracing::warn!(
-            "vault git: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        tracing::warn!("vault git: {}", String::from_utf8_lossy(&out.stderr).trim());
     };
     // Existing vaults may already track the derived caches. Removing them
     // from the index is non-destructive (`--cached`) and, together with the
@@ -352,17 +345,23 @@ pub fn sanitize_folder(folder: &str) -> SlcResult<String> {
         return Err(SlcError::Storage("folder must not be empty".into()));
     }
     if folder.starts_with('/') {
-        return Err(SlcError::Storage(format!("folder must be relative to the vault: {folder}")));
+        return Err(SlcError::Storage(format!(
+            "folder must be relative to the vault: {folder}"
+        )));
     }
     for part in folder.split('/') {
         if part.is_empty() || part == "." || part == ".." {
-            return Err(SlcError::Storage(format!("folder contains an invalid component: {folder}")));
+            return Err(SlcError::Storage(format!(
+                "folder contains an invalid component: {folder}"
+            )));
         }
         if part
             .chars()
             .any(|c| c.is_control() || matches!(c, '\\' | ':'))
         {
-            return Err(SlcError::Storage(format!("folder contains invalid characters: {folder}")));
+            return Err(SlcError::Storage(format!(
+                "folder contains invalid characters: {folder}"
+            )));
         }
     }
     Ok(folder.to_string())
@@ -430,9 +429,7 @@ impl IndexEntry {
                 .extra
                 .iter()
                 .filter_map(|(key, value)| {
-                    value
-                        .as_str()
-                        .map(|value| (key.clone(), value.to_string()))
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
                 })
                 .collect(),
             archived: doc.metadata.archived,
@@ -481,9 +478,10 @@ impl IndexEntry {
                 return false;
             }
         }
-        if f.extra_strings.iter().any(|(key, expected)| {
-            self.extra_strings.get(key) != Some(expected)
-        }) {
+        if f.extra_strings
+            .iter()
+            .any(|(key, expected)| self.extra_strings.get(key) != Some(expected))
+        {
             return false;
         }
         if f.extra_strings_not_in.iter().any(|(key, excluded)| {
@@ -658,7 +656,10 @@ impl ObsidianVaultStore {
                             .and_then(|v| v.as_str())
                             .unwrap_or("custom")
                             .to_string(),
-                        seat_id: meta.get("seat_id").and_then(|v| v.as_str()).map(String::from),
+                        seat_id: meta
+                            .get("seat_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
                         doc_level: meta
                             .get("metadata")
                             .and_then(|m| m.get("doc_level"))
@@ -676,9 +677,7 @@ impl ObsidianVaultStore {
                                 extra
                                     .iter()
                                     .filter_map(|(key, value)| {
-                                        value
-                                            .as_str()
-                                            .map(|value| (key.clone(), value.to_string()))
+                                        value.as_str().map(|value| (key.clone(), value.to_string()))
                                     })
                                     .collect()
                             })
@@ -700,7 +699,9 @@ impl ObsidianVaultStore {
                             .get("tags")
                             .and_then(|v| v.as_array())
                             .map(|a| {
-                                a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
                             })
                             .unwrap_or_default(),
                         created_at: meta
@@ -732,7 +733,8 @@ impl ObsidianVaultStore {
                             } else if explicit_id.is_some() && slot.get().explicit_id {
                                 return Err(SlcError::Storage(format!(
                                     "duplicate document id {id} in vault folders {:?} and {:?}",
-                                    slot.get().folder, entry.folder
+                                    slot.get().folder,
+                                    entry.folder
                                 )));
                             }
                             // производный id уже занят: оставляем первый файл
@@ -819,7 +821,10 @@ impl ObsidianVaultStore {
     }
 
     fn persist_seat(&self, seat: &Seat) -> SlcResult<()> {
-        let path = self.root.join("seats").join(format!("{}.json", safe_file_name(&seat.seat_id)));
+        let path = self
+            .root
+            .join("seats")
+            .join(format!("{}.json", safe_file_name(&seat.seat_id)));
         let text = serde_json::to_string_pretty(seat)?;
         self.atomic_write(&path, text.as_bytes())?;
         Ok(())
@@ -854,7 +859,10 @@ impl ObsidianVaultStore {
                 }
             }
         }
-        self.index.lock().unwrap().insert(doc.document_id.clone(), IndexEntry::from_doc(doc));
+        self.index
+            .lock()
+            .unwrap()
+            .insert(doc.document_id.clone(), IndexEntry::from_doc(doc));
         self.persist_index()?;
         Ok(())
     }
@@ -872,12 +880,21 @@ impl ObsidianVaultStore {
         let text = std::fs::read_to_string(&path)?;
         let (meta, body) = frontmatter_parse(&text);
         let meta = meta.unwrap_or_default();
-        let metadata: crate::model::DocMeta =
-            meta.get("metadata").cloned().map(|m| serde_json::from_value(m).unwrap_or_default()).unwrap_or_default();
+        let metadata: crate::model::DocMeta = meta
+            .get("metadata")
+            .cloned()
+            .map(|m| serde_json::from_value(m).unwrap_or_default())
+            .unwrap_or_default();
         Ok(Document {
-            document_id: meta.get("id").and_then(|v| v.as_str()).unwrap_or(&entry.id).to_string(),
+            document_id: meta
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&entry.id)
+                .to_string(),
             category: DocumentCategory::parse(
-                meta.get("category").and_then(|v| v.as_str()).unwrap_or("custom"),
+                meta.get("category")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("custom"),
             )
             .unwrap_or(DocumentCategory::Custom),
             folder: Some(entry.folder.clone()),
@@ -888,20 +905,58 @@ impl ObsidianVaultStore {
                 .unwrap_or("")
                 .to_string(),
             metadata,
-            tags: meta.get("tags").and_then(|v| v.as_array()).map(|a| {
-                a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-            }).unwrap_or_default(),
-            auto_load: meta.get("auto_load").and_then(|v| v.as_array()).map(|a| {
-                a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-            }).unwrap_or_default(),
-            references: meta.get("references").and_then(|v| v.as_array()).map(|a| {
-                a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-            }).unwrap_or_default(),
-            seat_id: meta.get("seat_id").and_then(|v| v.as_str()).map(String::from),
-            created_at: meta.get("created_at").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&Utc)).unwrap_or_else(Utc::now),
-            updated_at: meta.get("updated_at").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&Utc)).unwrap_or_else(Utc::now),
-            version: meta.get("version").and_then(|v| v.as_i64()).unwrap_or(entry.version),
-            deleted_at: meta.get("deleted_at").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&Utc)),
+            tags: meta
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            auto_load: meta
+                .get("auto_load")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            references: meta
+                .get("references")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            seat_id: meta
+                .get("seat_id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            created_at: meta
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now),
+            updated_at: meta
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now),
+            version: meta
+                .get("version")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(entry.version),
+            deleted_at: meta
+                .get("deleted_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&Utc)),
         })
     }
 
@@ -952,10 +1007,7 @@ impl ObsidianVaultStore {
             return;
         }
         self.git_commit_dirty.store(true, Ordering::Release);
-        if self
-            .git_commit_worker_active
-            .swap(true, Ordering::AcqRel)
-        {
+        if self.git_commit_worker_active.swap(true, Ordering::AcqRel) {
             return;
         }
         let root = self.root.clone();
@@ -1024,7 +1076,10 @@ pub fn render_doc(doc: &Document) -> SlcResult<String> {
     meta.insert("created_at".into(), json!(doc.created_at.to_rfc3339()));
     meta.insert("updated_at".into(), json!(doc.updated_at.to_rfc3339()));
     meta.insert("version".into(), json!(doc.version));
-    meta.insert("deleted_at".into(), json!(doc.deleted_at.map(|d| d.to_rfc3339())));
+    meta.insert(
+        "deleted_at".into(),
+        json!(doc.deleted_at.map(|d| d.to_rfc3339())),
+    );
     let yaml = serde_yaml::to_string(&meta).map_err(|e| SlcError::Parse(e.to_string()))?;
     Ok(format!("---\n{yaml}---\n\n{}\n", doc.content))
 }
@@ -1035,10 +1090,15 @@ pub fn render_doc(doc: &Document) -> SlcResult<String> {
 impl StorageBackend for ObsidianVaultStore {
     async fn kb_insert(&self, doc: &Document) -> SlcResult<()> {
         if !doc.category.is_kb() {
-            return Err(SlcError::Storage("history docs go to the episodic store, not the KB".into()));
+            return Err(SlcError::Storage(
+                "history docs go to the episodic store, not the KB".into(),
+            ));
         }
         if self.index.lock().unwrap().contains_key(&doc.document_id) {
-            return Err(SlcError::Storage(format!("document already exists: {}", doc.document_id)));
+            return Err(SlcError::Storage(format!(
+                "document already exists: {}",
+                doc.document_id
+            )));
         }
         let doc = doc.clone();
         self.write_note(&doc)?;
@@ -1080,7 +1140,9 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn kb_replace(&self, doc: &Document) -> SlcResult<bool> {
         if !doc.category.is_kb() {
-            return Err(SlcError::Storage("history docs go to the episodic store, not the KB".into()));
+            return Err(SlcError::Storage(
+                "history docs go to the episodic store, not the KB".into(),
+            ));
         }
         let exists = self.index.lock().unwrap().contains_key(&doc.document_id);
         let doc = doc.clone();
@@ -1089,7 +1151,12 @@ impl StorageBackend for ObsidianVaultStore {
         Ok(exists)
     }
 
-    async fn kb_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>> {
+    async fn kb_find(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+        limit: usize,
+    ) -> SlcResult<Vec<Document>> {
         let entries = self.select(Table::Kb, filter, sort, limit);
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
@@ -1099,7 +1166,9 @@ impl StorageBackend for ObsidianVaultStore {
     }
 
     async fn kb_count(&self, filter: &DocFilter) -> SlcResult<u64> {
-        Ok(self.select(Table::Kb, filter, &DocSort::default(), usize::MAX).len() as u64)
+        Ok(self
+            .select(Table::Kb, filter, &DocSort::default(), usize::MAX)
+            .len() as u64)
     }
 
     async fn kb_patch_meta(&self, filter: &DocFilter, patch: &MetaPatch) -> SlcResult<usize> {
@@ -1203,7 +1272,9 @@ impl StorageBackend for ObsidianVaultStore {
     async fn kb_purge(&self, document_id: &str) -> SlcResult<bool> {
         let entry = self.index.lock().unwrap().remove(document_id);
         let Some(e) = entry else { return Ok(false) };
-        let path = self.root.join(&sanitize_folder(&e.folder)?)
+        let path = self
+            .root
+            .join(&sanitize_folder(&e.folder)?)
             .join(format!("{}.md", safe_file_name(&e.id)));
         let _ = tokio::fs::remove_file(path).await;
         self.delete_embeddings(document_id).await?;
@@ -1214,7 +1285,15 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn kb_graveyard(&self, days: Option<i64>) -> SlcResult<Vec<Document>> {
         let cutoff = days.map(|d| Utc::now() - chrono::Duration::days(d));
-        let entries = self.select(Table::Kb, &DocFilter { deleted: true, ..Default::default() }, &DocSort::default(), usize::MAX);
+        let entries = self.select(
+            Table::Kb,
+            &DocFilter {
+                deleted: true,
+                ..Default::default()
+            },
+            &DocSort::default(),
+            usize::MAX,
+        );
         let mut out = Vec::new();
         for e in entries {
             let doc = self.read_note(&e)?;
@@ -1242,12 +1321,17 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn episodic_insert(&self, doc: &Document) -> SlcResult<()> {
         if doc.category != DocumentCategory::History {
-            return Err(SlcError::Storage("only history docs go to the episodic store".into()));
+            return Err(SlcError::Storage(
+                "only history docs go to the episodic store".into(),
+            ));
         }
         // Seat-less episodic docs are allowed (legacy import): they are not
         // picked up by any per-seat pipeline, just stored as diary.
         if self.index.lock().unwrap().contains_key(&doc.document_id) {
-            return Err(SlcError::Storage(format!("document already exists: {}", doc.document_id)));
+            return Err(SlcError::Storage(format!(
+                "document already exists: {}",
+                doc.document_id
+            )));
         }
         let doc = doc.clone();
         self.write_note(&doc)?;
@@ -1257,7 +1341,9 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn episodic_upsert(&self, doc: &Document) -> SlcResult<bool> {
         if doc.category != DocumentCategory::History {
-            return Err(SlcError::Storage("only history docs go to the episodic store".into()));
+            return Err(SlcError::Storage(
+                "only history docs go to the episodic store".into(),
+            ));
         }
         if self.index.lock().unwrap().contains_key(&doc.document_id) {
             self.write_note(doc)?;
@@ -1268,7 +1354,12 @@ impl StorageBackend for ObsidianVaultStore {
         Ok(false)
     }
 
-    async fn episodic_find(&self, filter: &DocFilter, sort: &DocSort, limit: usize) -> SlcResult<Vec<Document>> {
+    async fn episodic_find(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+        limit: usize,
+    ) -> SlcResult<Vec<Document>> {
         let entries = self.select(Table::Episodic, filter, sort, limit);
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
@@ -1278,7 +1369,9 @@ impl StorageBackend for ObsidianVaultStore {
     }
 
     async fn episodic_count(&self, filter: &DocFilter) -> SlcResult<u64> {
-        Ok(self.select(Table::Episodic, filter, &DocSort::default(), usize::MAX).len() as u64)
+        Ok(self
+            .select(Table::Episodic, filter, &DocSort::default(), usize::MAX)
+            .len() as u64)
     }
 
     async fn episodic_patch_meta(&self, filter: &DocFilter, patch: &MetaPatch) -> SlcResult<usize> {
@@ -1308,7 +1401,9 @@ impl StorageBackend for ObsidianVaultStore {
     async fn episodic_purge(&self, document_id: &str) -> SlcResult<bool> {
         let entry = self.index.lock().unwrap().remove(document_id);
         let Some(e) = entry else { return Ok(false) };
-        let path = self.root.join(&sanitize_folder(&e.folder)?)
+        let path = self
+            .root
+            .join(&sanitize_folder(&e.folder)?)
             .join(format!("{}.md", safe_file_name(&e.id)));
         let _ = tokio::fs::remove_file(path).await;
         self.persist_index()?;
@@ -1322,7 +1417,9 @@ impl StorageBackend for ObsidianVaultStore {
         {
             let mut map = self.embeddings.lock().unwrap();
             for r in records {
-                map.entry(r.document_id.clone()).or_default().push(r.clone());
+                map.entry(r.document_id.clone())
+                    .or_default()
+                    .push(r.clone());
             }
         }
         self.persist_embeddings()?;
@@ -1332,7 +1429,10 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn get_embedding(&self, document_id: &str) -> SlcResult<Option<Vec<f32>>> {
         let map = self.embeddings.lock().unwrap();
-        Ok(map.get(document_id).and_then(|chunks| chunks.first()).map(|c| c.embedding.clone()))
+        Ok(map
+            .get(document_id)
+            .and_then(|chunks| chunks.first())
+            .map(|c| c.embedding.clone()))
     }
 
     async fn get_all_chunks(&self, document_id: &str) -> SlcResult<Vec<EmbeddingRecord>> {
@@ -1340,7 +1440,11 @@ impl StorageBackend for ObsidianVaultStore {
         Ok(map.get(document_id).cloned().unwrap_or_default())
     }
 
-    async fn all_embeddings(&self, scope: EmbeddingScope, seat_id: Option<&str>) -> SlcResult<Vec<EmbeddingRecord>> {
+    async fn all_embeddings(
+        &self,
+        scope: EmbeddingScope,
+        seat_id: Option<&str>,
+    ) -> SlcResult<Vec<EmbeddingRecord>> {
         let map = self.embeddings.lock().unwrap();
         let mut out = Vec::new();
         for chunks in map.values() {
@@ -1369,7 +1473,10 @@ impl StorageBackend for ObsidianVaultStore {
     // ── seats ───────────────────────────────────────────────────
 
     async fn insert_seat(&self, seat: &Seat) -> SlcResult<()> {
-        self.seats.lock().unwrap().insert(seat.seat_id.clone(), seat.clone());
+        self.seats
+            .lock()
+            .unwrap()
+            .insert(seat.seat_id.clone(), seat.clone());
         self.persist_seat(seat)?;
         self.git_commit();
         Ok(())
@@ -1396,7 +1503,9 @@ impl StorageBackend for ObsidianVaultStore {
     async fn touch_seat(&self, seat_id: &str) -> SlcResult<bool> {
         let seat = {
             let mut seats = self.seats.lock().unwrap();
-            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            let Some(seat) = seats.get_mut(seat_id) else {
+                return Ok(false);
+            };
             let now = Utc::now();
             // Authentication touches every tool call. Persisting and pushing
             // each one makes a read-only request unexpectedly expensive, so
@@ -1415,7 +1524,9 @@ impl StorageBackend for ObsidianVaultStore {
     async fn set_seat_status(&self, seat_id: &str, status: SeatStatus) -> SlcResult<bool> {
         let seat = {
             let mut seats = self.seats.lock().unwrap();
-            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            let Some(seat) = seats.get_mut(seat_id) else {
+                return Ok(false);
+            };
             seat.status = status;
             seat.clone()
         };
@@ -1427,7 +1538,9 @@ impl StorageBackend for ObsidianVaultStore {
     async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
         let seat = {
             let mut seats = self.seats.lock().unwrap();
-            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            let Some(seat) = seats.get_mut(seat_id) else {
+                return Ok(false);
+            };
             seat.active_task_id = Some(task_id.into());
             // Task activation is document activation too (unified anchor).
             seat.active_document_id = Some(task_id.into());
@@ -1438,10 +1551,16 @@ impl StorageBackend for ObsidianVaultStore {
         Ok(true)
     }
 
-    async fn set_seat_active_document(&self, seat_id: &str, document_id: Option<&str>) -> SlcResult<bool> {
+    async fn set_seat_active_document(
+        &self,
+        seat_id: &str,
+        document_id: Option<&str>,
+    ) -> SlcResult<bool> {
         let seat = {
             let mut seats = self.seats.lock().unwrap();
-            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            let Some(seat) = seats.get_mut(seat_id) else {
+                return Ok(false);
+            };
             seat.active_document_id = document_id.map(String::from);
             seat.clone()
         };
@@ -1452,19 +1571,39 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn get_seat_active_document(&self, seat_id: &str) -> SlcResult<Option<String>> {
         let seats = self.seats.lock().unwrap();
-        let Some(seat) = seats.get(seat_id) else { return Ok(None) };
+        let Some(seat) = seats.get(seat_id) else {
+            return Ok(None);
+        };
         // Unified field first; fall back to the legacy task pointer.
-        Ok(seat.active_document_id.clone().or_else(|| seat.active_task_id.clone()))
+        Ok(seat
+            .active_document_id
+            .clone()
+            .or_else(|| seat.active_task_id.clone()))
     }
 
-    async fn incr_seat_stats(&self, seat_id: &str, tool_name: &str, tokens_used: i64) -> SlcResult<bool> {
+    async fn incr_seat_stats(
+        &self,
+        seat_id: &str,
+        tool_name: &str,
+        tokens_used: i64,
+    ) -> SlcResult<bool> {
         let seat = {
             let mut seats = self.seats.lock().unwrap();
-            let Some(seat) = seats.get_mut(seat_id) else { return Ok(false) };
+            let Some(seat) = seats.get_mut(seat_id) else {
+                return Ok(false);
+            };
             seat.usage_stats.total_requests += 1;
             seat.usage_stats.total_tokens += tokens_used;
-            let count = seat.usage_stats.tools_used.get(tool_name).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
-            seat.usage_stats.tools_used.insert(tool_name.into(), json!(count));
+            let count = seat
+                .usage_stats
+                .tools_used
+                .get(tool_name)
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                + 1;
+            seat.usage_stats
+                .tools_used
+                .insert(tool_name.into(), json!(count));
             seat.last_accessed = Utc::now();
             seat.clone()
         };
@@ -1476,7 +1615,10 @@ impl StorageBackend for ObsidianVaultStore {
     // ── timers ──────────────────────────────────────────────────
 
     async fn insert_timer(&self, timer: &PersistedTimer) -> SlcResult<()> {
-        self.timers.lock().unwrap().insert(timer.timer_id.clone(), timer.clone());
+        self.timers
+            .lock()
+            .unwrap()
+            .insert(timer.timer_id.clone(), timer.clone());
         self.persist_timers()?;
         self.git_commit();
         Ok(())
@@ -1512,18 +1654,31 @@ impl StorageBackend for ObsidianVaultStore {
     // ── records ─────────────────────────────────────────────────
 
     async fn put_record(&self, collection: &str, key: &str, value: &Value) -> SlcResult<()> {
-        self.records.lock().unwrap().insert((collection.to_string(), key.to_string()), value.clone());
+        self.records
+            .lock()
+            .unwrap()
+            .insert((collection.to_string(), key.to_string()), value.clone());
         self.persist_records()?;
         self.git_commit();
         Ok(())
     }
 
     async fn get_record(&self, collection: &str, key: &str) -> SlcResult<Option<Value>> {
-        Ok(self.records.lock().unwrap().get(&(collection.to_string(), key.to_string())).cloned())
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .get(&(collection.to_string(), key.to_string()))
+            .cloned())
     }
 
     async fn delete_record(&self, collection: &str, key: &str) -> SlcResult<bool> {
-        let existed = self.records.lock().unwrap().remove(&(collection.to_string(), key.to_string())).is_some();
+        let existed = self
+            .records
+            .lock()
+            .unwrap()
+            .remove(&(collection.to_string(), key.to_string()))
+            .is_some();
         if existed {
             self.persist_records()?;
             self.git_commit();
@@ -1563,8 +1718,8 @@ impl StorageBackend for ObsidianVaultStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Datelike;
     use crate::model::{DocLevel, DocMeta};
+    use chrono::Datelike;
 
     fn tmp_vault(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("slc-test-{tag}-{}", uuid::Uuid::new_v4().simple()))
@@ -1614,14 +1769,20 @@ mod tests {
             Some("seat_1".into()),
         );
         store2.episodic_insert(&evt).await.unwrap();
-        let rel = root.join("history").join(format!("{:04}", Utc::now().year())).join(format!("{:02}", Utc::now().month()));
+        let rel = root
+            .join("history")
+            .join(format!("{:04}", Utc::now().year()))
+            .join(format!("{:02}", Utc::now().month()));
         assert!(rel.join("session-2026-08-13-morning.md").exists());
 
         let kb_count = store2.kb_count(&DocFilter::default()).await.unwrap();
         assert_eq!(kb_count, 1, "history must not be in KB");
         let ep_count = store2.episodic_count(&DocFilter::default()).await.unwrap();
         assert_eq!(ep_count, 1);
-        assert!(store2.kb_insert(&evt).await.is_err(), "history rejected by kb_insert");
+        assert!(
+            store2.kb_insert(&evt).await.is_err(),
+            "history rejected by kb_insert"
+        );
     }
 
     #[tokio::test]
@@ -1690,7 +1851,9 @@ mod tests {
         }
 
         let mut filter = DocFilter::default();
-        filter.extra_strings.insert("assignee".into(), "developer-0".into());
+        filter
+            .extra_strings
+            .insert("assignee".into(), "developer-0".into());
         filter
             .extra_strings_not_in
             .insert("status".into(), vec!["RUNNING".into()]);
@@ -1759,7 +1922,10 @@ mod tests {
         assert_eq!(store.episodic_patch_meta(&f, &patch).await.unwrap(), 5);
         assert_eq!(
             store
-                .episodic_count(&DocFilter { has_compression_batch: Some(false), ..Default::default() })
+                .episodic_count(&DocFilter {
+                    has_compression_batch: Some(false),
+                    ..Default::default()
+                })
                 .await
                 .unwrap(),
             0
@@ -1784,13 +1950,22 @@ mod tests {
             }])
             .await
             .unwrap();
-        assert_eq!(store.get_embedding("doc-a").await.unwrap(), Some(vec![0.5, 0.25]));
+        assert_eq!(
+            store.get_embedding("doc-a").await.unwrap(),
+            Some(vec![0.5, 0.25])
+        );
     }
     #[test]
     fn sanitize_folder_accepts_nested_relative_and_rejects_escapes() {
         // Valid Obsidian layouts.
-        assert_eq!(sanitize_folder("projects/vassista").unwrap(), "projects/vassista");
-        assert_eq!(sanitize_folder("history/2026/08").unwrap(), "history/2026/08");
+        assert_eq!(
+            sanitize_folder("projects/vassista").unwrap(),
+            "projects/vassista"
+        );
+        assert_eq!(
+            sanitize_folder("history/2026/08").unwrap(),
+            "history/2026/08"
+        );
         // Escapes must be rejected (path traversal / absolute / windows).
         for bad in [
             "../../tmp/x",
@@ -1837,12 +2012,14 @@ mod tests {
         std::fs::write(&lock, b"stale evidence").unwrap();
         let modified = std::fs::metadata(&lock).unwrap().modified().unwrap();
 
-        assert!(quarantine_stale_git_index_lock(
-            &root,
-            modified + GIT_INDEX_LOCK_STALE_AFTER - Duration::from_secs(1),
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            quarantine_stale_git_index_lock(
+                &root,
+                modified + GIT_INDEX_LOCK_STALE_AFTER - Duration::from_secs(1),
+            )
+            .unwrap()
+            .is_none()
+        );
         assert!(lock.exists());
 
         let quarantined = quarantine_stale_git_index_lock(
