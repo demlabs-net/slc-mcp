@@ -2,7 +2,7 @@
 # Самоподписанный сертификат для локального nginx (slc-mcp HTTPS).
 # Устанавливает в /etc/nginx/ssl/slc/ и в системный trust store.
 # Продление: повторный запуск перезапишет сертификат (nginx reload не нужен,
-# если пути прежние — достаточно перезапуска ZCode с новым NODE_EXTRA_CA_CERTS).
+# если пути прежние ).
 set -euo pipefail
 
 DIR=/etc/nginx/ssl/slc
