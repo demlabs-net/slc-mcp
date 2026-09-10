@@ -204,6 +204,8 @@ pub struct SlcConfig {
     pub task_assign_acl: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Text-only principals cannot claim visual acceptance in task reports.
     pub text_only_principals: std::collections::HashSet<String>,
+    /// Operator-owned maintenance fence, keyed by exact seat ID (`*` holds all).
+    pub workflow_hold_seats: std::collections::HashSet<String>,
 }
 
 impl SlcConfig {
@@ -269,6 +271,13 @@ impl Default for SlcConfig {
             principal_policy_documents: roles::parse_principal_policy_documents_env(),
             task_assign_acl: roles::parse_task_assign_acl_env(),
             text_only_principals: roles::parse_text_only_principals_env(),
+            workflow_hold_seats: std::env::var("SLC_WORKFLOW_HOLD_SEATS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|seat| !seat.is_empty())
+                .map(String::from)
+                .collect(),
         }
     }
 }
@@ -1071,13 +1080,25 @@ impl SlcEngine {
         let Some(doc) = self.get_document(document_id).await? else {
             return Ok(false);
         };
-        self.store
+        // An operator may anchor a seat that has no live record yet — a role that
+        // has not started since a restart, or one that exists only as a vault file.
+        // Materialise it first: the store's seat writers are no-ops on a missing
+        // seat, which used to be swallowed into a false "activated" result.
+        self.seats.ensure_seat(seat_id).await?;
+        if !self
+            .store
             .set_seat_active_document(seat_id, Some(document_id))
-            .await?;
-        if doc.category == DocumentCategory::Task {
-            self.store
+            .await?
+        {
+            return Ok(false);
+        }
+        if doc.category == DocumentCategory::Task
+            && !self
+                .store
                 .set_seat_active_task(seat_id, document_id)
-                .await?;
+                .await?
+        {
+            return Ok(false);
         }
         Ok(true)
     }
@@ -1620,24 +1641,38 @@ impl SlcEngine {
             })),
         );
         let store_for_handlers = self.store.clone();
+        let held_seats = self.config.workflow_hold_seats.clone();
         registry.set_handler(
             model::TimerType::Reminder,
             std::sync::Arc::new(timer::AsyncFnHandler::new(move |t| {
                 let store = store_for_handlers.clone();
                 let timer = t.clone();
+                let held = held_seats.contains("*") || held_seats.contains(&timer.seat_id);
                 Box::pin(async move {
+                    if held {
+                        // Immutable operator config changes only on restart. Keep
+                        // this one-shot active in storage until then, without a
+                        // polling loop or accidental deactivation by TimerRegistry.
+                        // Cancellation still aborts this future through its handle.
+                        std::future::pending::<()>().await;
+                    }
                     handle_reminder(&store, &timer).await?;
                     Ok(())
                 })
             })),
         );
         let store_for_handlers = self.store.clone();
+        let held_seats = self.config.workflow_hold_seats.clone();
         registry.set_handler(
             model::TimerType::FocusReminder,
             std::sync::Arc::new(timer::AsyncFnHandler::new(move |t| {
                 let store = store_for_handlers.clone();
                 let timer = t.clone();
+                let held = held_seats.contains("*") || held_seats.contains(&timer.seat_id);
                 Box::pin(async move {
+                    if held {
+                        return Ok(());
+                    }
                     handle_focus_reminder(&store, &timer).await?;
                     Ok(())
                 })
@@ -1704,9 +1739,12 @@ async fn handle_reminder(
         tracing::warn!("Reminder {reminder_id} not found in DB");
         return Ok(());
     };
-    manager
+    if !manager
         .mark_fired(reminder_id, Some(&timer.seat_id))
-        .await?;
+        .await?
+    {
+        return Ok(());
+    }
     let queue = NotificationQueue::new(store.clone());
     let mut meta = serde_json::Map::new();
     meta.insert(
@@ -1754,6 +1792,62 @@ async fn handle_focus_reminder(
         )
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn cancelled_and_fired_reminders_never_emit_again() {
+    let store: std::sync::Arc<dyn StorageBackend> =
+        std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+    let registry = timer::TimerRegistry::new(store.clone());
+    let manager = ReminderManager::new(store.clone(), registry.clone());
+    for cancelled in [true, false] {
+        let reminder = manager
+            .create(
+                "held-test",
+                "obsolete order",
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let timer = registry
+            .list(Some("held-test"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|timer| {
+                timer
+                    .metadata
+                    .get("reminder_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(reminder.reminder_id.as_str())
+            })
+            .unwrap();
+        if cancelled {
+            manager
+                .cancel(&reminder.reminder_id, Some("held-test"))
+                .await
+                .unwrap();
+        } else {
+            manager
+                .mark_fired(&reminder.reminder_id, Some("held-test"))
+                .await
+                .unwrap();
+        }
+        handle_reminder(&store, &timer).await.unwrap();
+    }
+    assert_eq!(
+        NotificationQueue::new(store)
+            .count_pending("held-test")
+            .await
+            .unwrap(),
+        0
+    );
+    registry.stop().await;
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -1822,6 +1916,51 @@ pub unsafe extern "C" fn slc_free_string(ptr: *mut std::os::raw::c_char) {
 mod engine_tests {
     use super::*;
     use serde_json::{Value, json};
+
+    /// Anchoring must land for a seat that has no live record yet, and must not
+    /// report success when the write did not happen.
+    #[tokio::test]
+    async fn document_activation_materialises_a_missing_seat() {
+        let store: std::sync::Arc<dyn StorageBackend> =
+            std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
+        let engine = SlcEngine::with(
+            store.clone(),
+            std::sync::Arc::new(MockLlm::new(vec![])),
+            SlcConfig::default(),
+        );
+        let mut doc = Document::new(
+            "anchor-doc",
+            DocumentCategory::Documentation,
+            "# Anchor",
+            DocMeta::default(),
+            vec![],
+            None,
+        );
+        engine.add_document(&mut doc).await.unwrap();
+        // No seat record exists for this id at this point.
+        assert!(engine.seats.get_seat("fresh-role").await.unwrap().is_none());
+
+        assert!(engine
+            .document_activate("fresh-role", "anchor-doc")
+            .await
+            .unwrap());
+
+        // The anchor is durable and readable through the same path update_context uses.
+        assert_eq!(
+            engine
+                .document_get_active("fresh-role")
+                .await
+                .unwrap()
+                .map(|doc| doc.document_id),
+            Some("anchor-doc".into())
+        );
+
+        // An unknown document still reports failure rather than a false success.
+        assert!(!engine
+            .document_activate("fresh-role", "absent-doc")
+            .await
+            .unwrap());
+    }
 
     #[tokio::test]
     async fn summarize_text_uses_llm_and_falls_back() {

@@ -2763,7 +2763,8 @@ async fn call_tool(
                 }));
                 json!({"success": true, "document_id": document_id, "target_seat": target, "message": "Document activated (context anchor)"})
             } else {
-                json!({"success": false, "error": format!("document not found: {document_id}")})
+                json!({"success": false, "error": format!(
+                    "document not activated: {document_id} (not found, or the seat {target} could not be anchored)")})
             }
         }
         "deactivate_document" => {
