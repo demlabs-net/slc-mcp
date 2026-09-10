@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Самоподписанный сертификат для локального nginx (slc-mcp HTTPS).
-# Устанавливает в /etc/nginx/ssl/slc/ и в системный trust store.
-# Продление: повторный запуск перезапишет сертификат (nginx reload не нужен,
-# если пути прежние ).
+# Self-signed certificate for the local nginx (slc-mcp HTTPS).
+# Installs into /etc/nginx/ssl/slc/ and the system trust store.
+# Renewal: re-running overwrites the certificate (nginx reload is not needed
+# when paths stay the same — restart ZCode with the new NODE_EXTRA_CA_CERTS).
 set -euo pipefail
 
 DIR=/etc/nginx/ssl/slc
@@ -21,7 +21,7 @@ sudo mv slc-mcp.key slc-mcp.crt "$DIR/"
 sudo chown root:root "$DIR"/*
 sudo chmod 600 "$DIR/slc-mcp.key"
 
-# Доверие в системном store (curl, браузеры, системные клиенты).
+# Trust in the system store (curl, browsers, system clients).
 sudo cp "$DIR/slc-mcp.crt" /usr/local/share/ca-certificates/slc-mcp.crt
 sudo update-ca-certificates
 

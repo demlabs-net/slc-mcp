@@ -1,6 +1,6 @@
-# SLC MCP — сервер памяти (Obsidian vault) + веб-морда, один процесс.
-# MCP (JSON-RPC /mcp, SSE /sse, /messages) + REST /api/* + SPA-статика —
-# всё на порту 3000; владелец vault один, конфликтов доступа нет.
+# SLC MCP — memory server (Obsidian vault) + web UI, one process.
+# MCP (JSON-RPC /mcp, SSE /sse, /messages) + REST /api/* + SPA static —
+# all on port 3000; a single vault owner means no access conflicts.
 #
 # Vault location on the host comes from $SLC_VAULT (set by deploy.sh,
 # default ~/Obsidian/slc-vault). LM Studio / Ollama on the host are

@@ -1,14 +1,16 @@
-//! Полный порт легаси-авторизации: users/пароли (bcrypt), JWT access+refresh
-//! с ротацией, RBAC-группы, audit-log, rate-limit, Yandex OAuth2 + allowlist.
+//! Full port of the legacy auth: users/passwords (bcrypt), JWT access+refresh
+//! with rotation, RBAC groups, audit log, rate limiting, Yandex OAuth2 + allowlist.
 //!
-//! Легаси-источник: `src/auth/*`, `src/api/routes/auth.py`, `admin.py`
-//! (Python-стек slc). Хранилище — файлы vault `.slc/auth/*` (users.json,
-//! oauth_rules.json, audit.jsonl); группы — предопределённые (PREDEFINED_GROUPS).
+//! Legacy source: `src/auth/*`, `src/api/routes/auth.py`, `admin.py`
+//! (the slc Python stack). Storage — vault files under `.slc/auth/*`
+//! (users.json, oauth_rules.json, audit.jsonl); groups are predefined
+//! (PREDEFINED_GROUPS).
 //!
-//! Режимы (`SLC_AUTH`):
-//! - `seat` (default) — как раньше: X-Seat-ID/cookie, пользователей нет.
-//! - `full` — REST /api/* требует Bearer-JWT; сид выводится из пользователя
-//!   (`user_<user_id>`), регистрация по `AUTH_ENABLED` (admin-only или открытая).
+//! Modes (`SLC_AUTH`):
+//! - `seat` (default) — as before: X-Seat-ID/cookie, no users.
+//! - `full` — REST /api/* requires a Bearer JWT; the seat is derived from the
+//!   user (`user_<user_id>`); registration per `AUTH_ENABLED` (admin-only or
+//!   open).
 
 pub mod jwt;
 pub mod models;
@@ -20,12 +22,12 @@ use axum::http::HeaderMap;
 use models::{User, check_permission};
 use std::sync::{Arc, Mutex};
 
-/// Auth-режим веб-морды.
+/// Auth mode of the web UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
-    /// X-Seat-ID/cookie; пользователи и JWT не используются.
+    /// X-Seat-ID/cookie; users and JWT are not used.
     Seat,
-    /// Полный порт легаси: JWT-пользователи, RBAC, Yandex OAuth.
+    /// Full legacy port: JWT users, RBAC, Yandex OAuth.
     Full,
 }
 
@@ -38,7 +40,7 @@ impl AuthMode {
     }
 }
 
-/// Счётчик неудачных попыток (rate-limit как в легаси: 5 / 60с на ключ).
+/// Failed attempt counter (rate limit as in legacy: 5 per 60 s per key).
 #[derive(Default)]
 pub struct RateLimiter {
     attempts: Mutex<std::collections::HashMap<String, Vec<std::time::Instant>>>,
@@ -48,7 +50,7 @@ impl RateLimiter {
     const MAX: usize = 5;
     const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
-    /// Ok — можно продолжать; Err(429 message) — лимит исчерпан.
+    /// Ok — may continue; Err(429 message) — the limit is exhausted.
     pub fn check(&self, key: &str) -> Result<(), String> {
         let now = std::time::Instant::now();
         let mut map = self.attempts.lock().unwrap();
@@ -65,15 +67,15 @@ impl RateLimiter {
     }
 }
 
-/// Одноразовые коды (CSRF-state OAuth + auth_code для передачи токенов),
-/// TTL 120с — как легаси `oauth_pending_codes`.
+/// One-time codes (OAuth CSRF state + auth_code for token handoff),
+/// TTL 120 s — like legacy `oauth_pending_codes`.
 pub struct PendingCodes {
     map: Mutex<std::collections::HashMap<String, PendingCode>>,
 }
 
 pub struct PendingCode {
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Для auth_code — выданные токены; для csrf_state — пусто.
+    /// For auth_code — the issued tokens; for csrf_state — empty.
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
 }
@@ -95,7 +97,7 @@ impl PendingCodes {
         map.insert(code, pc);
     }
 
-    /// Найти и удалить (одноразовый), с проверкой TTL.
+    /// Find and remove (one-time use), with a TTL check.
     pub fn take(&self, code: &str) -> Option<PendingCode> {
         let mut map = self.map.lock().unwrap();
         let pc = map.remove(code)?;
@@ -106,10 +108,10 @@ impl PendingCodes {
     }
 }
 
-/// Состояние авторизации, живёт в AppState.
+/// Auth state; lives in AppState.
 pub struct AuthState {
     pub mode: AuthMode,
-    /// AUTH_ENABLED: при true регистрация только для admins.
+    /// AUTH_ENABLED: when true, registration is for admins only.
     pub auth_enabled: bool,
     pub store: Arc<store::AuthStore>,
     pub jwt: jwt::JwtManager,
@@ -142,7 +144,7 @@ impl AuthState {
         }
     }
 
-    /// Загрузить пользователя по Bearer-токену (full-режим).
+    /// Load the user from a Bearer token (full mode).
     pub fn user_from_bearer(&self, bearer: Option<&str>) -> Option<User> {
         if self.mode != AuthMode::Full {
             return None;
@@ -157,7 +159,7 @@ impl AuthState {
     }
 }
 
-/// Извлечь Authorization: Bearer <token> из заголовков.
+/// Extract Authorization: Bearer <token> from the headers.
 pub fn bearer_from(headers: &HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::AUTHORIZATION)
@@ -165,12 +167,12 @@ pub fn bearer_from(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Проверка прав текущего пользователя (полный порт легаси RBAC).
+/// Permission check for the current user (full legacy RBAC port).
 pub fn user_has_permission(user: &User, resource: &str, action: &str) -> bool {
     check_permission(&user.groups, resource, action)
 }
 
-/// Проверка «только superadmin может назначать admin-группы».
+/// Enforces "only a superadmin may assign admin groups".
 pub fn user_is_superadmin(user: &User) -> bool {
     user.groups.iter().any(|g| g == "superadmins")
 }
@@ -181,17 +183,17 @@ pub fn user_is_admin(user: &User) -> bool {
         .any(|g| models::ADMIN_GROUP_NAMES.contains(&g.as_str()))
 }
 
-/// Сгенерировать `user_{hex}` id как в легаси (uuid4 hex16).
+/// Generate a `user_{hex}` id as in legacy (uuid4 hex16).
 pub fn user_id_new() -> String {
     format!("user_{}", rand::random::<u128>() & 0xFFFF_FFFF_FFFF_FFFF)
 }
 
-/// `rule_{hex12}` как в легаси.
+/// `rule_{hex12}` as in legacy.
 pub fn rule_id_new() -> String {
     format!("rule_{:012x}", rand::random::<u64>() & 0xFF_FFFF_FFFF_FFFF)
 }
 
-/// `audit_{hex16}` как в легаси.
+/// `audit_{hex16}` as in legacy.
 pub fn audit_id_new() -> String {
     format!("audit_{:016x}", rand::random::<u64>())
 }

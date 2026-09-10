@@ -23,18 +23,18 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use std::sync::{Arc, Mutex};
 
-/// GPU-модель по умолчанию: мультиязычная (включая русский), 1024-мер.
+/// Default GPU model: multilingual (incl. Russian), 1024-dim.
 pub const BGE_M3: &str = "BAAI/bge-m3";
-/// CPU-модель по умолчанию: лёгкая, 384-мер, тоже мультиязычная.
+/// Default CPU model: lightweight, 384-dim, also multilingual.
 pub const E5_SMALL: &str = "intfloat/multilingual-e5-small";
 
-/// Файлы модели (safetensors-вариант; часть моделей, например bge-m3,
-/// публикует только `pytorch_model.bin` — см. [`PTH_FILE`]).
+/// Model files (safetensors variant; some models, e.g. bge-m3, publish
+/// only `pytorch_model.bin` — see [`PTH_FILE`]).
 const MODEL_FILES: [&str; 3] = ["model.safetensors", "config.json", "tokenizer.json"];
-/// Fallback для моделей без safetensors (torch-формат, читается candle'ом).
+/// Fallback for models without safetensors (torch format, readable by candle).
 const PTH_FILE: &str = "pytorch_model.bin";
 
-/// Максимальная длина токенов для эмбеддинга (у e5-small лимит 512).
+/// Maximum token length for embedding (e5-small's limit is 512).
 const MAX_TOKENS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,9 +47,9 @@ enum DeviceKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pooling {
-    /// bge-m3: первый токен.
+    /// bge-m3: the first token.
     Cls,
-    /// e5-семейство: среднее по всем токенам.
+    /// e5 family: mean over all tokens.
     Mean,
 }
 
@@ -64,9 +64,9 @@ struct Loaded {
     device: Device,
     dim: usize,
     pooling: Pooling,
-    /// e5-семейство требует префиксов query:/passage:.
+    /// e5 family requires query:/passage: prefixes.
     e5_prefix: bool,
-    /// Id токена паддинга (для батч-инференса).
+    /// Padding token id (for batch inference).
     pad_id: u32,
 }
 
@@ -95,7 +95,7 @@ impl Default for CandleEmbeddingLlm {
 }
 
 impl CandleEmbeddingLlm {
-    /// Общий конструктор: резолвит настройки из env.
+    /// Generic constructor: resolves settings from env.
     pub fn new() -> Self {
         let device = std::env::var("SLC_EMBED_DEVICE").unwrap_or_default();
         let device = match device.as_str() {
@@ -109,8 +109,8 @@ impl CandleEmbeddingLlm {
         )
     }
 
-    /// Конструктор с явной конфигурацией (используется `slc-mcp init`
-    /// для контрольной проверки без чтения env). `device` — `auto` |
+    /// Constructor with explicit configuration (used by `slc-mcp init`
+    /// for a sanity check without reading env). `device` — `auto` |
     /// `cuda` | `metal` | `cpu`.
     pub fn with_config(repo_id: impl Into<String>, device: &str) -> Self {
         let device_kind = match device {
@@ -148,8 +148,8 @@ impl CandleEmbeddingLlm {
             || self.device_kind == DeviceKind::Auto && detect_device() != DeviceKind::Cpu
     }
 
-    /// Статическая проверка «есть ли GPU-бэкенд» (без создания клиента и
-    /// фонового лоадера) — для выбора провайдера по умолчанию.
+    /// Static check "is there a GPU backend" (without creating a client or
+    /// a background loader) — for choosing the default provider.
     pub fn gpu_available() -> bool {
         detect_device() != DeviceKind::Cpu
     }
@@ -174,7 +174,7 @@ impl CandleEmbeddingLlm {
                 .send()
                 .is_ok()
         };
-        // Вес — safetensors ИЛИ torch-фоллбэк.
+        // Weights — safetensors OR the torch fallback.
         (cached(MODEL_FILES[0]) || cached(PTH_FILE))
             && cached(MODEL_FILES[1])
             && cached(MODEL_FILES[2])
@@ -193,7 +193,7 @@ impl CandleEmbeddingLlm {
         }
     }
 
-    /// Копия для фонового лоадера: разделяет `state`/`notify` с оригиналом.
+    /// Clone for the background loader: shares `state`/`notify` with the original.
     fn clone_for_loader(&self) -> Self {
         Self {
             repo_id: self.repo_id.clone(),
@@ -217,9 +217,9 @@ impl CandleEmbeddingLlm {
         self.notify.notify_waiters();
     }
 
-    /// Async-ожидание готовности модели — НЕ блокирует tokio-поток
-    /// (в отличие от старого Condvar). Будущее создаётся до проверки
-    /// состояния, поэтому уведомление между проверкой и await не теряется.
+    /// Async wait for model readiness — does NOT block a tokio thread
+    /// (unlike the old Condvar). The future is created before checking the
+    /// state, so a notification between the check and the await is not lost.
     async fn wait_ready(&self) -> Result<Arc<Loaded>, SlcError> {
         loop {
             let notified = self.notify.notified();
@@ -275,15 +275,15 @@ impl CandleEmbeddingLlm {
         let repo = client.model(owner, name);
 
         let dl = |file: &str| -> Result<std::path::PathBuf, String> {
-            // local_files_only: никаких автоскачиваний — модель должна быть
-            // подготовлена через `slc-mcp init`.
+            // local_files_only: no auto-downloads — the model must be
+            // prepared via `slc-mcp init`.
             repo.download_file()
                 .filename(file.to_string())
                 .local_files_only(true)
                 .send()
                 .map_err(|e| format!("{file} (запусти `slc-mcp init`, чтобы скачать модель): {e}"))
         };
-        // Веса: предпочитаем safetensors, иначе torch-файл (bge-m3 и др.).
+        // Weights: prefer safetensors, else the torch file (bge-m3 and others).
         let safetensors = dl(MODEL_FILES[0]).is_ok();
         let weights = if safetensors {
             dl(MODEL_FILES[0])?
@@ -312,8 +312,8 @@ impl CandleEmbeddingLlm {
             unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device) }
                 .map_err(|e| format!("load safetensors: {e}"))?
         } else {
-            // torch-формат читается целиком (pickle) — 4-5 ГБ в RAM для
-            // bge-m3; это GPU-путь, для слабых машин есть e5-small/hash.
+            // The torch format is read whole (pickle) — 4-5 GB in RAM for
+            // bge-m3; this is the GPU path, weak machines have e5-small/hash.
             VarBuilder::from_pth(&weights, DType::F32, &device)
                 .map_err(|e| format!("load pytorch_model.bin: {e}"))?
         };
@@ -328,8 +328,8 @@ impl CandleEmbeddingLlm {
             }))
             .map_err(|e| format!("tokenizer truncation: {e}"))?;
 
-        // bge-m3 — XLM-RoBERTa (CLS pooling, без префиксов); e5 — BERT
-        // (mean pooling, префиксы query:/passage:).
+        // bge-m3 — XLM-RoBERTa (CLS pooling, no prefixes); e5 — BERT
+        // (mean pooling, query:/passage: prefixes).
         let pooling = if self.repo_id.contains("bge-m3") {
             Pooling::Cls
         } else {
@@ -352,7 +352,7 @@ impl CandleEmbeddingLlm {
             EncodeModel::Bert(m)
         };
 
-        // Токен паддинга для батч-инференса (<pad> в bert/xlm-r словарях).
+        // Padding token for batch inference (<pad> in bert/xlm-r vocabularies).
         let pad_id = tokenizer.token_to_id("<pad>").unwrap_or(0);
 
         Ok(Loaded {
@@ -366,8 +366,8 @@ impl CandleEmbeddingLlm {
         })
     }
 
-    /// Синхронный эмбеддинг одного текста (токенизация + forward + pooling).
-    /// Вызывается только из `spawn_blocking` — candle-операции блокирующие.
+    /// Synchronous embedding of a single text (tokenization + forward + pooling).
+    /// Only called from `spawn_blocking` — candle operations are blocking.
     fn embed_loaded(loaded: &Loaded, text: &str, kind: EmbeddingKind) -> SlcResult<Vec<f32>> {
         let embed = (|| -> Result<Vec<f32>, String> {
             let text = match (loaded.e5_prefix, kind) {
@@ -405,9 +405,9 @@ impl CandleEmbeddingLlm {
         embed.map_err(|e| SlcError::Storage(format!("candle embed: {e}")))
     }
 
-    /// Синхронный БАТЧ-эмбеддинг: один forward на все тексты (паддинг до
-    /// максимальной длины в батче). Для индексации/реиндекса — на порядок
-    /// быстрее последовательных вызовов. Только из `spawn_blocking`.
+    /// Synchronous BATCH embedding: one forward pass for all texts (padding
+    /// to the maximum length in the batch). For indexing/reindexing — an
+    /// order of magnitude faster than sequential calls. Only from `spawn_blocking`.
     fn embed_batch(
         loaded: &Loaded,
         texts: &[String],
@@ -417,7 +417,7 @@ impl CandleEmbeddingLlm {
             if texts.is_empty() {
                 return Ok(Vec::new());
             }
-            // Токенизация + префиксы e5.
+            // Tokenization + e5 prefixes.
             let mut encodings: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
             for t in texts {
                 let t = match (loaded.e5_prefix, kind) {
@@ -434,7 +434,7 @@ impl CandleEmbeddingLlm {
             let max_len = encodings.iter().map(|v| v.len()).max().unwrap_or(1).max(1);
             let batch = encodings.len();
 
-            // Плотный паддинг + attention-маска.
+            // Dense padding + attention mask.
             let mut ids: Vec<u32> = Vec::with_capacity(batch * max_len);
             let mut mask: Vec<u32> = Vec::with_capacity(batch * max_len);
             for e in &encodings {
@@ -463,7 +463,7 @@ impl CandleEmbeddingLlm {
         embed.map_err(|e| SlcError::Storage(format!("candle embed batch: {e}")))
     }
 
-    /// Общий forward: bert/xlm-roberta → (batch, seq, hidden).
+    /// Shared forward: bert/xlm-roberta → (batch, seq, hidden).
     fn forward(
         loaded: &Loaded,
         ids: &Tensor,
@@ -480,7 +480,7 @@ impl CandleEmbeddingLlm {
         }
     }
 
-    /// Pooling → (batch, hidden): CLS (первый токен) или маскированный mean.
+    /// Pooling → (batch, hidden): CLS (first token) or masked mean.
     fn pool(loaded: &Loaded, out: &Tensor, mask: &Tensor) -> Result<Tensor, String> {
         match loaded.pooling {
             Pooling::Cls => out
@@ -489,7 +489,7 @@ impl CandleEmbeddingLlm {
                 .squeeze(1)
                 .map_err(|e| e.to_string()),
             Pooling::Mean => {
-                // Сумма по реальным токенам / количество реальных токенов.
+                // Sum over real tokens / number of real tokens.
                 let mf = mask
                     .to_dtype(DType::F32)
                     .map_err(|e| e.to_string())?
@@ -510,7 +510,7 @@ impl CandleEmbeddingLlm {
         }
     }
 
-    /// L2-нормализация последней оси.
+    /// L2-normalization of the last axis.
     fn normalize(pooled: &Tensor) -> Result<Tensor, String> {
         let norm = pooled
             .sqr()
@@ -525,15 +525,15 @@ impl CandleEmbeddingLlm {
     }
 }
 
-/// Скачать модель эмбеддингов в HF-кэш. Вызывается ТОЛЬКО из `slc-mcp init`
-/// (консольный визард развертывания) — в рантайме автоскачивание отключено.
+/// Download an embedding model into the HF cache. Called ONLY from `slc-mcp init`
+/// (the console deployment wizard) — auto-download is disabled at runtime.
 pub fn download_embedding_model(repo_id: &str) -> Result<(), String> {
     let (owner, name) = repo_id
         .split_once('/')
         .ok_or_else(|| format!("model repo id must be owner/name, got: {repo_id}"))?;
     let client = hf_hub::HFClientSync::new().map_err(|e| format!("hf-hub: {e}"))?;
     let repo = client.model(owner, name);
-    // Веса: safetensors, а если репозиторий их не публикует (bge-m3) — torch.
+    // Weights: safetensors; if the repo does not publish them (bge-m3) — torch.
     let weights = match repo
         .download_file()
         .filename(MODEL_FILES[0].to_string())
@@ -566,7 +566,7 @@ pub fn download_embedding_model(repo_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Человекочитаемое имя активного устройства (для `slc-mcp init`).
+/// Human-readable name of the active device (for `slc-mcp init`).
 pub fn detect_device_name() -> String {
     match detect_device() {
         DeviceKind::Cuda => "CUDA (GPU)".into(),
@@ -576,7 +576,7 @@ pub fn detect_device_name() -> String {
     }
 }
 
-/// Проверка кэша по repo id (без чтения env) — для `slc-mcp init`.
+/// Cache check by repo id (without reading env) — for `slc-mcp init`.
 pub fn model_is_cached(repo_id: &str) -> bool {
     let probe = CandleEmbeddingLlm {
         repo_id: repo_id.to_string(),
@@ -634,8 +634,8 @@ impl LlmClient for CandleEmbeddingLlm {
     ) -> SlcResult<Vec<f32>> {
         let loaded = self.wait_ready().await?;
         let text = text.to_string();
-        // Инференс на blocking-пуле: candle-операции синхронные и
-        // занимают десятки-сотни мс — tokio-поток не блокируется.
+        // Inference on the blocking pool: candle operations are synchronous
+        // and take tens-to-hundreds of ms — the tokio thread is not blocked.
         tokio::task::spawn_blocking(move || Self::embed_loaded(&loaded, &text, kind))
             .await
             .map_err(|e| SlcError::Storage(format!("embed task panicked: {e}")))?
@@ -667,8 +667,8 @@ mod tests {
 
     #[tokio::test]
     async fn not_cached_fails_fast() {
-        // Несуществующий репозиторий: модель не в кэше → быстрый Err
-        // с подсказкой про init (никакого скачивания/сети).
+        // Nonexistent repo: the model is not in the cache → a fast Err with
+        // an init hint (no downloads/network).
         let llm = CandleEmbeddingLlm::with_config("nonexistent/owner-model-xyz", "cpu");
         let err = llm
             .generate_embedding("тест")

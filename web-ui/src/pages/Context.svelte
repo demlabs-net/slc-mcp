@@ -43,7 +43,7 @@
   onMount(() => {
     load();
     const interval = setInterval(load, 30000);
-    // SSE-уведомления
+    // SSE notifications
     try {
       const token = tokenForStream();
       es = new EventSource(
@@ -54,7 +54,7 @@
       };
       es.onerror = () => { /* переподключение автоматическое */ };
     } catch {
-      /* без SSE */
+      /* no SSE */
     }
     return () => { clearInterval(interval); es?.close(); };
   });

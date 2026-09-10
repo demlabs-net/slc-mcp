@@ -1,34 +1,35 @@
-# SLC hooks — авто-сохранение контекста в конце агент-лупа
+# SLC hooks — auto-save context at the end of an agent loop
 
-`slc-hook.py` — готовый hook для **обвязки кодинг-агента**: харнес вызывает
-его в конце каждого цикла (агент закончил шаг/сессию), а он автоматически
-сохраняет контекст сита в SLC через MCP-тул `update_context`:
+`slc-hook.py` is a ready-made hook for a **coding-agent wrapper**: the
+harness calls it at the end of every loop iteration (the agent finished a
+step/session), and it automatically saves the seat's context to SLC through
+the MCP `update_context` tool:
 
-- `save <summary>` — снимок контекста в историю (как `/save_context`);
-- `update` — просто пересобрать текущий срез (как `/update_context`);
-- саммари по умолчанию собирается из последнего git-коммита
-  (`git log -1` + `diff --stat`), можно передать своё или `-` из stdin.
+- `save <summary>` — snapshot the context into history (like `/save_context`);
+- `update` — just rebuild the current slice (like `/update_context`);
+- the summary defaults to the latest git commit (`git log -1` + `diff --stat`);
+  you can pass your own or `-` to read it from stdin.
 
-Требования: `python3` (только стандартная библиотека), запущенный
-`slc-mcp serve`. Скрипт не зависит от LLM-сервера — работает и с hash-режимом
-(`SLC_LLM=hash`).
+Requirements: `python3` (standard library only) and a running `slc-mcp
+serve`. The script does not depend on an LLM server — it works with the hash
+mode too (`SLC_LLM=hash`).
 
-## Быстрая проверка
+## Quick check
 
 ```bash
-# сервер: slc-mcp serve --port 3000
+# server: slc-mcp serve --port 3000
 export SLC_SEAT_ID=dev
-python3 hooks/slc-hook.py save "проверка хука"
+python3 hooks/slc-hook.py save "hook check"
 ```
 
-Ответ содержит `limit_chars/used_chars/compressed` — если контекст сжат,
-появится предупреждение.
+The response contains `limit_chars/used_chars/compressed` — if the context
+was compressed, a warning appears.
 
-## Подключение к харнесу
+## Wiring into a harness
 
 ### Claude Code
 
-`~/.claude/settings.json` (или `.claude/settings.json` проекта):
+`~/.claude/settings.json` (or the project's `.claude/settings.json`):
 
 ```json
 {
@@ -47,50 +48,51 @@ python3 hooks/slc-hook.py save "проверка хука"
 }
 ```
 
-- `Stop` — конец каждого ответа агента в сессии; снимок уходит в историю.
-- Если хочется реже (только конец крупных этапов) — используйте
-  `SubagentStop` или вызывайте вручную через `/save_context`.
+- `Stop` — the end of each agent response in a session; a snapshot goes into
+  history.
+- To save less often (only at the end of larger stages) use `SubagentStop`
+  or call `/save_context` manually.
 
-### ZCode (клиент, в котором ведётся разработка)
+### ZCode (the client this project is developed in)
 
-Хуки ZCode конфигурируются в клиенте (см. справку клиента по hooks);
-команда для события конца сессии/цикла та же:
+ZCode hooks are configured in the client (see the client's hooks help); the
+command for the end-of-session/loop event is the same:
 
 ```
 SLC_SEAT_ID=dev python3 /path/to/slc-hook.py save
 ```
 
-### Любой агент / обёртка
+### Any agent / wrapper
 
-Обёртка в zsh/bash вокруг вашего агента — работает везде, где нет системы
-хуков:
+A zsh/bash wrapper around your agent works everywhere there is no hook
+system:
 
 ```bash
 agent() {
-  "$@"                                   # запуск агента
+  "$@"                                   # run the agent
   local rc=$?
   SLC_SEAT_ID=dev python3 /path/to/slc-hook.py save
   return $rc
 }
-# alias claude="agent claude"  и т.п.
+# alias claude="agent claude"  etc.
 ```
 
-### Минимальный вариант — git pre-commit
+### Minimal option — git pre-commit
 
 ```bash
 # .git/hooks/pre-commit
 SLC_SEAT_ID=dev python3 /path/to/slc-hook.py save
 ```
 
-## Окружение
+## Environment
 
-| Переменная       | Значение по умолчанию        | Описание                          |
-|------------------|------------------------------|-----------------------------------|
-| `SLC_MCP_URL`    | `http://127.0.0.1:3000/mcp`  | адрес MCP-сервера                 |
-| `SLC_SEAT_ID`    | — (обязательна)              | сид; можно `--seat`               |
-| `SLC_MCP_AUTH`   | `legacy_seat_id`             | `bearer_plus_seat` — если включён |
-| `SLC_MCP_TOKEN`  | —                            | токен для `bearer_plus_seat`      |
-| `SLC_SKIP`       | пусто                        | любое непустое значение — выйти 0 |
+| Variable         | Default                       | Description                          |
+|------------------|-------------------------------|--------------------------------------|
+| `SLC_MCP_URL`    | `http://127.0.0.1:3000/mcp`   | MCP server address                   |
+| `SLC_SEAT_ID`    | — (required)                  | seat; can also be passed with `--seat` |
+| `SLC_MCP_AUTH`   | `legacy_seat_id`              | `bearer_plus_seat` — if enabled      |
+| `SLC_MCP_TOKEN`  | —                             | token for `bearer_plus_seat`         |
+| `SLC_SKIP`       | empty                         | any non-empty value exits with 0     |
 
-Разные проекты = разные сиды: для каждого проекта/репозитория задавайте
-свой `SLC_SEAT_ID` (например, в `.env` проекта или в команде хука).
+Different projects = different seats: give each project/repository its own
+`SLC_SEAT_ID` (for example in the project's `.env` or in the hook command).
