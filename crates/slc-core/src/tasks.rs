@@ -1,6 +1,6 @@
 //! Tasks and projects — modeled as unified `Document`s (category `Task` /
-//! `Project`), per the user-approved design rule: "проекты, задачи и
-//! документы — всё это документы". Task/project-specific state (status,
+//! `Project`), per the user-approved design rule: "projects, tasks and
+//! documents — everything is a document". Task/project-specific state (status,
 //! project link, auto_load) lives in `Document::metadata.extra` and the
 //! typed `auto_load` field.
 //!
@@ -121,7 +121,7 @@ pub(crate) fn doc_to_task(doc: &Document) -> TaskInfo {
         name: extra_field(doc, "name").unwrap_or_else(|| doc.document_id.clone()),
         description: doc.content.clone(),
         status: extra_field(doc, "status").unwrap_or_else(|| STATUS_PENDING.into()),
-        // Канонический ключ — "project"; "project_id" остаётся для старых доков.
+        // Canonical key — "project"; "project_id" stays for legacy documents.
         project_id: extra_field(doc, "project").or_else(|| extra_field(doc, "project_id")),
         auto_load: doc.auto_load.clone(),
         created_at: doc.created_at.to_rfc3339(),
@@ -174,8 +174,8 @@ fn build_doc(
     meta.extra.insert("name".into(), json!(name));
     meta.extra.insert("status".into(), json!(status));
     if let Some(pid) = project_id {
-        // "project" — канонический ключ: из него вычисляется папка
-        // (docs/projects/<p>/tasks/) и он же отдаётся в TaskInfo.
+        // "project" — the canonical key: the folder is computed from it
+        // (docs/projects/<p>/tasks/) and it is also what TaskInfo reports.
         meta.extra.insert("project".into(), json!(pid));
     }
     if let Some(obj) = metadata.as_object() {
@@ -234,9 +234,10 @@ impl<S: StorageBackend> WorkItemManager<S> {
         Ok(doc_to_task(&doc))
     }
 
-    /// Говорящий id — транслит названия БЕЗ категорийного префикса
-    /// (папка уже несёт категорию: `tasks/`, `docs/projects/<p>/tasks/`),
-    /// при коллизии — `_2`, `_3`…; пустой слаг — unique_id fallback.
+    /// Human-readable id — transliteration of the name WITHOUT a category
+    /// prefix (the folder already carries the category: `tasks/`,
+    /// `docs/projects/<p>/tasks/`); on collision — `_2`, `_3`…; an empty
+    /// slug — unique_id fallback.
     pub(crate) async fn speaking_id(&self, name: &str) -> String {
         let slug = crate::model::slug_name(name);
         if slug.is_empty() {
@@ -302,7 +303,7 @@ impl<S: StorageBackend> WorkItemManager<S> {
             doc.content_hash = content_hash(&doc.content);
         }
         if let Some(patch) = description_patch {
-            // Инкрементальное обновление вместо пересылки всего тела.
+            // Incremental update instead of resending the whole body.
             doc.content =
                 apply_description_patch(&doc.content, patch).map_err(SlcError::InvalidInput)?;
             doc.content_hash = content_hash(&doc.content);
@@ -320,7 +321,7 @@ impl<S: StorageBackend> WorkItemManager<S> {
             doc.auto_load = al.to_vec();
         }
         if let Some(st) = status {
-            // Статус нормализуется в канонический набор; неизвестный — не трогаем.
+            // The status is normalized into the canonical set; unknown — leave as is.
             if let Some(norm) = normalize_task_status(st) {
                 doc.metadata.extra.insert("status".into(), json!(norm));
             }
@@ -532,15 +533,15 @@ impl crate::model::Document {
     }
 }
 
-/// Инкрементальное обновление markdown-тела (задача/проект) без пересылки
-/// всего текста. Операции применяются по порядку:
-/// - `{"op":"append","content":"…"}` — добавить в конец;
-/// - `{"op":"prepend","content":"…"}` — добавить в начало;
-/// - `{"op":"replace_section","heading":"### Фаза 2","content":"…"}` —
-///   заменить КОНТЕНТ секции (от заголовка до следующего заголовка того же
-///   или более высокого уровня); заголовок сохраняется;
-/// - `{"op":"remove_section","heading":"…"}` — удалить секцию целиком
-///   (вместе с заголовком).
+/// Incremental update of a markdown body (task/project) without resending
+/// the whole text. Operations apply in order:
+/// - `{"op":"append","content":"…"}` — append to the end;
+/// - `{"op":"prepend","content":"…"}` — prepend to the start;
+/// - `{"op":"replace_section","heading":"### Phase 2","content":"…"}` —
+///   replace the section CONTENT (from the heading up to the next heading of
+///   the same or a higher level); the heading itself is kept;
+/// - `{"op":"remove_section","heading":"…"}` — remove the section entirely
+///   (heading included).
 pub fn apply_description_patch(body: &str, patch: &Value) -> Result<String, String> {
     let Some(ops) = patch.as_array() else {
         return Err("description_patch must be an array of operations".into());
@@ -586,9 +587,9 @@ pub fn apply_description_patch(body: &str, patch: &Value) -> Result<String, Stri
     Ok(out)
 }
 
-/// Замена/удаление markdown-секции по заголовку. Секция тянется от
-/// заголовка до следующего заголовка ТОГО ЖЕ или более высокого уровня
-/// (или конца текста). `keep_heading=false` удаляет и заголовок.
+/// Replace/remove a markdown section by heading. The section runs from the
+/// heading to the next heading of THE SAME or a higher level (or the end of
+/// the text). `keep_heading=false` removes the heading too.
 fn apply_section_op(
     body: &str,
     heading: &str,
@@ -615,7 +616,7 @@ fn apply_section_op(
     for line in body.lines() {
         if let Some(lvl) = heading_level(line) {
             if lvl <= h_level {
-                // Заголовок того же/высшего уровня закрывает любую секцию.
+                // A heading of the same/higher level closes any section.
                 skipping = false;
                 if line.trim_start() == target {
                     found = true;
@@ -818,7 +819,7 @@ mod tests {
             .create_task("seat_t", "Fix audio", "do it", None, &[], &json!({}))
             .await
             .unwrap();
-        assert_eq!(t.task_id, "fix_audio"); // без категорийного префикса
+        assert_eq!(t.task_id, "fix_audio"); // no category prefix
         assert_eq!(t.status, STATUS_PENDING);
 
         let got = m.get_task("seat_t", &t.task_id).await.unwrap().unwrap();
@@ -867,7 +868,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(p.project_id, "vassista"); // без категорийного префикса
+        assert_eq!(p.project_id, "vassista"); // no category prefix
         assert_eq!(p.auto_load, vec!["core_manifest".to_string()]);
 
         let t = m
@@ -933,7 +934,7 @@ mod patch_tests {
             "phase_8_m3_mobile_polnyy_klient"
         );
         assert_eq!(crate::model::slug_name("Миграция БД"), "migratsiya_bd");
-        // Только мусор → пустой слаг (caller сделает unique_id fallback).
+        // Only garbage → empty slug (the caller makes the unique_id fallback).
         assert_eq!(crate::model::slug_name("!!! ???"), "");
     }
 
@@ -951,8 +952,8 @@ mod patch_tests {
     #[test]
     fn patch_replace_and_remove_section() {
         let body = "# Задача\n\nвводная\n\n## Фаза 1\n\nстарый шаг\n\n### Подшаг\n\nдетали\n\n## Фаза 2\n\nфинал\n";
-        // replace_section меняет только контент до следующего заголовка ТОГО ЖЕ
-        // уровня (подшаги внутри — тоже затрагиваются).
+        // replace_section only changes the content up to the next heading of
+        // THE SAME level (nested subheadings inside are affected too).
         let out = apply_description_patch(
             body,
             &json!([{"op":"replace_section","heading":"## Фаза 1","content":"новый шаг"}]),
@@ -962,7 +963,7 @@ mod patch_tests {
         assert!(!out.contains("старый шаг"));
         assert!(!out.contains("Подшаг"));
         assert!(out.contains("## Фаза 2\n\nфинал"));
-        // remove_section убирает и заголовок.
+        // remove_section removes the heading too.
         let out2 = apply_description_patch(
             body,
             &json!([{"op":"remove_section","heading":"## Фаза 2"}]),

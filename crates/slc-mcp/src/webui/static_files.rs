@@ -1,4 +1,4 @@
-//! Раздача статики SPA (web-ui/dist) с fallback на index.html.
+//! SPA static file serving (web-ui/dist) with a fallback to index.html.
 
 use crate::server::AppState;
 use axum::{
@@ -33,7 +33,7 @@ fn mime_for(path: &str) -> &'static str {
 pub async fn handler(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let raw = uri.path().trim_start_matches('/');
     let rel = if raw.is_empty() { "index.html" } else { raw };
-    // Защита от path traversal.
+    // Path traversal protection.
     let rel = rel.replace("..", "");
     let file = state.dist.join(&rel);
     let body = if file.is_file() {
@@ -51,7 +51,7 @@ pub async fn handler(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
             resp
         }
         None => {
-            // SPA fallback: неизвестный маршрут → index.html.
+            // SPA fallback: unknown route → index.html.
             match tokio::fs::read(state.dist.join("index.html")).await {
                 Ok(bytes) => {
                     let mut resp = Response::new(Body::from(bytes));
@@ -66,6 +66,6 @@ pub async fn handler(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     }
 }
 
-// Request не используется, но сигнатура нужна для fallback-роута.
+// Request is unused, but the signature is needed for the fallback route.
 #[allow(dead_code)]
 fn _assert(_: Request<Body>) {}

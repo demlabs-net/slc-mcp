@@ -7,7 +7,7 @@
   let error = $state('');
   let loading = $state(false);
 
-  // oauth_error из hash-фрагмента (#/login?oauth_error=exchange_failed)
+  // oauth_error from the hash fragment (#/login?oauth_error=exchange_failed)
   let oauthError = $state('');
   if (typeof window !== 'undefined') {
     const q = new URLSearchParams(window.location.hash.split('?')[1] || '');

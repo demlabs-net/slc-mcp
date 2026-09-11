@@ -1,5 +1,5 @@
-//! JWT-менеджер — 1:1 с легаси `src/auth/jwt_manager.py`:
-//! HS256, access 30 минут, refresh 7 дней, claims `type: access|refresh`.
+//! JWT manager — 1:1 with legacy `src/auth/jwt_manager.py`:
+//! HS256, access 30 minutes, refresh 7 days, claims `type: access|refresh`.
 
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ impl JwtManager {
 
     fn decode(&self, token: &str) -> Result<Claims, String> {
         let mut validation = Validation::new(Algorithm::HS256);
-        // exp проверяем вручную (jsonwebtoken не отдаёт время истечения).
+        // exp is checked manually (jsonwebtoken does not expose the expiry time).
         validation.validate_exp = false;
         let data = decode::<Claims>(
             token,
@@ -97,7 +97,7 @@ impl JwtManager {
         })
     }
 
-    /// Валидация access-токена (легаси `verify_token` — только type=access).
+    /// Validate an access token (legacy `verify_token` — access type only).
     pub fn verify_access(&self, token: &str) -> Result<Claims, String> {
         let claims = self.decode(token)?;
         if claims.token_type != "access" {
@@ -106,7 +106,7 @@ impl JwtManager {
         Ok(claims)
     }
 
-    /// Валидация refresh-токена; возвращает user_id (легаси
+    /// Validate a refresh token; returns the user_id (legacy
     /// `verify_refresh_token`).
     pub fn verify_refresh(&self, token: &str) -> Result<String, String> {
         let claims = self.decode(token)?;

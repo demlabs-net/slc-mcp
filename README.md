@@ -1,217 +1,302 @@
-# SLC MCP
+# SLC — Smart Layered Context memory server
 
-Rust MCP server for shared agent context: knowledge documents, projects,
-tasks, episodic history, focuses, reminders, hybrid semantic/BM25 search, and
-per-seat working context. Obsidian is the default storage backend.
+SLC is a memory server for AI agents. It gives every agent (or every
+human-operated client) a **persistent, shared working memory**: knowledge
+documents, projects and tasks, an episodic diary with progressive
+summarization, focuses, reminders, and hybrid semantic + BM25 search over all
+of it.
 
-## Local run
+The core idea is a **seat** — a stable identity that owns its own documents,
+tasks, and context. A coding agent keeps one seat across sessions; its
+working context (active document, base knowledge, profiles, focuses) is
+assembled on demand, compressed when it does not fit the model window, and
+snapshotted back into episodic history when the work is done.
+
+SLC ships as a single self-contained server that speaks three protocols at
+once:
+
+- **MCP** (Model Context Protocol, Streamable HTTP) — for agent clients;
+- **REST API** — for web UIs, scripts, and integrations;
+- **Web UI** — a bundled Svelte SPA served by the same process.
+
+The default storage backend is an **Obsidian vault** (plain markdown files
+plus sidecars), so the knowledge base remains human-readable and
+git-versioned. SQLite and MongoDB backends are available as alternatives.
+
+---
+
+## How it works
+
+```
+┌─────────────────────────────── slc-mcp (one process) ───────────────────────┐
+│  MCP  /mcp /sse /messages          REST /api/*          Web UI (SPA) /      │
+│        └──────────────┬────────────────┘───────────────────────┘            │
+│                 slc-core engine (single owner of the vault)                 │
+│                                                                             │
+│  Documents · Projects · Tasks │ Episodic history L1→L4 │ Focuses/reminders  │
+│  Hybrid search (BM25+vectors) │ Seats & context        │ Auth (JWT/OAuth)   │
+└───────────────────────────────┬─────────────────────────────────────────────┘
+                                ▼
+              Obsidian vault (default) · SQLite · MongoDB
+```
+
+Because one process owns the storage, there are no concurrent-access
+conflicts: the vault is the single source of truth, and all writes are
+serialized through the engine.
+
+### Memory model
+
+- **Everything is a document.** Projects, tasks, skills, and knowledge notes
+  share one unified `Document` model with a unique, human-readable id.
+  Documents carry `auto_load` (working links pulled into context) and
+  `references` (passive mentions).
+- **Episodic history** is separate: agents write diary entries
+  (`remember`), which are progressively summarized L1 → L2 → L3 → L4 and
+  consolidated into permanent facts. History is never embedded or searched —
+  it is raw material for reflection.
+- **Focuses** are what the agent is concentrating on (with priorities and
+  dependencies); **reminders** schedule one-shot or periodic callbacks.
+- **Seat context** is assembled by `update_context`: the active document,
+  base knowledge, profiles, and focuses, trimmed to the token budget by
+  dropping low-priority blocks first and, when needed, LLM-compressing the
+  rest — never by truncating documents by hand.
+
+---
+
+## Quick start
+
+### Docker (recommended)
 
 ```bash
-cp .env.example .env
+cp .env.example .env          # set SLC_VAULT_PATH, LLM provider, etc.
+./deploy.sh up                # builds the image, inits the vault, starts
+```
+
+The server listens on `http://127.0.0.1:3000`.
+
+### From source
+
+```bash
 cargo run -p slc-mcp -- serve --port 3000
 ```
 
-The service exposes:
-
-- MCP: `POST /mcp`
-- health: `GET /health`
-- REST/UI: `GET /api/*` and `/`
-
-Set `SLC_VAULT_PATH` to the Obsidian vault. The development swarm enables
-`SLC_MCP_SAMPLING=true`: seat-scoped reasoning is delegated to the model of the
-connected MCP client with `sampling/createMessage`, so SLC has no dedicated
-generative endpoint. `SLC_LLM=hash` is the fail-closed provider for CLI paths
-that run without a connected client. Search itself remains available through
-BM25; agents perform multi-hop retrieval by iterating the search and read tools.
-Standalone installations may instead configure `SLC_LLM` and the matching
-LM Studio, Ollama, or Candle provider variables.
-
-The MCP endpoint is standard Streamable HTTP and currently negotiates MCP
-`2025-03-26`. It returns an object result for legacy `ping` requests and
-accepts JSON-RPC notifications with HTTP 202 and an empty body. No Hermes
-patch is required: compatibility is verified with the official MCP SDK as an
-independent client. Newer protocol revisions that omit `ping` continue to use
-the same initialize/tools flow.
-
-`update_context` applies only the seat's configured context-token budget. It
-does not invoke an LLM merely to fit a Hermes- or vendor-specific output cap.
-Large tool results, including a single document with a large `content` field,
-can use SLC's advertised `get_page` extension;
-the extension is carried in ordinary MCP `TextContent` and needs no transport
-patch in the client. Every non-final page ends with the exact next
-`mcp__slc__get_page({...})` invocation and a mandatory continuation instruction.
-The final page explicitly marks pagination complete. Clients must follow the
-advertised command page by page before acting on the result.
-
-Pagination is enabled by default. `SLC_PAGINATION_ENABLED` toggles it for the
-server and `SLC_PAGE_TOKEN_LIMIT` sets both the approximate page size and the
-threshold at which a list response is paginated (default `50000` tokens).
-`set_page_limit` persists the default when no environment override is present.
-An MCP client may override response shaping for only its own HTTP connection:
-
-- `X-SLC-Pagination: enabled|disabled`
-- `X-SLC-Page-Token-Limit: <tokens>`
-- `X-SLC-Context-Token-Limit: <tokens>` sets the `update_context` and
-  `save_context` budget for that connection without changing the seat-wide
-  value.
-
-`SLC_CONTEXT_LIMIT_TOKENS` is a fallback, not a maximum (default `100000`).
-Clients should choose their own budget explicitly through the connection
-header or persist a seat-specific value with `command {"input":"/limit N"}`.
-For example, deployments may choose 50K, 100K, or 300K for different model
-windows; these are configuration examples and are not model tiers built into
-SLC.
-
-These are optional HTTP transport headers; the JSON-RPC/MCP message format is
-unchanged, so clients using the official SDK remain fully compatible.
-
-The generic seat-scoped `state_get`, `state_put`, `state_list`, and
-`state_delete` tools expose optimistic-concurrency text objects for external
-memory, skills, or other clients. They are ordinary MCP tools, not a
-Hermes-specific transport. `expected_etag` prevents silent concurrent
-overwrites; SLC also isolates every object by the authenticated `X-Seat-ID`.
-
-## agent-dev-0 deployment
-
-The development swarm uses:
-
-- source: `/opt/demlabs-dev-swarm/slc-mcp`
-- container: `dev-swarm-slc-mcp`
-- vault: `/opt/demlabs-dev-swarm/slc-vault`
-- MCP from swarm containers: `http://slc-mcp:3000/mcp`
-- host MCP: `http://127.0.0.1:3000/mcp`
-- web UI: `http://agent-dev-0:2002`
-- private Forgejo repository: `devops/slc-vault`
-- inference: seat-scoped MCP sampling; no dedicated LM Studio/Ollama model
-
-Deploy with:
+### First MCP call
 
 ```bash
-./scripts/build-deb.sh
-docker compose -f docker-compose.agent-dev.yml up -d --build
+curl -X POST http://127.0.0.1:3000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'X-Seat-ID: my-agent' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"add_document",
+                 "arguments":{"document_id":"hello_world","category":"custom",
+                              "content":"Hello from SLC"}}}'
 ```
 
-The build script runs the Rust workspace tests and packages the exact checkout
-into the ignored `dist/` directory consumed by the runtime image.
+The seat is created on first use and persists. Point an MCP client at
+`http://host:3000/mcp` (or the `/sse` stream) and the full tool catalog
+appears automatically.
 
-The vault is an independent Git repository. Runtime Git access uses a
-write-enabled deploy key from `slc-mcp/secrets/`; secrets and the vault itself
-must never be committed to this source repository. With
-`OBSIDIAN_AUTO_GIT_COMMIT=true`, document and operational sidecar writes are
-committed and pushed automatically. Volatile seat access heartbeats are
-coalesced to avoid a push for every read-only MCP request. Rebuildable
-`.slc/index.json` and `.slc/embeddings.json` caches are kept locally and
-managed in the vault `.gitignore`; authoritative `.slc/records.json`, timers,
-Markdown documents, task events and seat state remain versioned.
+---
 
-## Seats and lifecycle
+## Configuration
 
-The swarm authenticates with `SLC_MCP_AUTH=legacy_seat_id`. Every role sends
-its unique stable seat in the `X-Seat-ID` header. The manager has the
-`operator` role, but cross-seat access remains fail-closed: a target must also
-be listed explicitly in `SLC_SEAT_MANAGE_ACL`. Public document visibility is
-not write permission: an existing document can be changed or deleted only by
-its owning seat or an explicitly scoped operator.
+Copy `.env.example` to `.env`. Key variables:
 
-Hermes hooks call `update_context` before every model iteration and
-`save_context` afterward. Cron runs and delegated subagents use the same
-hooks. The Developer harness receives the SLC URL and seat header from its
-wrapper, which also records runner-start and runner-end lifecycle snapshots.
-Junior roles work directly through Hermes and share the same lifecycle hooks.
-Hermes' built-in memory and agent-created skill tree use the same seat through
-the generic external-state tools; the container-local writable tree is only a
-process cache.
+| Variable | Default | Purpose |
+|---|---|---|
+| `SLC_VAULT_PATH` | `~/.slc/vault` | Obsidian vault (or SQLite file) location |
+| `SLC_LLM` | — | Provider: `lmstudio`, `ollama`, `candle`, `hash` |
+| `SLC_MCP_SAMPLING` | `false` | Delegate reasoning to the connected MCP client (`sampling/createMessage`); no generative endpoint needed. `SLC_LLM=hash` is then the fail-closed fallback for CLI paths |
+| `LMSTUDIO_URL` / `LMSTUDIO_MODEL` / `LMSTUDIO_EMBED_MODEL` | — | OpenAI-compatible LM Studio endpoint and models |
+| `OLLAMA_ENDPOINT` / `OLLAMA_REASONING_MODEL` / `OLLAMA_EMBEDDING_MODEL` | — | Ollama fallback |
+| `SLC_AI_ORGANIZE` | `true` | Ask the reasoning LLM where a new document belongs (project folder) |
+| `OBSIDIAN_AUTO_GIT_COMMIT` | `false` | Commit vault changes to git after writes |
+| `SLC_MCP_AUTH` | `legacy_seat_id` | MCP auth: `legacy_seat_id`, `bearer_plus_seat`, `embedded` |
+| `SLC_MCP_TOKEN` | — | Bearer token when `SLC_MCP_AUTH=bearer_plus_seat` |
+| `SLC_AUTH` | `seat` | Web-UI/REST auth: `seat` or `full` (users + JWT + Yandex OAuth) |
+| `SLC_SEAT_TTL_SECONDS` | `86400` | Seat expiry; `0` = never |
+| `SLC_SEAT_ROLES` | — | Seat roles, e.g. `boss=operator` |
+| `SLC_SEAT_MANAGE_ACL` | — | Explicit cross-seat targets, e.g. `boss=worker|tester` |
+| `SLC_CONTEXT_LIMIT_TOKENS` | `100000` | Fallback token budget for `update_context` |
+| `SLC_PAGINATION_ENABLED` | `true` | Paginate oversized tool responses |
+| `SLC_PAGE_TOKEN_LIMIT` | `50000` | Approximate page size in tokens |
+| `JWT_SECRET_KEY` | — | JWT signing key (required for `SLC_AUTH=full`) |
+| `YANDEX_CLIENT_ID` / `YANDEX_CLIENT_SECRET` | — | Yandex OAuth credentials for the web UI |
 
-## Durable task workflow
+---
 
-SLC is the source of truth for delegated work. `assign_task` creates the task
-with stable issuer/assignee principals and parent/root lineage; `start_task`,
-`report_task`, `cancel_task`, and `task_message` append immutable events and
-update the task projection. `get_task`, workflow-aware `list_tasks`, and
-`list_task_events` work without any message bus. Idempotency keys make assignment and event
-retries safe. Their durable task/event IDs also repair a crash between the
-primary write and its portable-backend idempotency index. Old retries do not
-rewind the latest-event cursor, while their monotonic status transition is
-still repaired if the crash happened before the projection write. Workflow
-mutations are serialized so concurrent retries cannot create duplicate events.
-Caller-owned assignment metadata is isolated from SLC projection fields and
-returned as `task.metadata`.
+## MCP server
 
-Every assignee has a durable FIFO with capacity one. A new assignment is
-`ready` only when it owns the lane; later work remains `queued`. `start_task`
-rejects queued work, and every progress or terminal report requires the task
-to be running, so a queued task cannot close past the FIFO head. A terminal
-report releases the lane; `reconcile_task_queue` then promotes the oldest
-queued task and repairs interrupted projection writes or duplicate `ready`
-reservations. A non-running `ready` reservation that is not the oldest item is
-demoted and the true head is restored. Multiple actual `running` writers remain
-a hard error because choosing one automatically would be unsafe. Backend filtering happens before
-the 5000-item per-assignee safety bound, preventing unrelated or old terminal
-tasks from truncating a role queue silently. The queue is per agent profile,
-independently of how many global parallel slots its inference backend exposes.
-Assignment idempotency remains replayable after terminal tasks leave the
-runnable FIFO. `cancel_task` lets the issuer, assignee, or global coordinator
-remove queued/ready work without starting it; cancelling a reserved head also
-promotes the next FIFO item. It deliberately rejects a running task: SLC does
-not own the executor process and therefore cannot safely release that lane.
-The assignee must submit the terminal report; after a crashed run is confirmed
-idle, send the assignee a durable `task_message` for that same task and dispatch
-its returned delivery rather than creating a parallel replacement. The
-recovery run reports the already-running task without calling `start_task`
-again. Only the assignee may call `report_task`, so a global coordinator cannot
-accidentally close a writer that is still running.
+Endpoints (Streamable HTTP, MCP `2025-03-26`):
 
-Configure `SLC_PRINCIPAL_SEATS` to map transport-neutral participant names to
-the existing SLC seats, and configure delegation independently with
-`SLC_TASK_ASSIGN_ACL`. A global coordinator requires an explicit `"*"` grant.
-`SLC_PRINCIPAL_POLICY_DOCUMENTS` maps each principal to the mutable SLC policy
-document that is automatically appended to every new task's `auto_load` chain.
-`update_context` recursively resolves that chain, so activating the task does
-not hide the assignee's live operating policy.
-`SLC_TEXT_ONLY_PRINCIPALS` prevents non-vision models from claiming visual
-acceptance while still allowing them to report hashes, dimensions, and other
-machine evidence.
+| Endpoint | Purpose |
+|---|---|
+| `POST /mcp` | JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`, …) |
+| `GET /sse`, `POST /messages` | Streamable HTTP SSE transport |
+| `GET /health` | Health check |
 
-A delivery adapter is optional. Assignment, reconciliation, message, and
-report results include a sibling `wake_recommended` flag and, when applicable,
-a four-field
-`delivery` envelope: recipient, opaque task correlation ID, stable
-event-derived idempotency key, and a content-free instruction to read SLC.
-When a wake is recommended, a caller may pass `delivery` unchanged through
-Swarm MCP, Matrix, or another adapter. A queued assignment returns
-`wake_recommended=false` and must not be delivered until reconciliation exposes
-it as the single ready head. The task description, message, and
-report body remain only in SLC. Replacing the adapter therefore does not
-migrate task state or conversation history.
+Auth is per-request: the client sends its seat in the `X-Seat-ID` header
+(`SLC_MCP_AUTH=legacy_seat_id`, the default). In `bearer_plus_seat` mode a
+bearer token is required as well.
 
-Cancellation never recommends waking the cancelled task itself. If cancelling
-the reserved head exposes another task, `next_wake_recommended=true` and the
-separate `next_delivery` envelope identify the only run that should be started.
+With `SLC_MCP_SAMPLING=true`, reasoning requests (compression,
+consolidation, AI id naming) are returned to the authenticated seat's
+connected MCP client as `sampling/createMessage` — SLC then needs no
+dedicated generative endpoint; embeddings degrade to BM25 text search.
 
-## Mongo migration
+### Tool groups
 
-Back up MongoDB first, then import into an empty vault:
+- **Knowledge**: `add_document`, `get_document`, `update_document`,
+  `delete_document`, `list_documents`, `rename_document`, `search`
+- **Tasks & projects**: `create_task`, `update_task`, `delete_task`,
+  `activate_task`, `rename_task`, and the matching `*_project` tools
+- **Memory**: `remember`, `recall`, `compress`, `consolidate`
+- **Context**: `update_context`, `save_context`, slash commands (`/ctx`,
+  `/limit N`, `/search …`)
+- **Focuses & reminders**: `focus_add` / `focus_update` / `focus_remove`,
+  `reminder_create` / `reminder_cancel`, notifications
+- **Seats**: `seat_roles`, cross-seat activation via `target_seat`
+- **External state**: `state_get` / `state_put` / `state_list` /
+  `state_delete` — seat-scoped, optimistic-concurrency text objects
+- **Pagination**: `get_page`, `delete_response`, `set_page_limit`,
+  `get_page_settings`
+
+### Editing documents
+
+Bodies are edited with **diff operations only** (`diff`): `append`,
+`prepend`, `replace_section`, `remove_section`, addressed by markdown
+headings. Full-body replacement is not exposed for updates; the legacy
+`description` / `description_patch` parameters are still accepted for
+compatibility with older agent instructions, but new clients should use
+`diff`.
+
+Renames (`rename_document`, `rename_task`, `rename_project`) cascade: they
+rewrite `auto_load`/`references`, project bindings, `[[wiki-links]]` in body
+text, active seat pointers, and embeddings.
+
+### Pagination
+
+Large tool responses are paginated instead of truncated. The first page
+carries `_pagination` (`response_id`, `page`, `total_pages`) and an explicit
+instruction to fetch the rest with `get_page(response_id=…, page=2..N)`.
+Documents larger than a page are split by content into parts (`part: "k/n"`)
+that reassemble losslessly.
+
+If your client's harness truncates tool output, lower the page size:
+
+- per connection: header `X-SLC-Page-Token-Limit: <tokens>`;
+- persisted: `set_page_limit(<tokens>)` (or env `SLC_PAGE_TOKEN_LIMIT`).
+
+A page of `N` tokens ≈ `N×3` characters ≈ `N×9` bytes of Cyrillic text.
+The default page size is `50000` tokens (large responses stay single-page
+unless they are truly huge); if your client harness truncates output at a
+byte budget, lower the limit to roughly `budget_bytes / 9` (e.g. `5000` for
+a 50 KB budget).
+
+---
+
+## Seats, roles and cross-seat management
+
+A **seat** is the unit of ownership and context. Clients authenticate as a
+seat, and all their documents, tasks, focuses, and context belong to it.
+
+Seats can be granted roles:
+
+- `operator` — may manage the *context* of other seats: activate/deactivate
+  their documents, tasks, projects, and focuses (tools accept a
+  `target_seat` argument).
+
+A role alone grants nothing across seats: an operator must also have an
+explicit target in `SLC_SEAT_MANAGE_ACL`, e.g.
+`SLC_SEAT_MANAGE_ACL=planner=worker_a|worker_b` or `root=*`. This keeps an
+accidentally configured `operator` from becoming a global administrator.
+
+---
+
+## Web UI and REST API
+
+The same process serves a Svelte 5 web UI and a REST API (`/api/*`):
+
+- documents, tasks, projects, seats, search, stats, context, notifications,
+  reminders, focuses — with CRUD where applicable;
+- `GET /api/events` — SSE notification stream;
+- `GET /api/auth/…` — user authentication endpoints.
+
+Two auth modes for the web layer (`SLC_AUTH`):
+
+- `seat` (default): the browser keeps a seat id (header or cookie); anyone
+  with network access can use the service — suitable for trusted networks.
+- `full`: real user accounts. Users register or log in (password, bcrypt),
+  receive JWT access/refresh tokens with rotation, and may sign in via
+  **Yandex OAuth** with an allowlist (explicit rules or organization
+  membership via Yandex 360 Directory). Admin endpoints manage users,
+  groups, and OAuth rules. In this mode every API request is tied to the
+  user's own seat.
+
+---
+
+## Storage backends
+
+| Backend | When to use |
+|---|---|
+| **Obsidian vault** (default) | Human-readable markdown + frontmatter, git-versioned, editable in Obsidian |
+| SQLite | Embedded single-file storage |
+| MongoDB | Legacy deployments; migration source |
+
+The vault layout is hierarchical: `docs/<category>/…` for knowledge,
+`docs/projects/<project>/…` for project-scoped documents, `seats/` for seat
+records, and `.slc/` for indexes, embeddings, and auth state.
+
+---
+
+## CLI
+
+The same binary doubles as a CLI for maintenance and scripting:
 
 ```bash
-slc-mcp migrate \
-  --from-mongo mongodb://HOST:27017 \
-  --db slc_mcp \
-  --vault /path/to/slc-vault
+slc-mcp serve [--port 3000] [--auto-commit]   # run the server
+slc-mcp status                                 # backend + health
+slc-mcp search "query" --seat SEAT_ID          # hybrid search
+slc-mcp remember SEAT_ID EVENT_ID "text"       # write a diary entry
+slc-mcp compress SEAT_ID                       # run L1→L4 summarization
+slc-mcp consolidate SEAT_ID                    # extract permanent facts
+slc-mcp migrate --from-mongo URI --db slc_mcp  # import a legacy deployment
+slc-mcp reindex-embeddings                     # rebuild vectors after model change
+slc-mcp init                                   # provider/model setup wizard
 ```
 
-Legacy document, task, and project IDs are preserved by default so active
-seat pointers and references remain valid. Use `--rename-with-ai` only for an
-explicit, reviewed rename migration. Disable automatic Git commits during a
-bulk import, reindex embeddings afterward, inspect the migration report, and
-create the initial vault commit only after validation.
-
-Useful commands:
+### Migrating from the legacy Python SLC
 
 ```bash
-slc-mcp reindex-embeddings
-slc-mcp search "query" --seat SEAT_ID
-slc-mcp status
+slc-mcp migrate --from-mongo mongodb://HOST:27017 --db slc_mcp \
+  --to-vault /path/to/slc-vault [--rename-with-ai]
 ```
 
-The migrated legacy Mongo data should be retained separately for rollback;
-the production service does not need Mongo after a successful cutover.
+Legacy ids are preserved by default so existing seat pointers and references
+stay valid; `--rename-with-ai` renames ids to human-readable slugs with the
+reasoning LLM and rewrites all links. After a bulk import, reindex
+embeddings and review the migration report before the first vault commit.
+
+---
+
+## Development
+
+```text
+crates/slc-core   engine library (also built as a staticlib for embedding)
+crates/slc-mcp    server binary: MCP + REST + web UI + CLI
+web-ui/           Svelte 5 SPA
+```
+
+```bash
+cargo build -p slc-mcp
+cargo test -p slc-core -p slc-mcp
+```
+
+Packaging: the Dockerfile consumes a `.deb` produced locally
+(`cargo deb -p slc-mcp -o dist`, plus the SPA built into `web-ui/dist`), so
+the image itself contains no toolchain. `docker-compose.yml` builds from
+source for local development.
+
+## License
+
+MIT

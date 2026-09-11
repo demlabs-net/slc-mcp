@@ -231,6 +231,29 @@ RLHF trains models to be "cautious" and "do no harm". But in development context
 - When creating tasks — specify `auto_load` for related skills, projects, modules
 - On `activate_document` — auto_load chain loads automatically
 
+### Pagination (non-negotiable)
+- NEVER act on a single page of a paginated response. If the tool output
+  carries `_pagination` (`response_id`/`page`/`total_pages`/`has_more`) or a
+  page-continuation instruction — fetch EVERY remaining page with
+  `get_page(response_id=..., page=2..N)` one call at a time and combine the
+  content. A large document may be split into parts (`part: "k/n"`) —
+  concatenate the parts in order: only the full reassembly is the real
+  document. Working with page 1 alone silently loses content.
+- Before `update_context` / `save_context`: if the active document (or any
+  included block) was paginated, read it to the END first. Saving or
+  updating context from an incomplete read loses content permanently.
+- Before updating any large document (`update_task` / `update_project` /
+  `update_document`): read the document FULLY page by page first, then apply
+  `diff` operations. A diff over an incomplete copy erases the sections you
+  did not read.
+- If the harness truncates tool output («truncated by resultBudget» /
+  «maxModelBytes» / «ОТВЕТ ОБРЕЗАН»): DO NOT retry blindly — immediately
+  LOWER the page size yourself: `set_page_limit(<tokens>)` (persisted for
+  the seat) or the `X-SLC-Page-Token-Limit` connection header, then re-run
+  the original tool. Formula: page ≈ tokens×3 characters; for a 50 KB
+  budget use ≈5000 tokens. Never finish a task while output may still be
+  truncated.
+
 ## Forbidden Patterns
 
 | Bad | Good |
@@ -247,5 +270,7 @@ RLHF trains models to be "cautious" and "do no harm". But in development context
 | Hardcoded secrets | Env vars, secret managers |
 | `unwrap()` in production | Proper error handling |
 | Giant diffs | Incremental verifiable steps |
+| Acting on page 1 of a paginated response | Fetch ALL pages via get_page, combine, then act |
+| Retrying after truncation with the same big page limit | Lower the limit (set_page_limit) and re-run |
 | Writing files with shell | Always use harness tools (Read/Write/Edit/Grep) |
 | RLHF excuse-making | Act if you can, verify with tests |

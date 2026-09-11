@@ -2,24 +2,24 @@
 # SLC MCP — deploy helper (Docker, Obsidian vault, LM Studio provider, web UI).
 #
 # Usage:
-#   ./deploy.sh build     — собрать образ slc-mcp (MCP + REST + SPA одним процессом)
-#   ./deploy.sh up        — создать vault (+git init), поднять сервис, ждать /health
-#   ./deploy.sh down      — остановить сервисы
-#   ./deploy.sh status    — статус + /health (MCP) и /api/health (webui)
-#   ./deploy.sh logs      — логи (follow)
-#   ./deploy.sh migrate   — импорт БЗ+сидов из легаси-Mongo (CLI --from-mongo;
-#                           legacy id сохраняются, если явно не включён rename)
-#   ./deploy.sh reindex   — пересобрать эмбеддинги текущим провайдером
+#   ./deploy.sh build     — build the slc-mcp image (MCP + REST + SPA in one process)
+#   ./deploy.sh up        — create the vault (+git init), start services, wait for /health
+#   ./deploy.sh down      — stop the services
+#   ./deploy.sh status    — status + /health (MCP) and /api/health (web UI)
+#   ./deploy.sh logs      — follow logs
+#   ./deploy.sh migrate   — import KB + seats from legacy Mongo (CLI --from-mongo;
+#                           legacy ids are kept unless rename is enabled explicitly)
+#   ./deploy.sh reindex   — rebuild embeddings with the current provider
 #
-# Config: .env в корне репо (копия .env.example). Путь vault: $SLC_VAULT
-# (по умолчанию ~/Obsidian/slc-vault).
+# Config: .env in the repo root (copy of .env.example). Vault path: $SLC_VAULT
+# (default ~/Obsidian/slc-vault).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 VAULT_PATH="${SLC_VAULT:-$HOME/Obsidian/slc-vault}"
-export SLC_VAULT_HOST_PATH="$VAULT_PATH"   # используется docker-compose.yml
+export SLC_VAULT_HOST_PATH="$VAULT_PATH"   # consumed by docker-compose.yml
 COMPOSE=(docker compose)
 ENV_FILE="$ROOT/.env"
 HEALTH_URL="http://127.0.0.1:3000/health"
@@ -27,7 +27,7 @@ HEALTH_URL="http://127.0.0.1:3000/health"
 ensure_env() {
     if [ ! -f "$ENV_FILE" ]; then
         cp "$ROOT/.env.example" "$ENV_FILE"
-        echo "created $ENV_FILE from .env.example — проверьте настройки (LMSTUDIO_URL и т.п.)"
+        echo "created $ENV_FILE from .env.example — review the settings (LMSTUDIO_URL etc.)"
     fi
 }
 
@@ -41,7 +41,7 @@ wait_health() {
         fi
         sleep 2
     done
-    echo "ERROR: сервер не ответил за $((tries * 2))с — смотри ./deploy.sh logs" >&2
+    echo "ERROR: server did not respond within $((tries * 2))s — see ./deploy.sh logs" >&2
     return 1
 }
 
@@ -52,13 +52,13 @@ cmd_build() {
 cmd_up() {
     ensure_env
     mkdir -p "$VAULT_PATH"
-    # git-репозиторий vault — нужен при OBSIDIAN_AUTO_GIT_COMMIT=true.
+    # Vault git repository — required when OBSIDIAN_AUTO_GIT_COMMIT=true.
     if ! git -C "$VAULT_PATH" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         git -C "$VAULT_PATH" init -q
         echo "vault git init: $VAULT_PATH"
     fi
-    # Сервер коммитит с author-идентичностью из env; committer identity —
-    # из конфига репозитория (иначе git commit молча падает).
+    # The server commits with the author identity from env; the committer
+    # identity comes from the repo config (otherwise git commit silently fails).
     git -C "$VAULT_PATH" config user.name "slc-mcp" >/dev/null 2>&1 || true
     git -C "$VAULT_PATH" config user.email "slc-mcp@local" >/dev/null 2>&1 || true
     "${COMPOSE[@]}" up -d
@@ -76,9 +76,9 @@ cmd_down() {
 cmd_status() {
     "${COMPOSE[@]}" ps
     echo
-    curl -sS -m 3 "$HEALTH_URL" || echo "(health недоступен)"
+    curl -sS -m 3 "$HEALTH_URL" || echo "(health unavailable)"
     echo
-    curl -sS -m 3 "http://127.0.0.1:3000/api/health" || echo "(webui health недоступен)"
+    curl -sS -m 3 "http://127.0.0.1:3000/api/health" || echo "(web UI health unavailable)"
 }
 
 cmd_logs() {
@@ -123,9 +123,9 @@ cmd_migrate() {
             --to-vault /data/vault \
             "${rename_args[@]}"
     echo
-    echo "Импорт завершён. Перезапустите сервер, чтобы он пересобрал индекс:"
+    echo "Import finished. Restart the server so it rebuilds the index:"
     echo "  ./deploy.sh down && ./deploy.sh up"
-    echo "затем пересоберите эмбеддинги: ./deploy.sh reindex"
+    echo "then rebuild embeddings: ./deploy.sh reindex"
 }
 
 cmd_reindex() {

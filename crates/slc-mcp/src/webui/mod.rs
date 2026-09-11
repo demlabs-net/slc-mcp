@@ -1,9 +1,10 @@
-//! Веб-морда: REST API + статика SPA, встроенные прямо в MCP-сервер.
+//! Web frontend: REST API + SPA static files, embedded right into the MCP
+//! server.
 //!
-//! Один процесс владеет vault'ом — конфликтов одновременного доступа нет
-//! (refresh-луп остаётся для внешних изменений vault, например ручных правок
-//! в Obsidian или `git pull`). REST-хендлеры работают через тот же
-//! `Arc<SlcEngine>`, что и MCP-тулы.
+//! A single process owns the vault — no concurrent-access conflicts (the
+//! refresh loop remains for external vault changes, e.g. manual edits in
+//! Obsidian or `git pull`). REST handlers go through the same
+//! `Arc<SlcEngine>` as the MCP tools.
 
 pub mod api;
 pub mod static_files;

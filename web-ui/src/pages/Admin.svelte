@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Admin: пользователи (RBAC) + правила OAuth-allowlist + статус Y360.
-  // Порт auth-части легаси Admin.svelte / UserManagement / OAuthAccess.
+  // Admin: users (RBAC) + OAuth allowlist rules + Y360 status.
+  // Port of the auth part of the legacy Admin.svelte / UserManagement / OAuthAccess.
   import { onMount } from 'svelte';
   import { api } from '../lib/api';
   import { currentUser, isAdmin, isSuperAdmin } from '../lib/auth';
@@ -16,13 +16,13 @@
   let error = $state('');
   let notice = $state('');
 
-  // Форма правила
+  // Rule form
   let ruleType = $state('login');
   let ruleValue = $state('');
   let ruleGroups = $state('users');
   let ruleDesc = $state('');
 
-  // Назначение групп пользователю
+  // Assign groups to a user
   let pickUser = $state('');
   let pickGroups = $state<string[]>(['users']);
 
