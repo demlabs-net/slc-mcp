@@ -150,7 +150,26 @@ the 5000-item per-assignee safety bound, preventing unrelated or old terminal
 tasks from truncating a role queue silently. The queue is per agent profile,
 independently of how many global parallel slots its inference backend exposes.
 Assignment idempotency remains replayable after terminal tasks leave the
-runnable FIFO. `cancel_task` lets the issuer, assignee, or global coordinator
+runnable FIFO. Assignment responses expose additive machine fields:
+`invocation_outcome` is `created`, `replayed`, or
+`portfolio_identity_conflict`; `replayed`, `portfolio_identity_conflict`,
+`existing_task_id`, `next_attempt`, `fresh_transition`, and `delivery_needed`
+support branch-free schedulers. A pure replay returns the original task but
+emits no queue snapshot, delivery, wake, or SSE notification. If replay-time
+recovery newly creates the task's missing `ready` reservation,
+`fresh_transition=true` and `delivery_needed=true` permit exactly that recovered
+wake/SSE; the stable ready event id keeps transport delivery idempotent. A
+manager portfolio root collision remains a successful conflict outcome with the
+existing task and next historical attempt, not a transport-worthy error;
+reusing an idempotency key with a different fingerprint remains an error.
+Portfolio identity and index scans use the storage backend's explicit unbounded
+metadata-projection query, so all historical roots beyond the 5000-item
+runnable-queue bound are considered without loading task bodies.
+
+`task_message` similarly returns `replayed=false` only when it appends a new
+event. Exact replay returns the original event with `replayed=true` and no
+stale delivery, wake recommendation, or SSE notification; fingerprint mismatch
+remains an error. `cancel_task` lets the issuer, assignee, or global coordinator
 remove queued/ready work without starting it; cancelling a reserved head also
 promotes the next FIFO item. It deliberately rejects a running task: SLC does
 not own the executor process and therefore cannot safely release that lane.
