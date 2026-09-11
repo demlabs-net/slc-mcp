@@ -451,6 +451,51 @@ impl SlcEngine {
         targets
     }
 
+    /// Whether the operator stop covers this seat.
+    ///
+    /// The hold is operator-owned configuration (`SLC_WORKFLOW_HOLD_SEATS`), read
+    /// from the environment: no tool, document or agent instruction can clear it,
+    /// which is what makes it a stop rather than a suggestion. `*` covers every
+    /// seat, including ones created after the hold was configured.
+    pub fn workflow_held(&self, seat_id: &str) -> bool {
+        self.config.workflow_hold_seats.contains("*")
+            || self.config.workflow_hold_seats.contains(seat_id)
+    }
+
+    /// Resolve a workflow principal before consulting the exact-seat hold.
+    /// Unknown principals cannot receive execution authority.
+    pub fn workflow_principal_held(&self, principal: &str) -> bool {
+        self.workflow_seat(principal)
+            .is_none_or(|seat| self.workflow_held(&seat))
+    }
+
+    fn workflow_generation_current(&self, doc: &Document) -> bool {
+        self.config
+            .workflow_generation
+            .as_deref()
+            .is_none_or(|generation| {
+                workflow_string(doc, "workflow_generation").as_deref() == Some(generation)
+            })
+    }
+
+    /// Delivery authorization fails closed without affecting durable reporting.
+    pub async fn workflow_task_generation_current(&self, task_id: &str) -> bool {
+        if self.config.workflow_generation.is_none() {
+            return true;
+        }
+        matches!(self.store().kb_get(task_id).await, Ok(Some(doc)) if self.workflow_generation_current(&doc))
+    }
+
+    fn require_workflow_generation(&self, doc: &Document) -> SlcResult<()> {
+        if !self.workflow_generation_current(doc) {
+            return Err(SlcError::PermissionDenied(format!(
+                "operator generation fence: task {} belongs to an old or missing generation; inspect/report/cancel remain available; same-task recovery requires out-of-band operator authorization",
+                doc.document_id
+            )));
+        }
+        Ok(())
+    }
+
     pub fn can_assign_task(&self, seat_id: &str, assignee: &str) -> bool {
         let actor = self.workflow_principal(seat_id);
         actor == assignee
@@ -774,6 +819,12 @@ impl SlcEngine {
 
     /// Reconcile one principal's FIFO while the caller holds `workflow_lock`.
     /// Exactly one non-terminal task may reserve the lane as ready/running.
+    ///
+    /// This is the single promotion point, and it is reached from many callers
+    /// (assign, start, report, cancel, message, replay). A stop must therefore be
+    /// enforced HERE rather than only in the operator-facing wrapper: otherwise a
+    /// held seat could still have its successor promoted — and, via cancel, woken —
+    /// by reporting or cancelling. While held the queue is observed, never advanced.
     async fn reconcile_task_queue_locked(&self, assignee: &str) -> SlcResult<TaskQueueSnapshot> {
         let mut docs = self.assignee_queue_documents(assignee).await?;
         let running = docs
@@ -828,8 +879,10 @@ impl SlcEngine {
             docs = self.assignee_queue_documents(assignee).await?;
         }
 
-        if preserved.is_none()
+        if !self.workflow_principal_held(assignee)
+            && preserved.is_none()
             && let Some(head) = docs.first()
+            && self.workflow_generation_current(head)
         {
             let task_id = head.document_id.clone();
             let promotion_key = format!("queue-ready-v1:{task_id}");
@@ -879,7 +932,7 @@ impl SlcEngine {
                 .await?;
             if state == QUEUE_STATE_RUNNING {
                 running_task_id = Some(doc.document_id.clone());
-            } else {
+            } else if self.workflow_generation_current(doc) {
                 ready_task_id = Some(doc.document_id.clone());
             }
             entries.push(TaskQueueEntry { position: 0, task });
@@ -928,6 +981,15 @@ impl SlcEngine {
                 "unknown workflow principal: {assignee}"
             )));
         }
+        // Promotion hands out a wake envelope, so it must respect the same stop as
+        // assignment and start: otherwise a held seat could be woken by reconciling
+        // a queue that already existed before the hold.
+        if self.workflow_principal_held(&assignee) {
+            return Err(SlcError::PermissionDenied(format!(
+                "operator maintenance hold: the {assignee} task queue is not promoted while held; \
+                 inspection and reporting remain available"
+            )));
+        }
         self.reconcile_task_queue_locked(&assignee).await
     }
 
@@ -947,6 +1009,15 @@ impl SlcEngine {
         let _workflow_guard = self.workflow_lock.lock().await;
         let actor = self.workflow_principal(seat_id);
         let assignee = clean_required(assignee, "assignee", 128)?;
+        // A stop must not be bypassed by parking work in the queue: assignment is
+        // refused for a held assignee exactly like start_task, so nothing accumulates
+        // that would resume the moment the hold is lifted.
+        if self.workflow_principal_held(&assignee) {
+            return Err(SlcError::PermissionDenied(format!(
+                "operator maintenance hold: assigning work to {assignee} is disabled; \
+                 inspection and reporting remain available"
+            )));
+        }
         if !self.can_assign_task(seat_id, &assignee) {
             return Err(SlcError::PermissionDenied(format!(
                 "principal {actor} cannot assign tasks to {assignee}"
@@ -961,6 +1032,13 @@ impl SlcEngine {
             .as_object()
             .cloned()
             .ok_or_else(|| SlcError::InvalidInput("metadata must be a JSON object".into()))?;
+        if caller_metadata.contains_key("workflow_generation")
+            || caller_metadata.contains_key("operator_generation")
+        {
+            return Err(SlcError::InvalidInput(
+                "operator generation is reserved server-owned metadata".into(),
+            ));
+        }
         validate_manager_portfolio_metadata(&actor, project_id, &caller_metadata)?;
 
         let fingerprint = content_hash(&serde_json::to_string(&json!({
@@ -1002,6 +1080,7 @@ impl SlcEngine {
                 // original assignment must still return the original task
                 // projection instead of manufacturing a replacement.
                 let task = self.workflow_task_document(seat_id, task_id).await?;
+                self.require_workflow_generation(&task)?;
                 if effective_queue_state(&task) == QUEUE_STATE_TERMINAL {
                     return Ok(doc_to_task(&task));
                 }
@@ -1045,6 +1124,7 @@ impl SlcEngine {
                 )));
             }
             if let Some(recovered_doc) = recovered.pop() {
+                self.require_workflow_generation(&recovered_doc)?;
                 if workflow_string(&recovered_doc, "assignment_fingerprint").as_deref()
                     != Some(fingerprint.as_str())
                 {
@@ -1108,6 +1188,7 @@ impl SlcEngine {
             None
         };
         if let Some(parent) = parent.as_ref() {
+            self.require_workflow_generation(parent)?;
             inherit_parent_portfolio_metadata(parent, &mut caller_metadata)?;
         }
         // A manager-owned portfolio root is identified by its structured
@@ -1203,6 +1284,9 @@ impl SlcEngine {
         let mut workflow_metadata = Map::new();
         workflow_metadata.insert("workflow_metadata".into(), Value::Object(caller_metadata));
         workflow_metadata.insert("workflow_version".into(), json!(1));
+        if let Some(generation) = self.config.workflow_generation.as_deref() {
+            workflow_metadata.insert("workflow_generation".into(), json!(generation));
+        }
         workflow_metadata.insert("issuer".into(), json!(actor));
         workflow_metadata.insert("assignee".into(), json!(assignee));
         let assigned_at = Utc::now();
@@ -1477,9 +1561,15 @@ impl SlcEngine {
         idempotency_key: Option<&str>,
     ) -> SlcResult<(TaskInfo, TaskEvent)> {
         let _workflow_guard = self.workflow_lock.lock().await;
+        if self.workflow_held(seat_id) {
+            return Err(SlcError::PermissionDenied(
+                "operator maintenance hold: task starts are disabled; inspection and reporting remain available".into(),
+            ));
+        }
         let task_id = self.workflow_task_id_or_active(seat_id, task_id).await?;
         let task_id = task_id.as_str();
         let mut doc = self.workflow_task_document(seat_id, task_id).await?;
+        self.require_workflow_generation(&doc)?;
         let actor = self.workflow_principal(seat_id);
         if workflow_string(&doc, "assignee").as_deref() != Some(&actor) {
             return Err(SlcError::PermissionDenied(
@@ -2070,6 +2160,11 @@ impl SlcEngine {
             }
         }
         if let Some(obj) = metadata.and_then(Value::as_object) {
+            if obj.contains_key("workflow_generation") || obj.contains_key("operator_generation") {
+                return Err(SlcError::InvalidInput(
+                    "operator generation is reserved server-owned metadata".into(),
+                ));
+            }
             // Manager-owned structured task data stays isolated in
             // `workflow_metadata`, away from SLC projection fields.
             let sub = doc
@@ -2184,6 +2279,244 @@ mod tests {
             ..Default::default()
         };
         SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config)
+    }
+
+    /// The stop must hold on the promotion point itself, not only on the
+    /// operator-facing wrapper: reporting a task is allowed while held, but it must
+    /// not promote that seat's successor, and cancelling must not wake one.
+    #[tokio::test]
+    async fn held_seat_is_not_promoted_by_report_or_cancel() {
+        let mut engine = engine();
+        let first = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "junior",
+                "One",
+                "canonical",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("held-one"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_assign_task(
+                "seat-manager",
+                "junior",
+                "Two",
+                "canonical",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("held-two"),
+            )
+            .await
+            .unwrap();
+        // Started before the stop, exactly like a task that was already running.
+        engine
+            .workflow_start_task("junior", &first.task_id, "start", Some("held-start-1"))
+            .await
+            .unwrap();
+        engine.config.workflow_hold_seats.insert("*".into());
+
+        // Reporting is allowed while held...
+        engine
+            .workflow_report_task(
+                "junior",
+                &first.task_id,
+                "completed",
+                "done while held",
+                json!({}),
+                Some("held-report-1"),
+            )
+            .await
+            .unwrap();
+        // ...but the successor must NOT be promoted by it.
+        let listed = engine
+            .workflow_list_tasks(
+                "seat-manager",
+                TaskListScope::Visible,
+                None,
+                None,
+                Some("junior"),
+                None,
+                50,
+            )
+            .await
+            .unwrap();
+        for task in &listed {
+            let doc = engine
+                .workflow_task_document("junior", &task.task_id)
+                .await
+                .unwrap();
+            assert_ne!(
+                effective_queue_state(&doc),
+                QUEUE_STATE_READY,
+                "a held seat must not have a ready successor after reporting"
+            );
+        }
+
+        // Cancelling must not hand out a promoted successor either.
+        let second = listed.iter().find(|t| t.task_id != first.task_id).unwrap();
+        let (_, _, next_ready) = engine
+            .workflow_cancel_task(
+                "seat-manager",
+                &second.task_id,
+                "stop",
+                json!({}),
+                Some("held-cancel"),
+            )
+            .await
+            .expect("cancellation remains valid while held");
+        assert!(
+            next_ready.is_none(),
+            "cancel must not hand out a promoted successor while held"
+        );
+    }
+
+    /// Reconcile hands out a wake envelope, so it must be held too: otherwise an
+    /// already-queued task could be promoted and wake a held seat.
+    #[tokio::test]
+    async fn operator_hold_rejects_queue_promotion_for_a_held_seat() {
+        let mut engine = engine();
+        // Queued while released, so the backlog exists before the hold.
+        engine
+            .workflow_assign_task(
+                "seat-manager",
+                "junior",
+                "Queued before the stop",
+                "canonical",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("queued-before-hold"),
+            )
+            .await
+            .unwrap();
+        engine.config.workflow_hold_seats.insert("*".into());
+        let error = engine
+            .workflow_reconcile_task_queue("seat-manager", "junior")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("maintenance hold"));
+        engine.config.workflow_hold_seats.remove("*");
+        engine
+            .workflow_reconcile_task_queue("seat-manager", "junior")
+            .await
+            .unwrap();
+    }
+
+    /// A stop must block assignment too, not just start: otherwise work is parked in
+    /// the queue and resumes the moment the hold is lifted.
+    #[tokio::test]
+    async fn operator_hold_rejects_assignment_to_a_held_seat() {
+        let mut engine = engine();
+        engine.config.workflow_hold_seats.insert("*".into());
+        let error = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "junior",
+                "Held work",
+                "canonical",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("held-assign"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("maintenance hold"));
+        // Nothing was queued for that assignee while the hold was active.
+        let listed = engine
+            .workflow_list_tasks(
+                "seat-manager",
+                TaskListScope::Visible,
+                None,
+                None,
+                Some("junior"),
+                None,
+                50,
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.is_empty(),
+            "the held assignee must have no queued or ready work"
+        );
+
+        engine.config.workflow_hold_seats.remove("*");
+        engine
+            .workflow_assign_task(
+                "seat-manager",
+                "junior",
+                "Released work",
+                "canonical",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("released-assign"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_hold_rejects_start_without_mutating_canonical_task() {
+        let mut engine = engine();
+        let task = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "junior",
+                "Held work",
+                "canonical",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("held-assignment"),
+            )
+            .await
+            .unwrap();
+        engine
+            .config
+            .workflow_hold_seats
+            .insert("seat-junior".into());
+        let error = engine
+            .workflow_start_task("seat-junior", &task.task_id, "start", Some("held-start"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("maintenance hold"));
+        let visible = engine
+            .workflow_task_document("seat-junior", &task.task_id)
+            .await
+            .unwrap();
+        assert_eq!(effective_queue_state(&visible), QUEUE_STATE_READY);
+        engine.config.workflow_hold_seats.clear();
+        engine
+            .workflow_start_task("seat-junior", &task.task_id, "start", Some("held-start"))
+            .await
+            .unwrap();
+        engine
+            .config
+            .workflow_hold_seats
+            .insert("seat-junior".into());
+        engine
+            .workflow_report_task(
+                "seat-junior",
+                &task.task_id,
+                "blocked",
+                "stopped by operator",
+                json!({}),
+                Some("held-report"),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
