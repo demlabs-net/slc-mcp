@@ -78,6 +78,8 @@ pub struct TaskInfo {
     pub queue_order: Option<String>,
     /// Event used as the idempotency key for the current runnable wake.
     pub queue_ready_event_id: Option<String>,
+    /// Immutable server-stamped incident generation, never caller-owned metadata.
+    pub workflow_generation: Option<String>,
     /// Caller-owned structured task data, isolated from SLC projection fields.
     pub metadata: Value,
 }
@@ -136,6 +138,7 @@ pub(crate) fn doc_to_task(doc: &Document) -> TaskInfo {
         queue_state: extra_field(doc, "queue_state"),
         queue_order: extra_field(doc, "queue_order"),
         queue_ready_event_id: extra_field(doc, "queue_ready_event_id"),
+        workflow_generation: extra_field(doc, "workflow_generation"),
         metadata: doc
             .metadata
             .extra
