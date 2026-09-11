@@ -421,6 +421,45 @@ fn is_terminal_status(status: &str) -> bool {
     )
 }
 
+fn validate_portfolio_terminal_report_artifact_revision(
+    doc: &Document,
+    status: &str,
+    metadata: &Value,
+) -> SlcResult<()> {
+    if workflow_string(doc, "issuer").as_deref() != Some("manager")
+        || doc.metadata.extra.get("project").and_then(Value::as_str)
+            != Some(LEADS_PORTFOLIO_PROJECT)
+    {
+        return Ok(());
+    }
+
+    let stage = doc
+        .metadata
+        .extra
+        .get("workflow_metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("stage"))
+        .and_then(Value::as_str);
+    let requires_revision = matches!(
+        (stage, status),
+        (Some("BUILD"), STATUS_COMPLETED)
+            | (Some("TEST"), STATUS_COMPLETED | STATUS_FAILED)
+            | (Some("DEPLOY"), STATUS_FAILED)
+    );
+    if requires_revision
+        && metadata
+            .get("artifact_revision")
+            .and_then(Value::as_str)
+            .is_none_or(|revision| revision.trim().is_empty())
+    {
+        let stage = stage.expect("revision-requiring transition has a known stage");
+        return Err(SlcError::InvalidInput(format!(
+            "manager-owned {LEADS_PORTFOLIO_PROJECT} {stage} {status} terminal reports require non-empty metadata.artifact_revision so the dispatcher can preserve immutable artifact identity"
+        )));
+    }
+    Ok(())
+}
+
 fn effective_queue_state(doc: &Document) -> &'static str {
     let status = workflow_string(doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
     if is_terminal_status(&status) {
@@ -1800,30 +1839,29 @@ impl SlcEngine {
             TaskEventKind::Progress
         };
         let issuer = workflow_string(&doc, "issuer");
-        let current_status =
-            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
-        if is_terminal_status(&current_status) {
-            if current_status != status
-                || workflow_string(&doc, "terminal_summary").as_deref() != Some(summary.as_str())
-            {
-                return Err(SlcError::InvalidInput(format!(
-                    "terminal task cannot transition from {current_status} to {status}"
-                )));
-            }
-            let fingerprint = task_event_fingerprint(
-                task_id,
-                event_kind,
-                &actor,
-                issuer.as_deref(),
-                Some(status),
-                &summary,
-                &metadata,
-            )?;
-            if let Some(event) = self
-                .existing_task_event(&actor, idempotency_key, &fingerprint)
-                .await?
-            {
-                let repaired = self
+        let fingerprint = task_event_fingerprint(
+            task_id,
+            event_kind,
+            &actor,
+            issuer.as_deref(),
+            Some(status),
+            &summary,
+            &metadata,
+        )?;
+        if let Some(event) = self
+            .existing_task_event(&actor, idempotency_key, &fingerprint)
+            .await?
+        {
+            let mut repaired = self
+                .touch_task_projection(
+                    task_id,
+                    &event,
+                    Some(status),
+                    terminal.then_some(summary.as_str()),
+                )
+                .await?;
+            if terminal {
+                repaired = self
                     .set_task_queue_projection(task_id, QUEUE_STATE_TERMINAL, None)
                     .await?;
                 if let Some(assignee_seat) = self.workflow_seat(&assignee)
@@ -1837,9 +1875,37 @@ impl SlcEngine {
                 let queue = self.reconcile_task_queue_locked(&assignee).await?;
                 return Ok((repaired, event, queue.ready_task()));
             }
+            if repaired.status == STATUS_ACTIVE
+                && repaired.queue_state.as_deref() != Some(QUEUE_STATE_RUNNING)
+            {
+                repaired = self
+                    .set_task_queue_projection(
+                        task_id,
+                        QUEUE_STATE_RUNNING,
+                        repaired.queue_ready_event_id.as_deref(),
+                    )
+                    .await?;
+            }
+            return Ok((repaired, event, None));
+        }
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
+        if is_terminal_status(&current_status) {
+            if current_status != status
+                || workflow_string(&doc, "terminal_summary").as_deref() != Some(summary.as_str())
+            {
+                return Err(SlcError::InvalidInput(format!(
+                    "terminal task cannot transition from {current_status} to {status}"
+                )));
+            }
             return Err(SlcError::InvalidInput(
                 "terminal task already has a report; retry only with the original idempotency_key"
                     .into(),
+            ));
+        }
+        if !metadata.is_object() {
+            return Err(SlcError::InvalidInput(
+                "metadata must be a JSON object; omit metadata to use an empty object".into(),
             ));
         }
         if actor != assignee {
@@ -1860,6 +1926,9 @@ impl SlcEngine {
             return Err(SlcError::InvalidInput(format!(
                 "text-only principal cannot assert visual completion ({claim}); report numeric evidence and request vision-capable verification"
             )));
+        }
+        if terminal {
+            validate_portfolio_terminal_report_artifact_revision(&doc, status, &metadata)?;
         }
         let event = self
             .append_task_event(
@@ -2416,6 +2485,415 @@ mod tests {
             .unwrap();
 
         assert_eq!(task.metadata["slug"], "valid-identity");
+    }
+
+    #[tokio::test]
+    async fn manager_portfolio_transition_reports_require_artifact_revision_before_append() {
+        for (stage, status) in [
+            ("BUILD", "completed"),
+            ("TEST", "completed"),
+            ("TEST", "failed"),
+            ("DEPLOY", "failed"),
+        ] {
+            let engine = engine();
+            let key = format!("required-{stage}-{status}");
+            let task = engine
+                .workflow_assign_task(
+                    "seat-manager",
+                    "senior",
+                    &format!("{stage} artifact identity"),
+                    "Transition source",
+                    None,
+                    Some(LEADS_PORTFOLIO_PROJECT),
+                    &[],
+                    &json!({
+                        "pipeline": LEADS_PORTFOLIO_PROJECT,
+                        "slug": format!("{stage}-{status}").to_ascii_lowercase(),
+                        "stage": stage,
+                        "artifact_root": "/work/shared/leads-mass-redesign/identity/layout",
+                        "attempt": 1,
+                    }),
+                    Some(&format!("{key}-assign")),
+                )
+                .await
+                .unwrap();
+            engine
+                .workflow_start_task(
+                    "seat-senior",
+                    &task.task_id,
+                    "Starting",
+                    Some(&format!("{key}-start")),
+                )
+                .await
+                .unwrap();
+            let event_count = engine
+                .workflow_task_events("seat-senior", &task.task_id, 20)
+                .await
+                .unwrap()
+                .len();
+
+            for (suffix, metadata) in [
+                ("missing", json!({})),
+                ("blank", json!({"artifact_revision": "  "})),
+                ("wrong-type", json!({"artifact_revision": 42})),
+            ] {
+                let error = engine
+                    .workflow_report_task(
+                        "seat-senior",
+                        &task.task_id,
+                        status,
+                        "Canonical terminal result",
+                        metadata,
+                        Some(&format!("{key}-{suffix}")),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SlcError::InvalidInput(_)));
+                assert!(
+                    error.to_string().contains("metadata.artifact_revision"),
+                    "{stage} {status}: {error}"
+                );
+                assert_eq!(
+                    engine
+                        .workflow_task_events("seat-senior", &task.task_id, 20)
+                        .await
+                        .unwrap()
+                        .len(),
+                    event_count,
+                    "validation must run before appending the report event"
+                );
+            }
+
+            let (reported, event, _) = engine
+                .workflow_report_task(
+                    "seat-senior",
+                    &task.task_id,
+                    status,
+                    "Canonical terminal result",
+                    json!({"artifact_revision": "sha256:immutable"}),
+                    Some(&format!("{key}-valid")),
+                )
+                .await
+                .unwrap();
+            assert!(is_terminal_status(&reported.status));
+            assert_eq!(event.metadata["artifact_revision"], "sha256:immutable");
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_revision_report_rule_is_narrow_to_consumed_portfolio_transitions() {
+        for (stage, status) in [
+            ("DESIGN", "completed"),
+            ("BUILD", "failed"),
+            ("BUILD", "blocked"),
+            ("TEST", "blocked"),
+            ("DEPLOY", "completed"),
+            ("DEPLOY", "blocked"),
+        ] {
+            let engine = engine();
+            let key = format!("optional-{stage}-{status}");
+            let task = engine
+                .workflow_assign_task(
+                    "seat-manager",
+                    "senior",
+                    &format!("{stage} terminal without downstream revision"),
+                    "No revision-consuming transition",
+                    None,
+                    Some(LEADS_PORTFOLIO_PROJECT),
+                    &[],
+                    &json!({
+                        "pipeline": LEADS_PORTFOLIO_PROJECT,
+                        "slug": format!("optional-{stage}-{status}").to_ascii_lowercase(),
+                        "stage": stage,
+                        "artifact_root": "/work/shared/leads-mass-redesign/optional/layout",
+                        "attempt": 1,
+                    }),
+                    Some(&format!("{key}-assign")),
+                )
+                .await
+                .unwrap();
+            engine
+                .workflow_start_task(
+                    "seat-senior",
+                    &task.task_id,
+                    "Starting",
+                    Some(&format!("{key}-start")),
+                )
+                .await
+                .unwrap();
+            engine
+                .workflow_report_task(
+                    "seat-senior",
+                    &task.task_id,
+                    status,
+                    "Terminal result without a revision",
+                    json!({}),
+                    Some(&format!("{key}-report")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let engine = engine();
+        let generic = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "senior",
+                "Generic BUILD-shaped task",
+                "Not in the portfolio",
+                None,
+                None,
+                &[],
+                &json!({"stage": "BUILD"}),
+                Some("generic-build-assign"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-senior",
+                &generic.task_id,
+                "Starting",
+                Some("generic-build-start"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_report_task(
+                "seat-senior",
+                &generic.task_id,
+                "completed",
+                "Generic completion",
+                json!({}),
+                Some("generic-build-report"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_portfolio_report_without_revision_remains_readable_and_replayable() {
+        let engine = engine();
+        let task = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "senior",
+                "Historical BUILD",
+                "Predates artifact revision validation",
+                None,
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &json!({
+                    "pipeline": LEADS_PORTFOLIO_PROJECT,
+                    "slug": "historical-build",
+                    "stage": "BUILD",
+                    "artifact_root": "/work/shared/leads-mass-redesign/historical-build/layout",
+                    "attempt": 1,
+                }),
+                Some("historical-build-assign"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-senior",
+                &task.task_id,
+                "Starting",
+                Some("historical-build-start"),
+            )
+            .await
+            .unwrap();
+        let event = engine
+            .append_task_event(
+                &task.task_id,
+                TaskEventKind::Report,
+                "senior",
+                Some("manager"),
+                Some(STATUS_COMPLETED),
+                "Historical completion",
+                json!({}),
+                Some("historical-build-report"),
+            )
+            .await
+            .unwrap();
+        let event_key = idempotency_key("senior", "historical-build-report");
+        engine
+            .store()
+            .delete_record(TASK_EVENT_IDEMPOTENCY, &event_key)
+            .await
+            .unwrap();
+        let before_replay = engine
+            .workflow_get_task("seat-senior", &task.task_id)
+            .await
+            .unwrap();
+        assert_eq!(before_replay.status, STATUS_ACTIVE);
+        assert_eq!(
+            before_replay.queue_state.as_deref(),
+            Some(QUEUE_STATE_RUNNING)
+        );
+
+        let events = engine
+            .workflow_task_events("seat-manager", &task.task_id, 20)
+            .await
+            .unwrap();
+        assert_eq!(events.last().unwrap().event_id, event.event_id);
+        assert!(
+            events
+                .last()
+                .unwrap()
+                .metadata
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+
+        let (replayed, replayed_event, _) = engine
+            .workflow_report_task(
+                "seat-senior",
+                &task.task_id,
+                "completed",
+                "Historical completion",
+                json!({}),
+                Some("historical-build-report"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed.status, STATUS_COMPLETED);
+        assert_eq!(replayed.queue_state.as_deref(), Some(QUEUE_STATE_TERMINAL));
+        assert_eq!(replayed_event.event_id, event.event_id);
+        assert!(
+            engine
+                .store()
+                .get_record(TASK_EVENT_IDEMPOTENCY, &event_key)
+                .await
+                .unwrap()
+                .is_some(),
+            "exact replay repairs the missing portable idempotency index"
+        );
+        assert!(
+            engine
+                .task_get_active("seat-senior")
+                .await
+                .unwrap()
+                .is_none(),
+            "terminal replay repair releases the active task anchor"
+        );
+
+        let mismatch = engine
+            .workflow_report_task(
+                "seat-senior",
+                &task.task_id,
+                "completed",
+                "Historical completion",
+                json!({"artifact_revision": "changed-request"}),
+                Some("historical-build-report"),
+            )
+            .await
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("different task event"));
+    }
+
+    #[tokio::test]
+    async fn report_metadata_must_be_an_object_for_new_events() {
+        for (suffix, metadata) in [
+            ("null", Value::Null),
+            ("scalar", json!("scalar")),
+            ("array", json!(["array"])),
+            ("number", json!(42)),
+        ] {
+            let engine = engine();
+            let task = engine
+                .workflow_assign_task(
+                    "seat-senior",
+                    "junior",
+                    "Validate report metadata",
+                    "Engine boundary",
+                    None,
+                    None,
+                    &[],
+                    &json!({}),
+                    Some(&format!("metadata-shape-assign-{suffix}")),
+                )
+                .await
+                .unwrap();
+            engine
+                .workflow_start_task(
+                    "seat-junior",
+                    &task.task_id,
+                    "Starting",
+                    Some(&format!("metadata-shape-start-{suffix}")),
+                )
+                .await
+                .unwrap();
+            let before = engine
+                .workflow_task_events("seat-junior", &task.task_id, 20)
+                .await
+                .unwrap()
+                .len();
+
+            let error = engine
+                .workflow_report_task(
+                    "seat-junior",
+                    &task.task_id,
+                    "in_progress",
+                    "Still working",
+                    metadata,
+                    Some(&format!("metadata-shape-report-{suffix}")),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SlcError::InvalidInput(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("metadata must be a JSON object; omit metadata")
+            );
+            assert_eq!(
+                engine
+                    .workflow_task_events("seat-junior", &task.task_id, 20)
+                    .await
+                    .unwrap()
+                    .len(),
+                before
+            );
+        }
+
+        let engine = engine();
+        let task = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Optional empty metadata",
+                "Empty object remains valid",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("empty-metadata-assign"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-junior",
+                &task.task_id,
+                "Starting",
+                Some("empty-metadata-start"),
+            )
+            .await
+            .unwrap();
+        let (_, event, _) = engine
+            .workflow_report_task(
+                "seat-junior",
+                &task.task_id,
+                "in_progress",
+                "Still working",
+                json!({}),
+                Some("empty-metadata-report"),
+            )
+            .await
+            .unwrap();
+        assert!(event.metadata.as_object().unwrap().is_empty());
     }
 
     #[tokio::test]

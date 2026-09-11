@@ -178,7 +178,18 @@ idle, send the assignee a durable `task_message` for that same task and dispatch
 its returned delivery rather than creating a parallel replacement. The
 recovery run reports the already-running task without calling `start_task`
 again. Only the assignee may call `report_task`, so a global coordinator cannot
-accidentally close a writer that is still running.
+accidentally close a writer that is still running. At that report boundary,
+manager-owned `leads_mass_redesign` roots whose terminal result is consumed as
+immutable downstream identity must include non-empty
+`metadata.artifact_revision`: BUILD `completed`, TEST `completed`/`failed`, and
+DEPLOY `failed`. The check runs before the event append and is intentionally
+limited to those portfolio transitions; generic tasks, unrelated terminal
+states, and historical events remain backward-compatible. Exact idempotent
+replay is resolved before new-report validation so a historical event can repair
+an interrupted projection/index write without being rejected by the newer
+contract; a changed fingerprint is still rejected. Report metadata is a JSON
+object at the engine boundary: omitting it means an empty object, while explicit
+`null`, scalar, and array values are typed invalid input.
 
 Configure `SLC_PRINCIPAL_SEATS` to map transport-neutral participant names to
 the existing SLC seats, and configure delegation independently with

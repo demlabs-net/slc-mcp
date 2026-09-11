@@ -785,12 +785,12 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "report_task",
-            "description": "Append the assignee's durable task progress/terminal report and update SLC state. Only the assignee may report, and the task must already be running; coordinators cannot close a live executor lane and terminal reports cannot bypass the FIFO from ready/queued state. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task, but the response deliberately does not disclose that successor. Normally wake the issuer with delivery and end this executor run; the issuer reconciles and wakes the next head as a fresh run. Manager-issued leads_mass_redesign reports are the bounded polling exception: delivery is null and wake_recommended=false because the deterministic manager queue pump observes SLC directly, so do not send a duplicate manager message. Idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "description": "Append the assignee's durable task progress/terminal report and update SLC state. Only the assignee may report, and the task must already be running; coordinators cannot close a live executor lane and terminal reports cannot bypass the FIFO from ready/queued state. Manager-owned leads_mass_redesign BUILD completed, TEST completed/failed, and DEPLOY failed terminal reports must include non-empty metadata.artifact_revision because the deterministic dispatcher consumes those reports as immutable identity for TEST, DEPLOY, or correction. Other task reports remain backward-compatible. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task, but the response deliberately does not disclose that successor. Normally wake the issuer with delivery and end this executor run; the issuer reconciles and wakes the next head as a fresh run. Manager-issued leads_mass_redesign reports are the bounded polling exception: delivery is null and wake_recommended=false because the deterministic manager queue pump observes SLC directly, so do not send a duplicate manager message. Idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "status": {"type":"string","enum":["in_progress","completed","blocked","failed"]},
                 "summary": {"type":"string","minLength":1},
-                "metadata": {"type":"object","description":"machine evidence, paths, hashes, metrics, and structured findings"},
+                "metadata": {"type":"object","description":"Optional machine evidence object; omit it to use an empty object. Explicit null, scalar, or array values are invalid. metadata.artifact_revision is required and non-empty for manager-owned leads_mass_redesign BUILD completed, TEST completed/failed, and DEPLOY failed terminal reports"},
                 "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
             },"required":["task_id","status","summary","idempotency_key"]}
         }),
@@ -2495,6 +2495,9 @@ async fn call_tool(
             let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
             let status = args.get("status").and_then(Value::as_str).unwrap_or("");
             let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
+            // Omitted metadata preserves the historical empty-object default;
+            // explicit null/scalar/array values reach the engine and are rejected
+            // as typed InvalidInput instead of being silently normalized.
             let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
             let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
             let (task, event, _next_ready_task) = engine
@@ -3839,6 +3842,17 @@ fn ru_error_text(tool: &str, kind: &str, message: &str) -> String {
              get_document/list_documents. Если объект существует под другим id, передавайте \
              фактический id."
         ),
+        "invalid_input" if message.contains("metadata.artifact_revision") => format!(
+            "{message}\n\
+             Действие: повторите report_task с точной неизменяемой ревизией проверяемого \
+             артефакта в metadata.artifact_revision (например commit или sha256), сохранив \
+             исходные task_id, status, summary и idempotency_key."
+        ),
+        "invalid_input" if message.contains("metadata must be a JSON object") => format!(
+            "{message}\n\
+             Действие: передайте metadata как JSON-объект; если метаданных нет, удалите поле \
+             metadata из вызова или передайте пустой объект {{}}."
+        ),
         "invalid_input" if message.contains("workflow") || message.contains("append-only") => {
             format!(
                 "{message}\n\
@@ -4082,6 +4096,242 @@ mod seat_filter_tests {
         assert!(conflict["delivery"].is_null());
         assert!(conflict["queue"].is_null());
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn report_task_advertises_portfolio_artifact_revision_boundary() {
+        let report = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "report_task")
+            .expect("report_task tool");
+        let description = report["description"].as_str().unwrap();
+        let metadata_description = report["inputSchema"]["properties"]["metadata"]["description"]
+            .as_str()
+            .unwrap();
+
+        for expected in [
+            "BUILD completed",
+            "TEST completed/failed",
+            "DEPLOY failed",
+            "metadata.artifact_revision",
+        ] {
+            assert!(description.contains(expected), "{description}");
+        }
+        assert!(
+            metadata_description.contains("metadata.artifact_revision"),
+            "{metadata_description}"
+        );
+        assert!(
+            metadata_description.contains("omit it"),
+            "{metadata_description}"
+        );
+        assert!(
+            metadata_description.contains("Explicit null, scalar, or array values are invalid"),
+            "{metadata_description}"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_task_returns_typed_application_error_before_portfolio_event_append() {
+        use slc_core::storage::sqlite::SqliteStore;
+        use slc_core::{MockLlm, SlcConfig, StorageBackend};
+        use std::collections::{HashMap, HashSet};
+
+        let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
+        let config = SlcConfig {
+            principal_seats: HashMap::from([
+                ("manager".into(), "seat-manager".into()),
+                ("worker".into(), "seat-worker".into()),
+            ]),
+            task_assign_acl: HashMap::from([("manager".into(), HashSet::from(["worker".into()]))]),
+            ..Default::default()
+        };
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let policy = PaginationPolicy {
+            enabled: false,
+            page_token_limit: None,
+            context_token_limit: None,
+        };
+        let assigned = call_tool(
+            &engine,
+            "seat-manager",
+            "assign_portfolio_task",
+            &json!({
+                "assignee":"worker",
+                "name":"portfolio build",
+                "slug":"report-boundary",
+                "stage":"BUILD",
+                "artifact_root":"/work/shared/leads-mass-redesign/report-boundary/layout",
+                "attempt":1,
+                "idempotency_key":"report-boundary-assign"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let assigned: Value =
+            serde_json::from_str(assigned["content"][0]["text"].as_str().unwrap()).unwrap();
+        let task_id = assigned["task"]["task_id"].as_str().unwrap();
+        call_tool(
+            &engine,
+            "seat-worker",
+            "start_task",
+            &json!({"task_id":task_id,"idempotency_key":"report-boundary-start"}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let before = engine
+            .workflow_task_events("seat-worker", task_id, 20)
+            .await
+            .unwrap()
+            .len();
+
+        let error = call_tool(
+            &engine,
+            "seat-worker",
+            "report_task",
+            &json!({
+                "task_id":task_id,
+                "status":"completed",
+                "summary":"Build complete",
+                "metadata":{},
+                "idempotency_key":"report-boundary-terminal"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error["kind"], "invalid_input", "{error}");
+
+        let result = tool_error_result("report_task", &error);
+        assert_eq!(result["isError"], true, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("invalid input"), "{text}");
+        assert!(text.contains("metadata.artifact_revision"), "{text}");
+        assert!(text.contains("BUILD COMPLETED"), "{text}");
+        assert!(text.contains("Действие:"), "{text}");
+        assert!(text.contains("commit или sha256"), "{text}");
+        assert_eq!(
+            engine
+                .workflow_task_events("seat-worker", task_id, 20)
+                .await
+                .unwrap()
+                .len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn report_task_omitted_metadata_is_empty_object_but_explicit_non_object_is_error() {
+        use slc_core::storage::sqlite::SqliteStore;
+        use slc_core::{MockLlm, SlcConfig, StorageBackend};
+        use std::collections::{HashMap, HashSet};
+
+        let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
+        let config = SlcConfig {
+            principal_seats: HashMap::from([
+                ("issuer".into(), "seat-issuer".into()),
+                ("worker".into(), "seat-worker".into()),
+            ]),
+            task_assign_acl: HashMap::from([("issuer".into(), HashSet::from(["worker".into()]))]),
+            ..Default::default()
+        };
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let policy = PaginationPolicy {
+            enabled: false,
+            page_token_limit: None,
+            context_token_limit: None,
+        };
+        let assign_and_start = async |suffix: &str| {
+            let assigned = call_tool(
+                &engine,
+                "seat-issuer",
+                "assign_task",
+                &json!({
+                    "assignee":"worker",
+                    "name":format!("metadata shape {suffix}"),
+                    "idempotency_key":format!("metadata-shape-assign-{suffix}")
+                }),
+                &events,
+                policy,
+            )
+            .await
+            .unwrap();
+            let assigned: Value =
+                serde_json::from_str(assigned["content"][0]["text"].as_str().unwrap()).unwrap();
+            let task_id = assigned["task"]["task_id"].as_str().unwrap().to_string();
+            call_tool(
+                &engine,
+                "seat-worker",
+                "start_task",
+                &json!({
+                    "task_id":task_id,
+                    "idempotency_key":format!("metadata-shape-start-{suffix}")
+                }),
+                &events,
+                policy,
+            )
+            .await
+            .unwrap();
+            task_id
+        };
+
+        let omitted_task = assign_and_start("omitted").await;
+        let omitted = call_tool(
+            &engine,
+            "seat-worker",
+            "report_task",
+            &json!({
+                "task_id":omitted_task,
+                "status":"completed",
+                "summary":"No metadata needed",
+                "idempotency_key":"metadata-shape-report-omitted"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let omitted: Value =
+            serde_json::from_str(omitted["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(omitted["event"]["metadata"].as_object().unwrap().is_empty());
+
+        let invalid_task = assign_and_start("invalid").await;
+        for (suffix, metadata) in [
+            ("null", Value::Null),
+            ("scalar", json!("value")),
+            ("array", json!(["value"])),
+        ] {
+            let error = call_tool(
+                &engine,
+                "seat-worker",
+                "report_task",
+                &json!({
+                    "task_id":invalid_task,
+                    "status":"in_progress",
+                    "summary":format!("Invalid metadata shape {suffix}"),
+                    "metadata":metadata,
+                    "idempotency_key":format!("metadata-shape-report-{suffix}")
+                }),
+                &events,
+                policy,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error["kind"], "invalid_input", "{error}");
+            let result = tool_error_result("report_task", &error);
+            assert_eq!(result["isError"], true, "{result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("metadata must be a JSON object"), "{text}");
+            assert!(text.contains("удалите поле metadata"), "{text}");
+            assert!(text.contains("пустой объект {}"), "{text}");
+        }
     }
 
     #[tokio::test]
@@ -4797,6 +5047,7 @@ mod seat_filter_tests {
                 "task_id":task_id,
                 "status":"completed",
                 "summary":"done",
+                "metadata":{"artifact_revision":"sha256:portfolio-build"},
                 "idempotency_key":"report-portfolio"
             }),
             &events,
