@@ -65,10 +65,10 @@ pub enum StorageKind {
     MongoDB,
 }
 
-/// Пересобрать эмбеддинги документов БАТЧЕМ: один forward на чанк
-/// (по 32 документа), вместо последовательных вызовов. Best-effort —
-/// ошибка модели (например, ещё грузится) пропускает чанк целиком,
-/// следующий запуск повторит. Возвращает число успешно пересобранных.
+/// Rebuild document embeddings IN BATCHES: one forward pass per chunk
+/// (of 32 documents) instead of sequential calls. Best-effort — a model
+/// error (e.g. still loading) skips the whole chunk, the next run retries.
+/// Returns the number of successfully rebuilt documents.
 pub async fn reembed_documents(
     store: &dyn StorageBackend,
     llm: &dyn LlmClient,
@@ -85,7 +85,7 @@ pub async fn reembed_documents(
             Ok(embs) => embs,
             Err(e) => {
                 tracing::debug!("reembed: chunk skipped: {e}");
-                continue; // модель не готова — следующий запуск повторит
+                continue; // model not ready — the next run will retry
             }
         };
         for (doc, emb) in chunk.iter().zip(embs) {
@@ -123,32 +123,32 @@ async fn seed_core_if_missing(store: &dyn StorageBackend) {
     }
 }
 
-/// Приблизительное число символов на один токен (смешанный RU/EN текст).
-/// Компрессия работает в символах, лимиты задаются в токенах.
+/// Approximate characters per token (mixed RU/EN text).
+/// Compression works in characters, limits are set in tokens.
 pub const CHARS_PER_TOKEN: usize = 3;
 
-/// Отчёт пересборки эмбеддингов (`reindex-embeddings`). (`reindex-embeddings`).
+/// Report of the embedding rebuild (`reindex-embeddings`).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReindexReport {
-    /// Документов всего (в выборке).
+    /// Documents in total (in the selection).
     pub total: usize,
-    /// Пересобрано эмбеддингов (best-effort).
+    /// Embeddings rebuilt (best-effort).
     pub reindexed: usize,
-    /// Пропущено (другой сид при --seat).
+    /// Skipped (another seat with --seat).
     pub skipped: usize,
 }
 
-/// Отчёт переименования документа (`rename_document`/`rename_task`/
+/// Report of a document rename (`rename_document`/`rename_task`/
 /// `rename_project`).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RenameReport {
     pub old_id: String,
     pub new_id: String,
-    /// Всего затронутых документов (ссылочные поля и/или контент).
+    /// Documents affected in total (reference fields and/or content).
     pub links_fixed: usize,
-    /// Документы, в контенте которых заменены вики-ссылки [[old]].
+    /// Documents whose content had wiki links [[old]] replaced.
     pub content_links_fixed: usize,
-    /// Сиды с обновлёнными активными указателями.
+    /// Seats with updated active pointers.
     pub seats_updated: Vec<String>,
 }
 
@@ -186,9 +186,9 @@ pub struct SlcConfig {
     /// without reasoning simply keep the default folder. Disable with
     /// `SLC_AI_ORGANIZE=false`.
     pub ai_organize: bool,
-    /// Роли сидов: seat_id → роли. Из env `SLC_SEAT_ROLES`
-    /// ("seat_a=operator,seat_b=operator") или программно через
-    /// [`SlcConfig::with_seat_role`] (staticlib: параметр инициализации).
+    /// Seat roles: seat_id → roles. From env `SLC_SEAT_ROLES`
+    /// ("seat_a=operator,seat_b=operator") or programmatically via
+    /// [`SlcConfig::with_seat_role`] (staticlib: an initialization parameter).
     pub seat_roles: std::collections::HashMap<String, Vec<roles::SeatRole>>,
     /// Explicit cross-seat scope for operator seats.  From env
     /// `SLC_SEAT_MANAGE_ACL` (`manager=developer|designer,root=*`).
@@ -207,7 +207,7 @@ pub struct SlcConfig {
 }
 
 impl SlcConfig {
-    /// Добавить роль сиду (builder-стиль; для встроенных клиентов staticlib).
+    /// Add a role to a seat (builder-style; for embedded staticlib clients).
     pub fn with_seat_role(mut self, seat_id: impl Into<String>, role: roles::SeatRole) -> Self {
         self.seat_roles
             .entry(seat_id.into())
@@ -253,7 +253,7 @@ impl Default for SlcConfig {
             semantic_weight: 0.7,
             text_weight: 0.3,
             seat_ttl_seconds: 86400,
-            // Бюджет контекста — ТОКЕНЫ (~3 симв/токен внутри компрессии).
+            // The context budget is in TOKENS (~3 chars/token inside compression).
             context_limit_tokens: std::env::var("SLC_CONTEXT_LIMIT_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -327,8 +327,8 @@ async fn organize_document(
         names.join("\n"),
         doc.category.as_str(),
     );
-    // Сид документа: sampling-инференс работает только с сидом (иначе
-    // мгновенный отказ — дефолтная папка); локальные провайдеры игнорируют.
+    // The document's seat: sampling inference only works with a seat (otherwise
+    // it fails instantly — default folder); local providers ignore it.
     let seat = doc.seat_id.as_deref().unwrap_or("");
     let Ok(answer) = llm.reason_for(seat, &prompt).await else {
         return;
@@ -522,8 +522,9 @@ impl SlcEngine {
     }
 
     /// Intelligent compression of a text via the reasoning LLM: keep the key
-    /// facts within `max_chars` (размер сжатого текста для LLM-промпта, не
-    /// контекстный бюджет). Seat-aware: sampling-инференс требует сид.
+    /// facts within `max_chars` (the size of the compressed text for the LLM
+    /// prompt, not the context budget). Seat-aware: sampling inference
+    /// requires a seat.
     /// Best-effort — on LLM failure the original text is returned unchanged
     /// (callers never truncate by hand).
     pub async fn summarize_text_for(
@@ -650,10 +651,10 @@ impl SlcEngine {
         let _ = self.store.insert_embeddings(&[rec]).await;
     }
 
-    /// Пересобрать эмбеддинги всех документов (или одного сита) текущим
-    /// embedding-провайдером — после смены модели/настроек (`slc-mcp
-    /// reindex-embeddings`). Старые записи с другой размерностью всё равно
-    /// отфильтровываются поиском, но пересборка возвращает семантику.
+    /// Rebuild embeddings of all documents (or of one seat) with the current
+    /// embedding provider — after a model/settings change (`slc-mcp
+    /// reindex-embeddings`). Old records with a different dimensionality are
+    /// filtered out by search anyway, but the rebuild restores semantics.
     pub async fn reindex_embeddings(&self, seat: Option<&str>) -> SlcResult<ReindexReport> {
         let docs = self
             .store
@@ -672,7 +673,7 @@ impl SlcEngine {
             .cloned()
             .collect();
         let skipped = docs.len() - selected.len();
-        // Батч-пересборка (один forward на чанк документов).
+        // Batch rebuild (one forward per chunk of documents).
         let done = reembed_documents(self.store.as_ref(), self.llm.as_ref(), &selected).await;
         Ok(ReindexReport {
             total: docs.len(),
@@ -1087,9 +1088,9 @@ impl SlcEngine {
         Ok(())
     }
 
-    // ── роли сидов: управление контекстом других сидов ────────────────
+    // ── seat roles: managing other seats' context ─────────────────────────
 
-    /// Роли сида (пусто — нет особых прав).
+    /// A seat's roles (empty — no special rights).
     pub fn seat_roles(&self, seat_id: &str) -> Vec<roles::SeatRole> {
         self.config
             .seat_roles
@@ -1098,7 +1099,7 @@ impl SlcEngine {
             .unwrap_or_default()
     }
 
-    /// Имеет ли operator хотя бы одну явно разрешённую cross-seat цель.
+    /// Whether an operator has at least one explicitly allowed cross-seat target.
     pub fn can_manage_seats(&self, seat_id: &str) -> bool {
         self.has_operator_role(seat_id)
             && self
@@ -1138,8 +1139,8 @@ impl SlcEngine {
         targets
     }
 
-    /// Может ли сид читать/редактировать документ: свой/публичный
-    /// (is_kb_visible) или оператор (управление контекстом других сидов).
+    /// Whether a seat can read/edit a document: its own/public
+    /// (is_kb_visible) or an operator (managing other seats' context).
     pub fn can_read_document(&self, seat_id: &str, doc: &Document) -> bool {
         doc.is_kb_visible(seat_id)
             || doc
@@ -1157,7 +1158,7 @@ impl SlcEngine {
         }
     }
 
-    /// Проверка права: actor может управлять target_seat (свой сид — всегда).
+    /// Permission check: actor may manage target_seat (own seat — always).
     pub async fn require_seat_manage(&self, actor: &str, target_seat: &str) -> SlcResult<()> {
         if self.can_manage_target(actor, target_seat) {
             return Ok(());
@@ -1167,7 +1168,7 @@ impl SlcEngine {
         )))
     }
 
-    /// Активировать документ у целевого сида (свой сид — без роли).
+    /// Activate a document on the target seat (own seat — no role needed).
     pub async fn document_activate_for(
         &self,
         actor: &str,
@@ -1178,13 +1179,13 @@ impl SlcEngine {
         self.document_activate(target_seat, document_id).await
     }
 
-    /// Снять активный документ/задачу у целевого сида.
+    /// Clear the active document/task on the target seat.
     pub async fn document_deactivate_for(&self, actor: &str, target_seat: &str) -> SlcResult<()> {
         self.require_seat_manage(actor, target_seat).await?;
         self.document_deactivate(target_seat).await
     }
 
-    /// Поставить активную задачу целевому сиду.
+    /// Set the active task for the target seat.
     pub async fn task_activate_for(
         &self,
         actor: &str,
@@ -1195,7 +1196,7 @@ impl SlcEngine {
         self.task_activate(target_seat, task_id).await
     }
 
-    /// Сменить статус проекта (active|archived) у целевого сида.
+    /// Change a project's status (active|archived) on the target seat.
     pub async fn project_set_status_for(
         &self,
         actor: &str,
@@ -1225,7 +1226,7 @@ impl SlcEngine {
         .await
     }
 
-    /// Архивация/разархивация фокуса у целевого сида.
+    /// Archive/unarchive a focus on the target seat.
     pub async fn focus_set_archived_for(
         &self,
         actor: &str,
@@ -1238,14 +1239,14 @@ impl SlcEngine {
         f.set_archived(focus_id, target_seat, archived).await
     }
 
-    // ── переименование документов (каскад ссылок) ──────────────────────
+    // ── document rename (cascade of links) ────────────────────────────────
 
-    /// Переименовать документ (любой категории, включая задачи и проекты):
-    /// смена document_id/имени файла + каскадное исправление ссылок —
-    /// auto_load/references всех документов, проектные связи задач
-    /// (metadata.project/project_id), вики-ссылки `[[old]]` в контенте и
-    /// активные указатели сидов. `new_name` (для задач/проектов) обновляет
-    /// человекочитаемое имя. Только видимые сиду документы.
+    /// Rename a document (any category, including tasks and projects):
+    /// changing document_id/file name + cascading link fixes — the
+    /// auto_load/references of all documents, task-project links
+    /// (metadata.project/project_id), wiki links `[[old]]` in content, and
+    /// active seat pointers. `new_name` (for tasks/projects) updates the
+    /// human-readable name. Only documents visible to the seat.
     pub async fn rename_document(
         &self,
         seat_id: &str,
@@ -1287,12 +1288,12 @@ impl SlcEngine {
             .kb_find(&DocFilter::default(), &DocSort::default(), 100_000)
             .await?;
         let mut reembed: Vec<String> = Vec::new();
-        // Изменённые документы применяем пакетом — один git-коммит
-        // вместо коммита на каждый документ (kb_replace_many).
+        // Apply changed documents as a batch — one git commit
+        // instead of a commit per document (kb_replace_many).
         let mut changed_docs: Vec<Document> = Vec::new();
         for mut d in all {
             let mut changed = false;
-            // Ссылочные поля.
+            // Reference fields.
             let fix = |ids: &mut Vec<String>| -> bool {
                 let mut c = false;
                 for id in ids.iter_mut() {
@@ -1305,7 +1306,7 @@ impl SlcEngine {
             };
             let c1 = fix(&mut d.auto_load);
             let c2 = fix(&mut d.references);
-            // Проектные связи задач (metadata.project / project_id).
+            // Task-project links (metadata.project / project_id).
             let mut c3 = false;
             for key in ["project", "project_id"] {
                 if d.metadata.extra.get(key).and_then(|v| v.as_str()) == Some(document_id) {
@@ -1313,7 +1314,7 @@ impl SlcEngine {
                     c3 = true;
                 }
             }
-            // Вики-ссылки [[old]] / [[old|alias]] в контенте.
+            // Wiki links [[old]] / [[old|alias]] in content.
             let old_bracket = format!("[[{document_id}]]");
             let old_pipe = format!("[[{document_id}|");
             let mut c4 = false;
@@ -1342,12 +1343,12 @@ impl SlcEngine {
             }
         }
 
-        // Применяем каскадные правки одним пакетом (один git-коммит).
+        // Apply the cascading fixes as one batch (a single git commit).
         if !changed_docs.is_empty() {
             self.store.kb_replace_many(&changed_docs).await?;
         }
 
-        // Само переименование (файл/ключ).
+        // The rename itself (file/key).
         let ok = self.store.kb_rename(document_id, new_id).await?;
         if !ok {
             return Err(SlcError::NotFound(format!(
@@ -1355,7 +1356,7 @@ impl SlcEngine {
             )));
         }
 
-        // Человекочитаемое имя для задач/проектов.
+        // Human-readable name for tasks/projects.
         if let Some(name) = new_name.filter(|n| !n.trim().is_empty()) {
             if matches!(
                 doc.category,
@@ -1370,7 +1371,7 @@ impl SlcEngine {
             }
         }
 
-        // Активные указатели сидов (унифицированный и task-указатель).
+        // Active seat pointers (the unified and the task pointer).
         let mut seats_updated = Vec::new();
         for seat in self.seats.list_active(1000).await? {
             let mut changed = false;
@@ -1389,9 +1390,9 @@ impl SlcEngine {
             }
         }
 
-        // Эмбеддинги: старый ключ удаляем (obsidian sidecar хранит их по
-        // document_id; sqlite-перенос сделан в kb_rename), новый id и
-        // документы с изменённым контентом пере-эмбедим.
+        // Embeddings: remove the old key (the obsidian sidecar stores them by
+        // document_id; the sqlite move is done in kb_rename), then re-embed
+        // the new id and the documents with changed content.
         let _ = self.store.delete_embeddings(document_id).await;
         let _ = self.reembed_document(new_id).await;
         for id in reembed {
@@ -1407,8 +1408,8 @@ impl SlcEngine {
         })
     }
 
-    /// Переименовать задачу: новый id — slug от `new_name` (как при
-    /// создании), name обновляется, ссылки чинятся каскадно.
+    /// Rename a task: the new id is a slug from `new_name` (as on
+    /// creation), the name is updated, links are fixed cascadingly.
     pub async fn rename_task(
         &self,
         seat_id: &str,
@@ -1421,7 +1422,7 @@ impl SlcEngine {
             .await
     }
 
-    /// Переименовать проект: новый id — slug от `new_name`, name обновляется.
+    /// Rename a project: the new id is a slug from `new_name`, the name is updated.
     pub async fn rename_project(
         &self,
         seat_id: &str,
@@ -1947,8 +1948,8 @@ mod engine_tests {
         assert!(engine.require_seat_manage("boss", "worker").await.is_ok());
     }
 
-    /// Роли сидов: operator управляет контекстом другого сида, обычный
-    /// сид — нет (SlcError::PermissionDenied).
+    /// Seat roles: an operator manages another seat's context, a regular
+    /// seat — not (SlcError::PermissionDenied).
     #[tokio::test]
     async fn seat_roles_manage_other_seats() {
         use crate::error::SlcError;
@@ -1957,7 +1958,7 @@ mod engine_tests {
         let store: std::sync::Arc<dyn StorageBackend> =
             std::sync::Arc::new(storage::sqlite::SqliteStore::in_memory().unwrap());
         let llm: std::sync::Arc<dyn LlmClient> = std::sync::Arc::new(MockLlm::new(vec![]));
-        // Оператор — seat "boss"; рядовой — "worker".
+        // The operator — seat "boss"; a regular seat — "worker".
         let config = SlcConfig::default()
             .with_seat_role("boss", SeatRole::Operator)
             .with_seat_manage_target("boss", "worker");
@@ -1966,7 +1967,7 @@ mod engine_tests {
         engine.ensure_seat("boss").await.unwrap();
         engine.ensure_seat("worker").await.unwrap();
 
-        // Документ и задача сида worker.
+        // The document and task of seat worker.
         let mut doc = Document::new(
             "doc_worker",
             DocumentCategory::Custom,
@@ -1981,14 +1982,14 @@ mod engine_tests {
             .await
             .unwrap();
 
-        // Обычный сид не может управлять чужим сидом.
+        // A regular seat cannot manage another seat.
         let err = engine
             .document_activate_for("worker", "boss", "doc_worker")
             .await
             .unwrap_err();
         assert!(matches!(err, SlcError::PermissionDenied(_)), "{err:?}");
 
-        // Свой сид — всегда можно (target = actor).
+        // Own seat — always allowed (target = actor).
         assert!(
             engine
                 .document_activate_for("worker", "worker", "doc_worker")
@@ -1996,7 +1997,7 @@ mod engine_tests {
                 .unwrap()
         );
 
-        // Оператор активирует/деактивирует чужой сид.
+        // The operator activates/deactivates another seat.
         assert!(
             engine
                 .document_activate_for("boss", "worker", "doc_worker")
@@ -2024,7 +2025,7 @@ mod engine_tests {
                 .is_none()
         );
 
-        // Задачи: оператор ставит активную задачу чужому сиду.
+        // Tasks: the operator sets an active task on another seat.
         assert!(
             engine
                 .task_activate_for("boss", "worker", &task.task_id)
@@ -2041,7 +2042,7 @@ mod engine_tests {
             task.task_id
         );
 
-        // Фокусы: оператор архивирует фокус чужого сида.
+        // Focuses: the operator archives a focus of another seat.
         let f = engine
             .focus_add("worker", "focus task", "", 5, &[], None)
             .await
@@ -2060,14 +2061,14 @@ mod engine_tests {
                 .iter()
                 .all(|x| x.focus_id != f.focus_id || x.archived)
         );
-        // Без роли — отказ.
+        // Without a role — denied.
         let err = engine
             .focus_set_archived_for("worker", "boss", &f.focus_id, true)
             .await
             .unwrap_err();
         assert!(matches!(err, SlcError::PermissionDenied(_)));
 
-        // Проекты: оператор архивирует чужой проект.
+        // Projects: the operator archives another seat's project.
         let proj = engine
             .project_create("worker", "worker proj", "", &[], &json!({}))
             .await
@@ -2078,14 +2079,14 @@ mod engine_tests {
             .unwrap()
             .unwrap();
         assert_eq!(updated.status, "archived");
-        // Невалидный статус — InvalidInput.
+        // Invalid status — InvalidInput.
         let err = engine
             .project_set_status_for("boss", "worker", &proj.project_id, "bogus")
             .await
             .unwrap_err();
         assert!(matches!(err, SlcError::InvalidInput(_)));
 
-        // seat_roles отдаёт конфигурацию.
+        // seat_roles returns the configuration.
         assert_eq!(engine.seat_roles("boss"), vec![SeatRole::Operator]);
         assert!(engine.can_manage_seats("boss"));
         assert!(engine.can_manage_target("boss", "worker"));
@@ -2130,9 +2131,9 @@ mod engine_tests {
         assert!(!engine.can_write_document("unscoped-operator", &public));
     }
 
-    /// Менеджер (operator + SLC_SEAT_MANAGE_ACL) обновляет workflow-задачу
-    /// контактора в IN_WORK: правка персистится каноническим маршрутом через
-    /// workflow-хранилище (durable update-событие) и переживает перезагрузку.
+    /// A manager (operator + SLC_SEAT_MANAGE_ACL) updates the contactor's
+    /// workflow task in IN_WORK: the edit is persisted through the canonical
+    /// workflow-store route (a durable update event) and survives a reload.
     #[tokio::test]
     async fn manager_updates_workflow_task_of_managed_seat_with_durable_event() {
         use crate::roles::SeatRole;
@@ -2182,8 +2183,8 @@ mod engine_tests {
             .await
             .unwrap();
 
-        // Менеджер правит workflow-задачу контактора, пока та IN_WORK:
-        // имя + append-дифф к телу + auto_load + project + metadata.
+        // The manager edits the contactor's workflow task while it is
+        // IN_WORK: name + append-diff to the body + auto_load + project + metadata.
         let updated = engine
             .task_update(
                 "seat-manager",
@@ -2210,8 +2211,8 @@ mod engine_tests {
         );
         assert_eq!(updated.metadata["priority"], json!("high"));
 
-        // Перезагрузка: новая engine-инстанция на том же хранилище видит
-        // правку и с сида контактора, и с сида менеджера.
+        // Reload: a new engine instance on the same store sees the edit
+        // both from the contactor seat and from the manager seat.
         let engine2 = SlcEngine::with(store.clone(), Arc::new(MockLlm::new(vec![])), {
             let mut c = SlcConfig::default()
                 .with_seat_role("seat-manager", SeatRole::Operator)
@@ -2234,7 +2235,7 @@ mod engine_tests {
             .await
             .unwrap();
         assert_eq!(from_manager.name, "Prepare pitch v2");
-        // Тождественность и очередь не тронуты.
+        // Identity and queue are untouched.
         let raw = store.kb_get(&assigned.task_id).await.unwrap().unwrap();
         assert_eq!(
             raw.metadata
@@ -2252,7 +2253,7 @@ mod engine_tests {
         );
         assert!(raw.content.contains("уточнено"));
 
-        // Аудит: durable update-событие с полями изменений.
+        // Audit: a durable update event carrying the changed fields.
         let events = engine2
             .workflow_task_events("seat-manager", &assigned.task_id, 50)
             .await
@@ -2274,7 +2275,7 @@ mod engine_tests {
             );
         }
 
-        // Статус workflow-задачи событиями не переписывается — явная ошибка.
+        // A workflow task's status is not rewritten through events — an explicit error.
         let status_err = engine
             .task_update(
                 "seat-manager",
@@ -2295,7 +2296,7 @@ mod engine_tests {
         );
         assert!(status_err.to_string().contains("event-governed"));
 
-        // Владелец (контактор) остаётся на append-only контракте.
+        // The owner (contactor) stays on the append-only contract.
         let owner_err = engine
             .task_update(
                 "seat-contactor",
@@ -2313,8 +2314,8 @@ mod engine_tests {
         assert!(owner_err.to_string().contains("append-only"), "{owner_err}");
     }
 
-    /// Чужие задачи (обычные и workflow) не обновляются и не удаляются
-    /// не-менеджером: явный PermissionDenied вместо ложного «не найдено».
+    /// Tasks of other seats (plain and workflow) cannot be updated or
+    /// deleted by a non-manager: an explicit PermissionDenied instead of a fake "not found".
     #[tokio::test]
     async fn non_manager_cannot_update_or_delete_tasks_of_other_seats() {
         use crate::roles::SeatRole;
@@ -2356,7 +2357,7 @@ mod engine_tests {
             .await
             .unwrap();
 
-        // Не-менеджер не обновляет чужую обычную задачу.
+        // A non-manager cannot update another seat's plain task.
         let err = engine
             .task_update(
                 "seat-outsider",
@@ -2373,7 +2374,7 @@ mod engine_tests {
             .unwrap_err();
         assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
         assert!(err.to_string().contains("SLC_SEAT_MANAGE_ACL"));
-        // Аналитик тоже не владеет задачей контактора.
+        // The analyst does not own the contactor's task either.
         assert!(matches!(
             engine
                 .task_update(
@@ -2390,13 +2391,13 @@ mod engine_tests {
                 .await,
             Err(SlcError::PermissionDenied(_))
         ));
-        // Чужую workflow-задачу не удалить…
+        // Another seat's workflow task cannot be deleted…
         let err = engine
             .task_delete("seat-outsider", &workflow.task_id)
             .await
             .unwrap_err();
         assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
-        // …и не обновить.
+        // …nor updated.
         let err = engine
             .task_update(
                 "seat-outsider",
@@ -2412,13 +2413,13 @@ mod engine_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
-        // Чужую обычную задачу не удалить.
+        // Another seat's plain task cannot be deleted.
         let err = engine
             .task_delete("seat-analyst", &plain.task_id)
             .await
             .unwrap_err();
         assert!(matches!(err, SlcError::PermissionDenied(_)), "{err}");
-        // Владелец свою обычную задачу удаляет.
+        // The owner deletes its own plain task.
         assert!(
             engine
                 .task_delete("seat-contactor", &plain.task_id)
@@ -2426,7 +2427,7 @@ mod engine_tests {
                 .unwrap()
         );
         assert!(engine.get_document(&plain.task_id).await.unwrap().is_none());
-        // Существующая workflow-задача для владельца неудаляема (история событий).
+        // An existing workflow task cannot be deleted by its owner either (event history).
         let err = engine
             .task_delete("seat-contactor", &workflow.task_id)
             .await
@@ -2434,9 +2435,9 @@ mod engine_tests {
         assert!(err.to_string().contains("cannot be deleted"), "{err}");
     }
 
-    /// Менеджер видит/читает/удаляет задачи всех управляемых сидов
-    /// (обычные и workflow, включая IN_WORK); неизвестный id — NotFound,
-    /// workflow-задачи — не удаляются.
+    /// A manager sees/reads/deletes tasks of all managed seats
+    /// (plain and workflow, including IN_WORK); an unknown id — NotFound,
+    /// workflow tasks — cannot be deleted.
     #[tokio::test]
     async fn manager_get_list_delete_semantics_cover_all_managed_seats() {
         use crate::roles::SeatRole;
@@ -2498,8 +2499,8 @@ mod engine_tests {
             .await
             .unwrap();
 
-        // get: менеджер читает задачи каждого управляемого сида (включая
-        // IN_WORK workflow-задачу), владелец — свою.
+        // get: the manager reads tasks of every managed seat (including the
+        // IN_WORK workflow task), the owner — its own.
         let via_manager = engine
             .workflow_get_task("seat-manager", &plain_analyst.task_id)
             .await
@@ -2515,8 +2516,8 @@ mod engine_tests {
             Some(crate::workflow::QUEUE_STATE_RUNNING)
         );
 
-        // list (Visible scope): workflow-задачи всех управляемых сидов
-        // (включая IN_WORK) видны менеджеру одним вызовом.
+        // list (Visible scope): workflow tasks of all managed seats
+        // (including IN_WORK) are visible to the manager in one call.
         let visible = engine
             .workflow_list_tasks(
                 "seat-manager",
@@ -2534,8 +2535,8 @@ mod engine_tests {
             "manager Visible list must include the IN_WORK workflow task: {:?}",
             visible.iter().map(|t| &t.task_id).collect::<Vec<_>>()
         );
-        // По-сидовый list покрывает и обычные задачи каждого управляемого
-        // сида (legacy target_seat семантика менеджера).
+        // The per-seat list also covers the plain tasks of every managed
+        // seat (legacy target_seat manager semantics).
         let per_seat_contactor = engine
             .task_list("seat-contactor", None, None, 50)
             .await
@@ -2555,7 +2556,7 @@ mod engine_tests {
                 .iter()
                 .any(|t| t.task_id == plain_analyst.task_id)
         );
-        // Аутсайдер ничего чужого в Visible не видит.
+        // An outsider sees nothing foreign in the Visible scope.
         let outsider_visible = engine
             .workflow_list_tasks(
                 "seat-outsider",
@@ -2570,7 +2571,7 @@ mod engine_tests {
             .unwrap();
         assert!(outsider_visible.is_empty());
 
-        // delete: менеджер удаляет обычную задачу управляемого сида…
+        // delete: the manager deletes a plain task of a managed seat…
         assert!(
             engine
                 .task_delete("seat-manager", &plain_analyst.task_id)
@@ -2584,7 +2585,7 @@ mod engine_tests {
                 .unwrap()
                 .is_none()
         );
-        // …но не workflow-задачу (история событий сохраняется).
+        // …but not a workflow task (event history is preserved).
         let err = engine
             .task_delete("seat-manager", &workflow.task_id)
             .await
@@ -2598,7 +2599,7 @@ mod engine_tests {
                 .is_some()
         );
 
-        // Неизвестный id — честный NotFound, не «скрытый» ответ.
+        // An unknown id — an honest NotFound, not a "hidden" answer.
         let err = engine
             .task_update(
                 "seat-manager",
@@ -2616,8 +2617,8 @@ mod engine_tests {
         assert!(matches!(err, SlcError::NotFound(_)), "{err}");
     }
 
-    /// Переименование документа: каскад auto_load/references/вики-ссылок/
-    /// активных указателей сидов; rename_task строит slug от нового имени.
+    /// Renaming a document: a cascade over auto_load/references/wiki links/
+    /// active seat pointers; rename_task builds the slug from the new name.
     #[tokio::test]
     async fn rename_document_cascades_links() {
         let store: std::sync::Arc<dyn StorageBackend> =
@@ -2635,7 +2636,7 @@ mod engine_tests {
             Some("seat_a".to_string()),
         );
         engine.add_document(&mut doc).await.unwrap();
-        // Ссылающийся документ.
+        // The referencing document.
         let mut ref_doc = Document::new(
             "ref_doc",
             DocumentCategory::Custom,
@@ -2647,7 +2648,7 @@ mod engine_tests {
         ref_doc.auto_load = vec!["old_name".into()];
         ref_doc.references = vec!["old_name".into()];
         engine.add_document(&mut ref_doc).await.unwrap();
-        // Активный указатель сида на старый id.
+        // The seat's active pointer on the old id.
         engine
             .document_activate("seat_a", "old_name")
             .await
@@ -2658,18 +2659,18 @@ mod engine_tests {
             .await
             .unwrap();
         assert_eq!(report.new_id, "new_name");
-        assert_eq!(report.links_fixed, 2); // сам документ (контент) + ref_doc
-        assert_eq!(report.content_links_fixed, 1); // только сам документ
+        assert_eq!(report.links_fixed, 2); // the doc itself (content) + ref_doc
+        assert_eq!(report.content_links_fixed, 1); // only the doc itself
         assert!(report.seats_updated.contains(&"seat_a".to_string()));
 
-        // Старый id исчез, новый на месте, контент с заменёнными ссылками.
+        // The old id is gone, the new one is in place, content has replaced links.
         assert!(engine.get_document("old_name").await.unwrap().is_none());
         let renamed = engine.get_document("new_name").await.unwrap().unwrap();
         assert_eq!(
             renamed.content,
             "текст со ссылкой [[new_name]] и [[new_name|alias]]"
         );
-        // Указатель сида обновлён.
+        // The seat's pointer was updated.
         assert_eq!(
             engine
                 .document_get_active("seat_a")
@@ -2679,17 +2680,17 @@ mod engine_tests {
                 .document_id,
             "new_name"
         );
-        // Ссылки обновлены.
+        // References updated.
         let refd = engine.get_document("ref_doc").await.unwrap().unwrap();
         assert_eq!(refd.auto_load, vec!["new_name".to_string()]);
         assert_eq!(refd.references, vec!["new_name".to_string()]);
-        // Ссылка на несуществующий id — ошибка.
+        // A link to a nonexistent id — an error.
         let err = engine
             .rename_document("seat_a", "new_name", "new_name", None)
             .await
             .unwrap_err();
         assert!(matches!(err, SlcError::InvalidInput(_)));
-        // Эмбеддинги: старый ключ удалён, новый пере-эмбежен.
+        // Embeddings: the old key was removed, the new one is re-embedded.
         assert!(
             engine
                 .store()
@@ -2708,7 +2709,7 @@ mod engine_tests {
         );
     }
 
-    /// rename_task: новый id = slug от имени, name обновляется.
+    /// rename_task: the new id = slug from the name, the name is updated.
     #[tokio::test]
     async fn rename_task_builds_slug() {
         let store: std::sync::Arc<dyn StorageBackend> =

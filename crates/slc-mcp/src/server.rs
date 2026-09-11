@@ -30,9 +30,9 @@ pub struct AppState {
     pub sampling: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
     >,
-    /// Каталог со статикой SPA (web-ui/dist) для встроенной веб-морды.
+    /// Directory with the SPA static files (web-ui/dist) for the embedded web UI.
     pub dist: std::path::PathBuf,
-    /// Авторизация веб-морды (users/JWT/RBAC/Yandex OAuth, SLC_AUTH).
+    /// Web UI auth (users/JWT/RBAC/Yandex OAuth, SLC_AUTH).
     pub auth: std::sync::Arc<auth::AuthState>,
 }
 
@@ -67,8 +67,8 @@ pub async fn run(
         auth: std::sync::Arc::new(auth_state),
     });
     let app = Router::new()
-        // Streamable-HTTP клиенты (go-sdk / Yandex AI Studio) открывают
-        // SSE-поток GET-ом на URL сервера — отдаём тот же стрим, что и /sse.
+        // Streamable-HTTP clients (go-sdk / Yandex AI Studio) open an SSE
+        // stream with a GET on the server URL — serve the same stream as /sse.
         .route(
             "/mcp",
             get(sse_endpoint).post(mcp).delete(mcp_session_delete),
@@ -76,7 +76,7 @@ pub async fn run(
         .route("/sse", get(sse_endpoint))
         .route("/messages", post(messages))
         .route("/health", get(health))
-        // ── Веб-морда (REST + SPA, тот же процесс) ──
+        // ── Web UI (REST + SPA, same process) ──
         .route("/api/health", get(webui::api::health))
         .route("/api/stats", get(webui::api::stats))
         .route("/api/context", get(webui::api::context))
@@ -126,7 +126,7 @@ pub async fn run(
             put(webui::api::focus_update).delete(webui::api::focus_remove),
         )
         .route("/api/events", get(webui::api::sse_events))
-        // ── Авторизация веб-морды (полный порт легаси) ──
+        // ── Web UI auth (full legacy port) ──
         .route("/api/auth/register", post(auth::routes::register))
         .route("/api/auth/login", post(auth::routes::login))
         .route("/api/auth/refresh", post(auth::routes::refresh))
@@ -303,12 +303,14 @@ async fn messages(
         .map(String::from);
     let seat = seat_from_request(&headers).unwrap_or_default();
     let (status, Json(body)) = mcp_request(State(state.clone()), headers, Json(req)).await;
-    // Ответ доставляется ДВУМЯ путями сразу:
-    // 1. SSE-событие `message` на потоке /sse — легаси-SSE клиенты (SDK
-    //    SSEClientTransport) игнорируют тело POST и ждут ответ там;
-    // 2. inline-тело — streamable-HTTP клиенты и гибридные клиенты, которые
-    //    читают ответ из тела.
-    // Лишний канал просто игнорируется клиентом, чей pending уже resolved.
+    // The response is delivered via TWO paths at once:
+    // 1. The `message` SSE event on the /sse stream — legacy-SSE clients
+    //    (SDK SSEClientTransport) ignore the POST body and await the
+    //    response there;
+    // 2. the inline body — streamable-HTTP clients and hybrid clients that
+    //    read the response from the body.
+    // The extra channel is simply ignored by a client whose pending request
+    // is already resolved.
     if body.get("id").is_some() {
         let _ = state.events.send(json!({
             "type": "rpc_response",
@@ -987,7 +989,7 @@ fn tools() -> Vec<Value> {
                 "timezone": {"type":"string","description":"IANA timezone, e.g. Europe/Moscow"}
             },"required":["content"]}
         }),
-        // UI-ориентированные read/write-тулы
+        // UI-oriented read/write tools
         json!({
             "name": "project_set_status",
             "description": "Archive or unarchive a project (active|archived). An operator may change another explicitly authorized seat through target_seat.",
@@ -1338,7 +1340,10 @@ name and generate the new slug.
 любой ответ с `_pagination` (`response_id`/`page`/`total_pages`) или
 текстом «ОТВЕТ ОБРЕЗАН БЮДЖЕТОМ КЛИЕНТА».
 
-Правила:
+Правила (нарушение любого = потеря данных):
+0. **НИКОГДА не работай с одной страницей.** Увидел `_pagination` или
+   постраничную инструкцию — выкачай ВСЕ страницы пагинированного
+   документа/ответа до конца. Одна страница — это НЕ документ.
 1. **Считывай ВСЕ страницы до конца**: если `_pagination.has_more=true`,
    НЕМЕДЛЕННО выполни точную `mcp__slc__get_page({...})` команду,
    напечатанную в самом конце ответа. На следующей странице выполни
@@ -1356,14 +1361,15 @@ name and generate the new slug.
    ПОСТРАНИЧНО ПОЛНОСТЬЮ (get_document + все страницы `get_page`), и
    только потом применяй diff-операции: дифф поверх неполной копии
    затрёт потерянные секции.
-4. **Если клиент обрезает первую страницу** (обрезка на уровне обвязки:
-   сообщение «truncated by resultBudget»/«maxModelBytes») — уменьши размер
-   страницы: `set_page_limit(<токены>)` (persisted per-seat) или заголовок
-   `X-SLC-Page-Token-Limit: <токены>` на соединении (env сервера
-   `SLC_PAGE_TOKEN_LIMIT`). Общий дефолт — 50000 токенов; клиент с меньшим
-   result budget обязан явно задать меньший лимит. Грубая формула:
-   страница ≈ токены×3 символов. После уменьшения повтори исходный вызов тула — страницы
-   станут меньше и влезут в бюджет обвязки целиком.
+4. **Обрезка = САМ уменьши лимит и повтори.** Если клиент обрезает
+   выхлоп (сообщение «truncated by resultBudget»/«maxModelBytes» или
+   «ОТВЕТ ОБРЕЗАН») — НЕ продолжай работу и НЕ повторяй вслепую: немедленно
+   САМ уменьши размер страницы — `set_page_limit(<токены>)` (persisted
+   per-seat) или заголовок `X-SLC-Page-Token-Limit` на соединении (env
+   сервера `SLC_PAGE_TOKEN_LIMIT`) — и заново выполни исходный вызов тула.
+   Грубая формула: страница ≈ токены×3 символов; для бюджета 50K байт
+   бери ≈5000 токенов. Уменьшай до тех пор, пока страницы не перестанут
+   обрезаться, и только потом завершай обработку результата.
 
 ## Seat roles
 
@@ -1543,9 +1549,9 @@ async fn build_context(
     let seat_limit = engine.context_limit_for(seat_id).await.map_err(json_err)?;
     let limit_tokens = effective_context_token_limit(context_token_limit, seat_limit);
     let mut docs: Vec<Value> = Vec::new();
-    // ЕДИНАЯ единица бюджета — ТОКЕНЫ (~3 симв/токен, RU/EN смесь).
-    // Никаких байтовых ограничений вывода: бюджет задаёт клиент заголовком
-    // либо для seat через /limit, а об обрезке транспорта заботится харнес.
+    // The ONLY budget unit is TOKENS (~3 chars/token for a RU/EN mix).
+    // No byte limits on output: the budget is set by the client via header
+    // or per-seat via /limit, and the harness handles transport truncation.
     let to_tokens = |chars: usize| chars.div_ceil(slc_core::CHARS_PER_TOKEN).max(1);
     let mut used_tokens = 0usize;
 
@@ -1625,8 +1631,8 @@ async fn build_context(
     }
 
     // Compression: drop whole blocks by priority until the TOKEN budget
-    // fits — по одному, начиная с наименее важных (последних), чтобы
-    // манифест и стандарты остались в контексте даже при жёстком лимите.
+    // fits — one by one, starting from the least important (last) so the
+    // manifest and standards stay in context even under a tight limit.
     let overflow = |used_tokens: usize| -> bool { used_tokens > limit_tokens };
     let mut drop_while_overflow = |blocks: &mut Vec<Value>, omitted: &mut Vec<String>| {
         while overflow(used_tokens) {
@@ -1644,7 +1650,7 @@ async fn build_context(
             }
         }
     };
-    // Приоритет дропа: профили → base-документы (с наименее важных).
+    // Drop priority: profiles → base documents (from the least important).
     drop_while_overflow(&mut profile_blocks, &mut omitted);
     drop_while_overflow(&mut base_blocks, &mut omitted);
     let compressed = !omitted.is_empty() || traversal_limited;
@@ -1668,7 +1674,7 @@ async fn build_context(
     let mut llm_compressed: Vec<String> = Vec::new();
     if overflow(used_tokens) && !docs.is_empty() {
         // Compress from the least important end (profiles → active).
-        // summarize_text принимает размер в символах — конвертируем.
+        // summarize_text takes the size in characters — convert.
         let budget = ((limit_tokens / 2).max(100)) * slc_core::CHARS_PER_TOKEN;
         for b in docs.iter_mut().rev() {
             if !overflow(used_tokens) {
@@ -1728,9 +1734,9 @@ async fn build_context(
             "saved": save_info.as_ref().and_then(|v| v.get("document_id")).cloned(),
         }));
     }
-    // NOTE: контекст — ТОЛЬКО документы (активный + фокусы + профили + base).
-    // Списки всех проектов/задач в контекст не попадают (см. /ctx для
-    // диагностики) — иначе каждая сборка тянула бы всю базу.
+    // NOTE: the context is ONLY documents (active + focuses + profiles + base).
+    // Lists of all projects/tasks are NOT included in the context (see /ctx
+    // for diagnostics) — otherwise every build would pull in the whole base.
     Ok(
         json!({"docs": docs, "seat": seat_id, "save_info": save_info,
                    "limit_tokens": limit_tokens,
@@ -1928,8 +1934,8 @@ async fn call_tool(
                            "projects": projects, "tasks": tasks}))
                 }
                 "update_context" => {
-                    // Slash-команда = тот же MCP-тул update_context; summary
-                    // берётся из остатка строки.
+                    // The slash command = the same MCP tool update_context;
+                    // the summary is taken from the rest of the string.
                     let summary = parts.collect::<Vec<_>>().join(" ");
                     let empty: Vec<String> = Vec::new();
                     build_context(
@@ -1946,7 +1952,7 @@ async fn call_tool(
                     .await
                 }
                 "save_context" => {
-                    // Сохранить снимок = update_context со summary.
+                    // Saving a snapshot = update_context with a summary.
                     let summary = parts.collect::<Vec<_>>().join(" ");
                     if summary.is_empty() {
                         return Err(
@@ -1968,7 +1974,7 @@ async fn call_tool(
                     .await
                 }
                 "search" => {
-                    // Поиск по документам БЗ: /search <запрос>.
+                    // Search knowledge-base documents: /search <query>.
                     let query = parts.collect::<Vec<_>>().join(" ");
                     if query.is_empty() {
                         return Err(json!({"code": -32602, "message": "usage: /search <query>"}));
@@ -2020,7 +2026,7 @@ async fn call_tool(
                 .get("document_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            // Видимость: свой/публичный документ или сид с ролью operator.
+            // Visibility: own/public document or a seat with the operator role.
             match engine.get_document(id).await.map_err(json_err)? {
                 Some(d) if engine.can_read_document(seat_id, &d) => {
                     json!({"document_id": d.document_id, "category": d.category.as_str(), "folder": d.folder, "content": d.content, "tags": d.tags, "metadata": d.metadata, "seat_id": d.seat_id, "auto_load": d.auto_load, "references": d.references, "created_at": d.created_at.to_rfc3339(), "updated_at": d.updated_at.to_rfc3339()})
@@ -2622,8 +2628,8 @@ async fn call_tool(
         "update_task" => {
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
-            // Тело: diff (новый канон) или legacy description/description_patch
-            // (старые инструкции агентов) — принимаются оба.
+            // Body: diff (new canon) or legacy description/description_patch
+            // (old agent instructions) — both are accepted.
             let description = args.get("description").and_then(|v| v.as_str());
             let description_patch = args
                 .get("diff")
@@ -2643,13 +2649,14 @@ async fn call_tool(
             let auto_load = args.get("auto_load").map(|_| str_array(args, "auto_load"));
             let status = args.get("status").and_then(|v| v.as_str());
             let metadata = args.get("metadata").cloned();
-            // Полные manager-семантики в движке: свой/публичный объект либо
-            // менеджер (operator + SLC_SEAT_MANAGE_ACL) любого управляемого
-            // сида, включая workflow-задачи в IN_WORK (канонический маршрут
-            // через workflow-хранилище с аудит-событием). Неизвестный id —
-            // отдельная явная ошибка NotFound, чужая задача без прав —
-            // PermissionDenied, workflow-статусы — событиями start/report/
-            // cancel. Все application-ошибки возвращаются как isError:true.
+            // Full manager semantics live in the engine: the caller's own or
+            // public objects, or a manager (operator + SLC_SEAT_MANAGE_ACL)
+            // of any managed seat, including workflow tasks in IN_WORK (the
+            // canonical route through the workflow store with an audit
+            // event). An unknown id is a separate explicit NotFound error, a
+            // foreign task without rights — PermissionDenied, workflow
+            // statuses — via start/report/cancel events. All application
+            // errors come back as isError:true.
             let updated = engine
                 .task_update(
                     seat_id,
@@ -2664,7 +2671,7 @@ async fn call_tool(
                 )
                 .await
                 .map_err(json_err)?;
-            // Тело изменилось — пере-эмбеддинг для семантического поиска.
+            // The body changed — re-embed for semantic search.
             let _ = engine.reembed_document(task_id).await;
             json!({"success": true, "task_id": task_id, "name": updated.name, "message": "Task updated"})
         }
@@ -3257,8 +3264,8 @@ async fn call_tool(
                     "message": "workflow tasks are append-only; use task_message, report_task, or cancel_task"
                 }));
             }
-            // Тело: content (legacy, полная замена) и/или diff — оба
-            // принимаются (старые инструкции агентов).
+            // Body: content (legacy, full replacement) and/or diff — both
+            // are accepted (older agent instructions).
             if let Some(c) = args.get("content").and_then(|v| v.as_str()) {
                 doc.content = c.to_string();
                 doc.content_hash = slc_core::content_hash(c);
@@ -3648,10 +3655,11 @@ async fn call_tool(
         }
     }
     let mut result = json!({"content": [{"type": "text", "text": text}], "isError": false});
-    // structuredContent: некоторые клиенты требуют его, когда у тула есть
-    // outputSchema. Схем у наших тулов нет, поэтому для БОЛЬШИХ ответов
-    // дубль не отдаём — он удваивал вывод (text + structuredContent) и
-    // выводил за resultBudget харнеса (обрезка strategy=truncate).
+    // structuredContent: some clients require it when the tool has an
+    // outputSchema. Our tools have no schemas, so for LARGE responses we
+    // omit the duplicate — it doubled the output (text + structuredContent)
+    // and pushed it past the harness resultBudget (truncation
+    // strategy=truncate).
     if tool_text.chars().count() <= 2000 {
         if let Ok(parsed) = serde_json::from_str::<Value>(&tool_text) {
             result["structuredContent"] = parsed;
@@ -3704,9 +3712,9 @@ async fn call_tool(
                 }
             }
         } else if tool_text.chars().count() > 16_000 {
-            // Ответ большой, но пагинация не сработала (лимит страницы
-            // велик или пагинация выключена) — клиент, скорее всего,
-            // обрежет выхлоп. Явно подсказываем, что делать.
+            // The response is large but pagination did not kick in (the page
+            // limit is high or pagination is off) — the client will likely
+            // truncate the output. Explicitly hint what to do.
             text.push_str(&format!(
                     "\n\n⚠️ Ответ большой ({} символов) и НЕ пагинирован (лимит страницы {} токенов ≈ {} символов). Если клиент обрезает выхлоп: set_page_limit(<{}>) и повтори вызов тула.",
                     tool_text.chars().count(),
@@ -4747,13 +4755,13 @@ mod seat_filter_tests {
     #[test]
     fn tool_catalog_describes_manager_full_access_truthfully() {
         let catalog = catalog();
-        // update_task обязан заявлять полный доступ менеджера и workflow-маршрут.
+        // update_task must advertise full manager access and the workflow route.
         let update = catalog["update_task"]["description"].as_str().unwrap();
         assert!(update.contains("MANAGER FULL ACCESS"), "{update}");
         assert!(update.contains("SLC_SEAT_MANAGE_ACL"), "{update}");
         assert!(update.contains("workflow event store"), "{update}");
         assert!(update.contains("IN_WORK"), "{update}");
-        // get/delete/list задач заявляют только то, что реализовано.
+        // Task get/delete/list advertise only what is implemented.
         assert!(
             catalog["get_task"]["description"]
                 .as_str()
@@ -4775,7 +4783,7 @@ mod seat_filter_tests {
         let list = catalog["list_tasks"]["description"].as_str().unwrap();
         assert!(list.contains("target_seat"), "{list}");
         assert!(list.contains("SLC_SEAT_MANAGE_ACL"), "{list}");
-        // update_task по-прежнему требует task_id.
+        // update_task still requires task_id.
         assert!(
             catalog["update_task"]["inputSchema"]["required"]
                 .as_array()
@@ -4821,16 +4829,16 @@ mod seat_filter_tests {
         let text = append_only["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("append-only"), "{text}");
         assert!(text.contains("workflow"), "{text}");
-        // Русское, пригодное к действию: указаны канонические инструменты.
+        // Russian and actionable: the canonical tools are named.
         assert!(text.contains("report_task"), "{text}");
         assert!(text.contains("task_message"), "{text}");
 
-        // Общая ошибка без kind остаётся JSON-RPC (не конвертируется).
+        // A generic error without a kind stays JSON-RPC (not converted).
         let generic = json!({"code": -32602, "message": "bad arguments"});
         assert!(generic.get("kind").is_none());
     }
 
-    /// Engine helper — рой менеджера над контактором/аналитиком.
+    /// Engine helper — the manager swarm over the contactor/analyst.
     async fn swarm_engine() -> SlcEngine {
         use slc_core::roles::SeatRole;
         use slc_core::storage::sqlite::SqliteStore;
@@ -4861,7 +4869,7 @@ mod seat_filter_tests {
         }
     }
 
-    /// call_tool-текст как JSON (успешные вызовы отдают JSON-текст).
+    /// call_tool text parsed as JSON (successful calls return JSON text).
     async fn tool_json(engine: &SlcEngine, seat: &str, name: &str, args: Value) -> Value {
         let (events, _) = tokio::sync::broadcast::channel(8);
         let result = call_tool(engine, seat, name, &args, &events, tool_policy())
@@ -4891,7 +4899,7 @@ mod seat_filter_tests {
         )
         .await;
 
-        // Менеджер правит workflow-задачу контактора (IN_WORK) через update_task.
+        // The manager edits the contactor's workflow task (IN_WORK) via update_task.
         let updated = tool_json(
             &engine,
             "seat-manager",
@@ -4906,7 +4914,7 @@ mod seat_filter_tests {
         .await;
         assert_eq!(updated["success"], true, "{updated}");
 
-        // Переживает перезагрузку: контактор и менеджер видят правку.
+        // Survives a reload: the contactor and the manager both see the edit.
         for seat in ["seat-contactor", "seat-manager"] {
             let fetched = tool_json(&engine, seat, "get_task", json!({"task_id": task_id})).await;
             assert_eq!(fetched["task"]["name"], "Prepare pitch v2", "{seat}");
@@ -4918,7 +4926,7 @@ mod seat_filter_tests {
             );
             assert_eq!(fetched["task"]["status"], "IN_WORK");
         }
-        // Аудит-событие update лежит в workflow-хранилище.
+        // The durable update event lives in the workflow store.
         let events = tool_json(
             &engine,
             "seat-contactor",
@@ -4935,7 +4943,7 @@ mod seat_filter_tests {
             "{events}"
         );
 
-        // Владелец на append-only: update_task отклоняется с kind invalid_input.
+        // The owner is append-only: update_task is rejected with kind invalid_input.
         let owner_blocked = call_tool(
             &engine,
             "seat-contactor",
@@ -4967,7 +4975,7 @@ mod seat_filter_tests {
         .await;
         let task_id = created["task_id"].as_str().unwrap().to_string();
 
-        // Аутсайдер и аналитик не могут править задачу контактора.
+        // An outsider and the analyst cannot edit the contactor's task.
         for outsider in ["seat-outsider", "seat-analyst"] {
             let err = call_tool(
                 &engine,
@@ -4981,7 +4989,7 @@ mod seat_filter_tests {
             .unwrap_err();
             assert_eq!(err["kind"], "permission_denied", "{outsider}: {err}");
         }
-        // Несуществующая задача — отдельная явная not_found.
+        // A nonexistent task is a separate explicit not_found.
         let err = call_tool(
             &engine,
             "seat-manager",
@@ -5029,8 +5037,8 @@ mod seat_filter_tests {
         )
         .await;
 
-        // Менеджер читает и листит задачи управляемых сидов (включая IN_WORK):
-        // Visible scope покрывает workflow-задачи, target_seat — обычные.
+        // The manager reads and lists tasks of managed seats (incl. IN_WORK):
+        // the Visible scope covers workflow tasks, target_seat — plain ones.
         let listed = tool_json(
             &engine,
             "seat-manager",
@@ -5073,8 +5081,8 @@ mod seat_filter_tests {
         .await;
         assert_eq!(per_seat_analyst["count"], 1);
 
-        // Менеджер удаляет обычную задачу управляемого сида; workflow —
-        // нет (история событий), владелец своей — да.
+        // The manager deletes a managed seat's plain task; workflow — no
+        // (event history), the owner deletes its own — yes.
         let deleted = tool_json(
             &engine,
             "seat-manager",

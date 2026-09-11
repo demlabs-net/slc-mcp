@@ -1,8 +1,8 @@
-// SLC web UI — REST-клиент к slc-mcp (/api/*, тот же процесс, что и MCP).
-// Два режима сервера (SLC_AUTH):
-// - seat (default): X-Seat-ID, сид генерируется в браузере;
-// - full: Bearer-JWT (users/пароли + Yandex OAuth), сид выводится из юзера.
-// При 401 (full-режим) — однофлайтовый refresh + повтор запроса.
+// SLC web UI — REST client for slc-mcp (/api/*, same process as MCP).
+// Two server modes (SLC_AUTH):
+// - seat (default): X-Seat-ID, the seat is generated in the browser;
+// - full: Bearer-JWT (users/passwords + Yandex OAuth), seat derived from the user.
+// On 401 (full mode) — single-flight refresh + request retry.
 
 const SEAT_KEY = 'slc_seat_id';
 
@@ -19,7 +19,7 @@ export function resetSeat(): void {
   localStorage.removeItem(SEAT_KEY);
 }
 
-// Токен выставляется модулем auth.ts (login/refresh/logout).
+// The token is set by the auth.ts module (login/refresh/logout).
 let accessToken: string | null = null;
 export function setAccessToken(t: string | null): void {
   accessToken = t;
@@ -40,7 +40,7 @@ async function req<T = any>(method: string, path: string, body?: any, retried = 
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (resp.status === 401 && accessToken && !path.startsWith('/api/auth/') && !retried) {
-    // 401 → одна попытка refresh (single-flight), потом повтор запроса.
+    // 401 → one refresh attempt (single-flight), then retry the request.
     if (!refreshPromise) {
       refreshPromise = import('./auth').then(m => m.refreshTokens()).finally(() => { refreshPromise = null; });
     }
@@ -129,7 +129,7 @@ export const api = {
     remove: (id: string) => req(`/api/focuses/${encodeURIComponent(id)}`, 'DELETE'),
   },
 
-  // ── auth (полный порт легаси: users/JWT/Yandex OAuth) ──
+  // ── auth (full legacy port: users/JWT/Yandex OAuth) ──
   auth: {
     me: () => req('/api/auth/me'),
     login: (username: string, password: string) =>

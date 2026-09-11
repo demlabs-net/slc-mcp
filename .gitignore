@@ -6,3 +6,4 @@ slc-mcp.legacy
 secrets/
 vault/
 dist/
+Cargo.lock

@@ -300,6 +300,21 @@ mod tests {
         }
     }
 
+    /// Advance the paused clock in small steps until `cond` holds (or the
+    /// budget is exhausted), yielding in between. Unlike a single fixed
+    /// advance, this is race-free against a spawned task that registers its
+    /// `sleep` late (after some steps already passed): a later step still
+    /// advances past its deadline.
+    async fn advance_until(total_ms: u64, cond: impl Fn() -> bool) {
+        for _ in 0..120 {
+            if cond() {
+                return;
+            }
+            tokio::time::advance(StdDuration::from_millis(total_ms / 120)).await;
+            yield_a_bit().await;
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn periodic_timer_fires_and_reschedules() {
         let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());

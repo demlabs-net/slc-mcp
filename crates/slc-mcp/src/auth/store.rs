@@ -1,7 +1,7 @@
-//! Персистентное хранилище авторизации в vault: `.slc/auth/`.
+//! Persistent auth storage inside the vault: `.slc/auth/`.
 //! users.json + oauth_rules.json (JSON), audit.jsonl (append).
-//! Один процесс владеет vault'ом — файлы читаются при старте, пишутся
-//! атомарно (tmp + rename) при каждом изменении.
+//! A single process owns the vault — files are read at startup and written
+//! atomically (tmp + rename) on every change.
 
 use super::models::{AuditEntry, OAuthAccessRule, User};
 use anyhow::{Context, Result};
@@ -23,7 +23,7 @@ impl AuthStore {
         }
     }
 
-    /// Загрузить состояние с диска (вызывается при старте сервера).
+    /// Load state from disk (called at server startup).
     pub fn load(&self) -> Result<()> {
         std::fs::create_dir_all(&self.dir).context("auth dir create")?;
         let users_file = self.dir.join("users.json");

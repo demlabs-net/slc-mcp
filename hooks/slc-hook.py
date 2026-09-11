@@ -96,7 +96,7 @@ def rpc(url: str, seat: str, token: str | None, method: str, params: dict) -> di
     except urllib.error.URLError as e:
         raise RuntimeError(f"не удалось подключиться к {url}: {e.reason}") from e
 
-    # SSE-обёртка (data: {...}) — на случай, если сервер вернёт event-stream.
+    # SSE wrapper (data: {...}) — in case the server returns an event-stream.
     if data.lstrip().startswith("data:"):
         data = "\n".join(
             line[5:].strip() for line in data.splitlines() if line.startswith("data:")
@@ -168,7 +168,7 @@ def main() -> int:
 
     text = tool_text(result)
     if text:
-        # Сводка результата — limit/used/compressed предупреждение не теряем.
+        # Result summary — keep the limit/used/compressed warning visible.
         tail = [ln for ln in text.splitlines() if ln.strip()]
         print("\n".join(tail[:12]) if tail else text)
     return 0
