@@ -1883,6 +1883,20 @@ fn workflow_delivery(
     })
 }
 
+/// Reporting remains valid while held; only execution authority is withheld.
+fn workflow_delivery_if_released(
+    engine: &SlcEngine,
+    recipient: Option<&str>,
+    task_id: &str,
+    event_id: Option<&str>,
+    event_kind: &str,
+) -> Value {
+    if recipient.is_none_or(|principal| engine.workflow_principal_held(principal)) {
+        return Value::Null;
+    }
+    workflow_delivery(recipient, task_id, event_id, event_kind)
+}
+
 async fn call_tool(
     engine: &SlcEngine,
     seat_id: &str,
@@ -1896,7 +1910,7 @@ async fn call_tool(
         .ensure_seat(seat_id)
         .await
         .map_err(|e| json!({"code": -32000, "message": e.to_string()}))?;
-    let text = match name {
+    let mut text = match name {
         "command" => {
             let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
             if !input.starts_with('/') {
@@ -2282,7 +2296,8 @@ async fn call_tool(
                 == Some(slc_core::workflow::QUEUE_STATE_READY)
                 && queue.ready_task_id.as_deref() == Some(task.task_id.as_str());
             let delivery = wake_recommended.then(|| {
-                workflow_delivery(
+                workflow_delivery_if_released(
+                    engine,
                     Some(assignee),
                     &task.task_id,
                     task.queue_ready_event_id.as_deref(),
@@ -2369,7 +2384,8 @@ async fn call_tool(
                 == Some(slc_core::workflow::QUEUE_STATE_READY)
                 && queue.ready_task_id.as_deref() == Some(task.task_id.as_str());
             let delivery = wake_recommended.then(|| {
-                workflow_delivery(
+                workflow_delivery_if_released(
+                    engine,
                     Some(assignee),
                     &task.task_id,
                     task.queue_ready_event_id.as_deref(),
@@ -2458,7 +2474,8 @@ async fn call_tool(
                 "success": true,
                 "task": task,
                 "event": event,
-                "delivery": workflow_delivery(
+                "delivery": workflow_delivery_if_released(
+                    engine,
                     task.issuer.as_deref(),
                     &task.task_id,
                     Some(&event.event_id),
@@ -2500,14 +2517,16 @@ async fn call_tool(
                 "delivery": if polled_manager_portfolio {
                     Value::Null
                 } else {
-                    workflow_delivery(
+                    workflow_delivery_if_released(
+                        engine,
                         task.issuer.as_deref(),
                         &task.task_id,
                         Some(&event.event_id),
                         event.kind.as_str(),
                     )
                 },
-                "wake_recommended": terminal && !polled_manager_portfolio,
+                "wake_recommended": terminal && !polled_manager_portfolio
+                    && task.issuer.as_deref().is_some_and(|p| !engine.workflow_principal_held(p)),
             })
         }
         "cancel_task" => {
@@ -2530,20 +2549,29 @@ async fn call_tool(
                     "actor": event.actor,
                 }));
             }
-            let next_delivery = next_ready_task.as_ref().map(|next| {
-                workflow_delivery(
-                    next.assignee.as_deref(),
-                    &next.task_id,
-                    next.queue_ready_event_id.as_deref(),
-                    "ready",
-                )
-            });
+            let next_delivery = next_ready_task
+                .as_ref()
+                .filter(|next| {
+                    next.assignee
+                        .as_deref()
+                        .is_some_and(|p| !engine.workflow_principal_held(p))
+                })
+                .map(|next| {
+                    workflow_delivery_if_released(
+                        engine,
+                        next.assignee.as_deref(),
+                        &next.task_id,
+                        next.queue_ready_event_id.as_deref(),
+                        "ready",
+                    )
+                });
             let next_wake_recommended = next_delivery.is_some();
             json!({
                 "success": true,
                 "task": task,
                 "event": event,
-                "delivery": workflow_delivery(
+                "delivery": workflow_delivery_if_released(
+                    engine,
                     event.recipient.as_deref(),
                     &task.task_id,
                     Some(&event.event_id),
@@ -2572,6 +2600,9 @@ async fn call_tool(
                 )
                 .await
                 .map_err(json_err)?;
+            // The core may resolve an omitted task ID from the active task.
+            // Use its canonical event identity for notifications and fencing.
+            let task_id = event.task_id.as_str();
             if let Some(target_seat) = engine.workflow_seat(recipient) {
                 let _ = events.send(json!({
                     "type": "task_message",
@@ -2584,13 +2615,14 @@ async fn call_tool(
             json!({
                 "success": true,
                 "event": event,
-                "delivery": workflow_delivery(
+                "delivery": workflow_delivery_if_released(
+                    engine,
                     Some(recipient),
                     task_id,
                     Some(&event.event_id),
                     "message",
                 ),
-                "wake_recommended": true,
+                "wake_recommended": !engine.workflow_principal_held(recipient),
             })
         }
         "list_task_events" => {
@@ -2610,7 +2642,8 @@ async fn call_tool(
                 .map_err(json_err)?;
             let ready_task = queue.ready_task();
             let delivery = ready_task.as_ref().map(|task| {
-                workflow_delivery(
+                workflow_delivery_if_released(
+                    engine,
                     task.assignee.as_deref(),
                     &task.task_id,
                     task.queue_ready_event_id.as_deref(),
@@ -2626,6 +2659,11 @@ async fn call_tool(
             })
         }
         "update_task" => {
+            if args.get("status").is_some_and(|status| !status.is_string()) {
+                return Err(json_err(slc_core::SlcError::InvalidInput(
+                    "status must be a string when supplied".into(),
+                )));
+            }
             let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let name = args.get("name").and_then(|v| v.as_str());
             // Body: diff (new canon) or legacy description/description_patch
@@ -3631,6 +3669,23 @@ async fn call_tool(
         _ => return Err(json!({"code": -32601, "message": format!("unknown tool: {name}")})),
     };
     let _ = engine.seats.record_tool_use(seat_id, name, 0).await;
+    // Every executable envelope, including report/message retries, must belong
+    // to the current operator generation. Do not turn a valid report into an error.
+    for (delivery_key, wake_key) in [
+        ("delivery", "wake_recommended"),
+        ("next_delivery", "next_wake_recommended"),
+    ] {
+        if let Some(task_id) = text
+            .get(delivery_key)
+            .and_then(|delivery| delivery.get("correlation_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            && !engine.workflow_task_generation_current(&task_id).await
+        {
+            text[delivery_key] = Value::Null;
+            text[wake_key] = json!(false);
+        }
+    }
     let mut text = text.to_string();
     // Inject pending notifications into the tool response (UX channel).
     // Machine-oriented external-state operations must remain parseable JSON.
@@ -4879,6 +4934,388 @@ mod seat_filter_tests {
         let text = result["content"][0]["text"].as_str().unwrap();
         serde_json::from_str(text)
             .unwrap_or_else(|_| panic!("tool {name} returned non-JSON: {text}"))
+    }
+
+    #[tokio::test]
+    async fn active_task_message_uses_canonical_identity_for_delivery_and_generation() {
+        let mut engine = swarm_engine().await;
+        engine.config.workflow_generation = Some("active-message-generation".into());
+        let assigned = tool_json(&engine, "seat-manager", "assign_task",
+            json!({"assignee":"contactor","name":"Active message","idempotency_key":"active-message-assign"})).await;
+        let id = assigned["task"]["task_id"].as_str().unwrap();
+        tool_json(&engine, "seat-contactor", "start_task",
+            json!({"task_id":id,"idempotency_key":"active-message-start"})).await;
+        for supplied_id in [None, Some("")] {
+            let mut args = json!({"recipient":"manager","message":"Evidence",
+                "idempotency_key":"active-message-send"});
+            if let Some(value) = supplied_id {
+                args["task_id"] = json!(value);
+            }
+            let (events, mut receiver) = tokio::sync::broadcast::channel(8);
+            let result = call_tool(&engine, "seat-contactor", "task_message", &args, &events, tool_policy()).await.unwrap();
+            let result: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(result["event"]["task_id"], id);
+            assert_eq!(result["delivery"]["correlation_id"], id);
+            assert_eq!(result["wake_recommended"], true);
+            assert_eq!(receiver.try_recv().unwrap()["task_id"], id);
+        }
+        engine.config.workflow_generation = Some("next-message-generation".into());
+        let stale = tool_json(&engine, "seat-contactor", "task_message",
+            json!({"recipient":"manager","message":"Evidence","idempotency_key":"active-message-send"})).await;
+        assert_eq!(stale["event"]["task_id"], id);
+        assert!(stale["delivery"].is_null());
+        assert_eq!(stale["wake_recommended"], false);
+    }
+
+    #[tokio::test]
+    async fn update_task_rejects_nonstring_status_before_any_edit() {
+        let engine = swarm_engine().await;
+        let assigned = tool_json(&engine, "seat-manager", "assign_task",
+            json!({"assignee":"contactor","name":"Unchanged","idempotency_key":"invalid-status-assign"})).await;
+        let id = assigned["task"]["task_id"].as_str().unwrap();
+        let before = tool_json(&engine, "seat-manager", "get_task", json!({"task_id":id})).await;
+        let history = tool_json(&engine, "seat-manager", "list_task_events", json!({"task_id":id})).await;
+        for status in [json!(true), json!(7), json!({}), json!([]), Value::Null] {
+            let (events, _) = tokio::sync::broadcast::channel(8);
+            let error = call_tool(&engine, "seat-manager", "update_task",
+                &json!({"task_id":id,"status":status,"name":"Must not change",
+                    "diff":[{"op":"append","content":"Must not append"}]}), &events, tool_policy()).await.unwrap_err();
+            assert!(error["message"].as_str().unwrap().contains("status must be a string"));
+            assert_eq!(tool_json(&engine, "seat-manager", "get_task", json!({"task_id":id})).await, before);
+            assert_eq!(tool_json(&engine, "seat-manager", "list_task_events", json!({"task_id":id})).await, history);
+        }
+    }
+
+    #[tokio::test]
+    async fn enabling_generation_does_not_adopt_unstamped_legacy_tasks() {
+        let mut engine = swarm_engine().await;
+        engine.config.workflow_generation = None;
+        let old = tool_json(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            json!({"assignee":"contactor","name":"Legacy","idempotency_key":"legacy-generation"}),
+        )
+        .await;
+        let id = old["task"]["task_id"].as_str().unwrap();
+        assert!(old["task"]["workflow_generation"].is_null());
+        engine.config.workflow_generation = Some("incident-one".into());
+        assert!(
+            engine
+                .workflow_start_task("seat-contactor", id, "", Some("legacy-start"))
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .workflow_assign_task(
+                    "seat-manager",
+                    "analyst",
+                    "Forged",
+                    "",
+                    None,
+                    None,
+                    &[],
+                    &json!({"workflow_generation":"incident-one"}),
+                    Some("legacy-forge")
+                )
+                .await
+                .is_err()
+        );
+        let visible = tool_json(&engine, "seat-manager", "get_task", json!({"task_id":id})).await;
+        assert!(visible["task"]["workflow_generation"].is_null());
+        assert_eq!(visible["task"]["queue_state"], "ready");
+    }
+
+    #[tokio::test]
+    async fn generation_rotation_parks_old_tasks_and_suppresses_report_replays() {
+        let mut engine = swarm_engine().await;
+        engine.config.workflow_generation = Some("incident-one".into());
+        let assigned = tool_json(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            json!({"assignee":"contactor","name":"Old","idempotency_key":"generation-old"}),
+        )
+        .await;
+        let id = assigned["task"]["task_id"].as_str().unwrap().to_string();
+        assert_eq!(assigned["task"]["workflow_generation"], "incident-one");
+        tool_json(
+            &engine,
+            "seat-contactor",
+            "start_task",
+            json!({"task_id":id,"idempotency_key":"generation-start"}),
+        )
+        .await;
+        let queued = tool_json(&engine, "seat-manager", "assign_task",
+            json!({"assignee":"contactor","name":"Old queued","idempotency_key":"generation-queued"})).await;
+        let queued_id = queued["task"]["task_id"].as_str().unwrap().to_string();
+        engine.config.workflow_generation = Some("incident-two".into());
+        assert!(!engine.workflow_task_generation_current(&id).await);
+        assert!(
+            engine
+                .workflow_start_task("seat-contactor", &id, "", Some("generation-start"))
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .workflow_assign_task(
+                    "seat-manager",
+                    "contactor",
+                    "Child",
+                    "",
+                    Some(&id),
+                    None,
+                    &[],
+                    &json!({}),
+                    Some("generation-child")
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .workflow_assign_task(
+                    "seat-manager",
+                    "contactor",
+                    "Old",
+                    "",
+                    None,
+                    None,
+                    &[],
+                    &json!({}),
+                    Some("generation-old")
+                )
+                .await
+                .is_err()
+        );
+        for _ in 0..2 {
+            let report = tool_json(&engine, "seat-contactor", "report_task",
+                json!({"task_id":id,"status":"completed","summary":"Stopped","idempotency_key":"generation-report"})).await;
+            assert_eq!(report["success"], true);
+            assert!(report["delivery"].is_null());
+            assert_eq!(report["wake_recommended"], false);
+            let message = tool_json(&engine, "seat-contactor", "task_message",
+                json!({"task_id":id,"recipient":"manager","message":"Evidence","idempotency_key":"generation-message"})).await;
+            assert!(message["delivery"].is_null());
+            assert_eq!(message["wake_recommended"], false);
+        }
+        let queue = engine
+            .workflow_reconcile_task_queue("seat-manager", "contactor")
+            .await
+            .unwrap();
+        assert!(queue.ready_task_id.is_none());
+        assert_eq!(queue.entries[0].task.task_id, queued_id);
+        assert_eq!(queue.entries[0].task.queue_state.as_deref(), Some("queued"));
+        assert!(
+            engine
+                .workflow_start_task(
+                    "seat-contactor",
+                    &queued_id,
+                    "",
+                    Some("generation-forbidden")
+                )
+                .await
+                .is_err()
+        );
+        let forged = json!({"task_id":queued_id,"metadata":{"workflow_generation":"incident-two"}});
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        assert!(
+            call_tool(
+                &engine,
+                "seat-manager",
+                "update_task",
+                &forged,
+                &events,
+                tool_policy()
+            )
+            .await
+            .is_err()
+        );
+        assert!(!engine.workflow_task_generation_current(&queued_id).await);
+        let fresh = tool_json(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            json!({"assignee":"analyst","name":"Fresh","idempotency_key":"generation-fresh"}),
+        )
+        .await;
+        let fresh_id = fresh["task"]["task_id"].as_str().unwrap();
+        assert!(engine.workflow_task_generation_current(fresh_id).await);
+        assert_eq!(fresh["wake_recommended"], true);
+        engine.config.workflow_generation = Some("incident-three".into());
+        assert!(
+            engine
+                .workflow_start_task("seat-analyst", fresh_id, "", Some("generation-third"))
+                .await
+                .is_err()
+        );
+        let queue = engine
+            .workflow_reconcile_task_queue("seat-manager", "analyst")
+            .await
+            .unwrap();
+        assert!(queue.ready_task_id.is_none()); // ready-before-rotation remains parked
+        assert_eq!(queue.entries[0].task.queue_state.as_deref(), Some("ready"));
+    }
+
+    #[tokio::test]
+    async fn mapped_hold_cancels_existing_ready_head_without_promoting_successor() {
+        let mut engine = swarm_engine().await;
+        let first = tool_json(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            json!({"assignee":"contactor","name":"Ready","idempotency_key":"ready-before-hold"}),
+        )
+        .await;
+        let first_id = first["task"]["task_id"].as_str().unwrap().to_string();
+        let second = tool_json(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            json!({"assignee":"contactor","name":"Queued","idempotency_key":"queued-before-hold"}),
+        )
+        .await;
+        let second_id = second["task"]["task_id"].as_str().unwrap().to_string();
+        assert_eq!(first["task"]["queue_state"], "ready");
+        engine
+            .config
+            .workflow_hold_seats
+            .insert("seat-contactor".into());
+        for _ in 0..2 {
+            let cancelled = tool_json(&engine, "seat-manager", "cancel_task",
+                json!({"task_id":first_id,"reason":"Operator stop","idempotency_key":"ready-hold-cancel"})).await;
+            assert_eq!(cancelled["success"], true);
+            assert!(cancelled["delivery"].is_null());
+            assert!(cancelled["next_delivery"].is_null());
+            assert_eq!(cancelled["next_wake_recommended"], false);
+            let pending = tool_json(
+                &engine,
+                "seat-manager",
+                "get_task",
+                json!({"task_id":second_id}),
+            )
+            .await;
+            assert_eq!(pending["task"]["queue_state"], "queued");
+        }
+    }
+
+    #[tokio::test]
+    async fn mapped_hold_preserves_reports_without_execution_deliveries() {
+        let mut engine = swarm_engine().await;
+        let first = tool_json(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            json!({"assignee":"contactor","name":"First","idempotency_key":"hold-first"}),
+        )
+        .await;
+        let first_id = first["task"]["task_id"].as_str().unwrap().to_string();
+        assert_eq!(first["wake_recommended"], true);
+        tool_json(
+            &engine,
+            "seat-contactor",
+            "start_task",
+            json!({"task_id":first_id,"idempotency_key":"hold-start"}),
+        )
+        .await;
+        let second = tool_json(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            json!({"assignee":"contactor","name":"Second","idempotency_key":"hold-second"}),
+        )
+        .await;
+        let second_id = second["task"]["task_id"].as_str().unwrap().to_string();
+        engine
+            .config
+            .workflow_hold_seats
+            .insert("seat-contactor".into());
+        engine
+            .config
+            .workflow_hold_seats
+            .insert("seat-manager".into());
+        assert!(engine.workflow_principal_held("contactor"));
+        assert!(!engine.workflow_principal_held("analyst"));
+        assert!(
+            engine
+                .workflow_assign_task(
+                    "seat-manager",
+                    "contactor",
+                    "Forbidden",
+                    "",
+                    None,
+                    None,
+                    &[],
+                    &json!({}),
+                    Some("hold-forbidden")
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .workflow_reconcile_task_queue("seat-manager", "contactor")
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .workflow_start_task("seat-contactor", &first_id, "", Some("hold-start"))
+                .await
+                .is_err()
+        );
+        for _ in 0..2 {
+            let message = tool_json(
+                &engine,
+                "seat-manager",
+                "task_message",
+                json!({"task_id":first_id,"recipient":"contactor","message":"Inspection only",
+                    "idempotency_key":"hold-message"}),
+            )
+            .await;
+            assert_eq!(message["success"], true);
+            assert!(message["delivery"].is_null());
+            assert_eq!(message["wake_recommended"], false);
+            let report = tool_json(
+                &engine,
+                "seat-contactor",
+                "report_task",
+                json!({"task_id":first_id,"status":"completed","summary":"Stopped safely",
+                    "idempotency_key":"hold-report"}),
+            )
+            .await;
+            assert_eq!(report["task"]["status"], "COMPLETED");
+            assert!(report["delivery"].is_null());
+            assert_eq!(report["wake_recommended"], false);
+        }
+        let pending = tool_json(
+            &engine,
+            "seat-manager",
+            "get_task",
+            json!({"task_id":second_id}),
+        )
+        .await;
+        assert_eq!(pending["task"]["queue_state"], "queued");
+        for _ in 0..2 {
+            let cancelled = tool_json(&engine, "seat-manager", "cancel_task",
+                json!({"task_id":second_id,"reason":"Operator stop","idempotency_key":"hold-cancel"})).await;
+            assert_eq!(cancelled["task"]["status"], "CANCELLED");
+            assert!(cancelled["delivery"].is_null());
+            assert!(cancelled["next_delivery"].is_null());
+            assert_eq!(cancelled["next_wake_recommended"], false);
+        }
+        // Other mapped seats retain normal authority under a selective hold.
+        let control = tool_json(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            json!({"assignee":"analyst","name":"Control","idempotency_key":"hold-control"}),
+        )
+        .await;
+        assert_eq!(control["wake_recommended"], true);
+        assert!(control["delivery"].is_object());
     }
 
     #[tokio::test]

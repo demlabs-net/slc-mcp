@@ -206,6 +206,8 @@ pub struct SlcConfig {
     pub text_only_principals: std::collections::HashSet<String>,
     /// Operator-owned maintenance fence, keyed by exact seat ID (`*` holds all).
     pub workflow_hold_seats: std::collections::HashSet<String>,
+    /// Optional operator incident generation. Old/unstamped tasks cannot start.
+    pub workflow_generation: Option<String>,
 }
 
 impl SlcConfig {
@@ -271,6 +273,10 @@ impl Default for SlcConfig {
             principal_policy_documents: roles::parse_principal_policy_documents_env(),
             task_assign_acl: roles::parse_task_assign_acl_env(),
             text_only_principals: roles::parse_text_only_principals_env(),
+            workflow_generation: std::env::var("SLC_WORKFLOW_GENERATION")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             workflow_hold_seats: std::env::var("SLC_WORKFLOW_HOLD_SEATS")
                 .unwrap_or_default()
                 .split(',')
@@ -1940,10 +1946,12 @@ mod engine_tests {
         // No seat record exists for this id at this point.
         assert!(engine.seats.get_seat("fresh-role").await.unwrap().is_none());
 
-        assert!(engine
-            .document_activate("fresh-role", "anchor-doc")
-            .await
-            .unwrap());
+        assert!(
+            engine
+                .document_activate("fresh-role", "anchor-doc")
+                .await
+                .unwrap()
+        );
 
         // The anchor is durable and readable through the same path update_context uses.
         assert_eq!(
@@ -1956,10 +1964,12 @@ mod engine_tests {
         );
 
         // An unknown document still reports failure rather than a false success.
-        assert!(!engine
-            .document_activate("fresh-role", "absent-doc")
-            .await
-            .unwrap());
+        assert!(
+            !engine
+                .document_activate("fresh-role", "absent-doc")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
