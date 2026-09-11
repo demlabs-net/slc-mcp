@@ -4943,8 +4943,13 @@ mod seat_filter_tests {
         let assigned = tool_json(&engine, "seat-manager", "assign_task",
             json!({"assignee":"contactor","name":"Active message","idempotency_key":"active-message-assign"})).await;
         let id = assigned["task"]["task_id"].as_str().unwrap();
-        tool_json(&engine, "seat-contactor", "start_task",
-            json!({"task_id":id,"idempotency_key":"active-message-start"})).await;
+        tool_json(
+            &engine,
+            "seat-contactor",
+            "start_task",
+            json!({"task_id":id,"idempotency_key":"active-message-start"}),
+        )
+        .await;
         for supplied_id in [None, Some("")] {
             let mut args = json!({"recipient":"manager","message":"Evidence",
                 "idempotency_key":"active-message-send"});
@@ -4952,8 +4957,18 @@ mod seat_filter_tests {
                 args["task_id"] = json!(value);
             }
             let (events, mut receiver) = tokio::sync::broadcast::channel(8);
-            let result = call_tool(&engine, "seat-contactor", "task_message", &args, &events, tool_policy()).await.unwrap();
-            let result: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            let result = call_tool(
+                &engine,
+                "seat-contactor",
+                "task_message",
+                &args,
+                &events,
+                tool_policy(),
+            )
+            .await
+            .unwrap();
+            let result: Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
             assert_eq!(result["event"]["task_id"], id);
             assert_eq!(result["delivery"]["correlation_id"], id);
             assert_eq!(result["wake_recommended"], true);
@@ -4974,15 +4989,46 @@ mod seat_filter_tests {
             json!({"assignee":"contactor","name":"Unchanged","idempotency_key":"invalid-status-assign"})).await;
         let id = assigned["task"]["task_id"].as_str().unwrap();
         let before = tool_json(&engine, "seat-manager", "get_task", json!({"task_id":id})).await;
-        let history = tool_json(&engine, "seat-manager", "list_task_events", json!({"task_id":id})).await;
+        let history = tool_json(
+            &engine,
+            "seat-manager",
+            "list_task_events",
+            json!({"task_id":id}),
+        )
+        .await;
         for status in [json!(true), json!(7), json!({}), json!([]), Value::Null] {
             let (events, _) = tokio::sync::broadcast::channel(8);
-            let error = call_tool(&engine, "seat-manager", "update_task",
+            let error = call_tool(
+                &engine,
+                "seat-manager",
+                "update_task",
                 &json!({"task_id":id,"status":status,"name":"Must not change",
-                    "diff":[{"op":"append","content":"Must not append"}]}), &events, tool_policy()).await.unwrap_err();
-            assert!(error["message"].as_str().unwrap().contains("status must be a string"));
-            assert_eq!(tool_json(&engine, "seat-manager", "get_task", json!({"task_id":id})).await, before);
-            assert_eq!(tool_json(&engine, "seat-manager", "list_task_events", json!({"task_id":id})).await, history);
+                    "diff":[{"op":"append","content":"Must not append"}]}),
+                &events,
+                tool_policy(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("status must be a string")
+            );
+            assert_eq!(
+                tool_json(&engine, "seat-manager", "get_task", json!({"task_id":id})).await,
+                before
+            );
+            assert_eq!(
+                tool_json(
+                    &engine,
+                    "seat-manager",
+                    "list_task_events",
+                    json!({"task_id":id})
+                )
+                .await,
+                history
+            );
         }
     }
 
