@@ -24,7 +24,7 @@
 //! KB and episodic live in separate folder trees (history never gets
 //! embedded/searched), mirroring the [`StorageBackend`] split.
 
-use super::{DocFilter, DocSort, MetaPatch, SortDir, StorageBackend};
+use super::{DocFilter, DocSort, KbMetadataProjection, MetaPatch, SortDir, StorageBackend};
 use crate::error::{SlcError, SlcResult};
 use crate::model::{
     Document, DocumentCategory, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat, SeatStatus,
@@ -396,6 +396,10 @@ pub struct IndexEntry {
     pub doc_type: Option<String>,
     #[serde(default)]
     pub extra_strings: BTreeMap<String, String>,
+    /// Full free-form metadata projection. The sidecar is rebuildable and this
+    /// avoids reopening every Markdown body for metadata-only workflow scans.
+    #[serde(default)]
+    pub metadata_extra: Map<String, Value>,
     pub archived: Option<bool>,
     pub consolidated: Option<bool>,
     pub compression_batch_id: Option<String>,
@@ -432,6 +436,7 @@ impl IndexEntry {
                     value.as_str().map(|value| (key.clone(), value.to_string()))
                 })
                 .collect(),
+            metadata_extra: doc.metadata.extra.clone(),
             archived: doc.metadata.archived,
             consolidated: doc.metadata.consolidated,
             compression_batch_id: doc.metadata.compression_batch_id.clone(),
@@ -682,6 +687,11 @@ impl ObsidianVaultStore {
                                     })
                                     .collect()
                             })
+                            .unwrap_or_default(),
+                        metadata_extra: meta
+                            .get("metadata")
+                            .and_then(Value::as_object)
+                            .cloned()
                             .unwrap_or_default(),
                         archived: meta
                             .get("metadata")
@@ -961,13 +971,14 @@ impl ObsidianVaultStore {
         })
     }
 
-    /// Collect matching entries (KB or episodic by table) sorted + limited.
-    fn select(
+    /// Collect matching entries (KB or episodic by table), sort them, and
+    /// optionally apply a caller-visible bound.
+    fn select_with_limit(
         &self,
         table: Table,
         filter: &DocFilter,
         sort: &DocSort,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Vec<IndexEntry> {
         let index = self.index.lock().unwrap();
         let mut out: Vec<&IndexEntry> = index
@@ -994,8 +1005,29 @@ impl ObsidianVaultStore {
                 SortDir::Desc => ord.reverse(),
             }
         });
-        out.truncate(limit.min(out.len()));
+        if let Some(limit) = limit {
+            out.truncate(limit.min(out.len()));
+        }
         out.into_iter().cloned().collect()
+    }
+
+    fn select(
+        &self,
+        table: Table,
+        filter: &DocFilter,
+        sort: &DocSort,
+        limit: usize,
+    ) -> Vec<IndexEntry> {
+        self.select_with_limit(table, filter, sort, Some(limit))
+    }
+
+    fn select_unbounded(
+        &self,
+        table: Table,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> Vec<IndexEntry> {
+        self.select_with_limit(table, filter, sort, None)
     }
 
     /// Fire-and-forget, coalesced vault commit. The write path must NEVER
@@ -1164,6 +1196,38 @@ impl StorageBackend for ObsidianVaultStore {
             out.push(self.read_note(&e)?);
         }
         Ok(out)
+    }
+
+    async fn kb_find_unbounded(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> SlcResult<Vec<Document>> {
+        let entries = self.select_unbounded(Table::Kb, filter, sort);
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            out.push(self.read_note(&entry)?);
+        }
+        Ok(out)
+    }
+
+    async fn kb_find_metadata_unbounded(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> SlcResult<Vec<KbMetadataProjection>> {
+        Ok(self
+            .select_unbounded(Table::Kb, filter, sort)
+            .into_iter()
+            .filter_map(|entry| {
+                DocumentCategory::parse(&entry.category).map(|category| KbMetadataProjection {
+                    document_id: entry.id,
+                    category,
+                    seat_id: entry.seat_id,
+                    metadata_extra: entry.metadata_extra,
+                })
+            })
+            .collect())
     }
 
     async fn kb_count(&self, filter: &DocFilter) -> SlcResult<u64> {

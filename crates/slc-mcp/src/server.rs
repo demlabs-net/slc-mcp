@@ -705,7 +705,7 @@ fn tools() -> Vec<Value> {
         // tasks
         json!({
             "name": "assign_task",
-            "description": "Append a durable task to the assignee's bounded SLC-owned FIFO. Exactly one task per assignee can be ready/running; only a ready assignment includes a content-free wake envelope. Queued tasks must not be dispatched until reconcile_task_queue promotes them.",
+            "description": "Append a durable task to the assignee's bounded SLC-owned FIFO. Exactly one task per assignee can be ready/running. A pure exact replay has fresh_transition=false and emits no queue, delivery, wake, or SSE; if replay-time crash recovery newly creates the missing ready reservation, fresh_transition=true and delivery_needed=true permit exactly that fresh wake/SSE. Fingerprint mismatch remains an application error. Queued tasks must not be dispatched until reconcile_task_queue promotes them.",
             "inputSchema": {"type":"object","properties":{
                 "assignee": {"type":"string","description":"stable workflow principal, for example dev-junior-0"},
                 "name": {"type":"string","minLength":1},
@@ -732,7 +732,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "assign_portfolio_task",
-            "description": "Manager-only assignment for the leads_mass_redesign conveyor. Portfolio identity is expressed as required top-level fields and SLC writes the canonical structured metadata; use this instead of assign_task for every manager-issued DESIGN, BUILD, TEST, or DEPLOY task in this portfolio. Each historical root (slug, stage, attempt) is unique even after terminal state: inspect the existing task named by a collision and never bypass it by changing name, assignee, or idempotency key; only a genuine replacement uses the reported next attempt as a new root.",
+            "description": "Manager-only assignment for the leads_mass_redesign conveyor. Portfolio identity is expressed as required top-level fields and SLC writes canonical structured metadata. Exact replay returns invocation_outcome=replayed: pure replay suppresses transport, while replay recovery that newly reserves ready returns fresh_transition=true and delivery_needed=true for exactly one recovered wake/SSE. A different request colliding with an existing historical identity returns invocation_outcome=portfolio_identity_conflict with existing_task_id and next_attempt and never emits transport. Fingerprint mismatch remains an error.",
             "inputSchema": {
                 "type":"object",
                 "properties":{
@@ -787,12 +787,12 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "report_task",
-            "description": "Append the assignee's durable task progress/terminal report and update SLC state. Only the assignee may report, and the task must already be running; coordinators cannot close a live executor lane and terminal reports cannot bypass the FIFO from ready/queued state. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task, but the response deliberately does not disclose that successor. Normally wake the issuer with delivery and end this executor run; the issuer reconciles and wakes the next head as a fresh run. Manager-issued leads_mass_redesign reports are the bounded polling exception: delivery is null and wake_recommended=false because the deterministic manager queue pump observes SLC directly, so do not send a duplicate manager message. Idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "description": "Append the assignee's durable task progress/terminal report and update SLC state. Only the assignee may report, and the task must already be running; coordinators cannot close a live executor lane and terminal reports cannot bypass the FIFO from ready/queued state. Manager-owned leads_mass_redesign BUILD completed, TEST completed/failed, and DEPLOY failed terminal reports must include non-empty metadata.artifact_revision because the deterministic dispatcher consumes those reports as immutable identity for TEST, DEPLOY, or correction. Other task reports remain backward-compatible. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task, but the response deliberately does not disclose that successor. Normally wake the issuer with delivery and end this executor run; the issuer reconciles and wakes the next head as a fresh run. Manager-issued leads_mass_redesign reports are the bounded polling exception: delivery is null and wake_recommended=false because the deterministic manager queue pump observes SLC directly, so do not send a duplicate manager message. Idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "status": {"type":"string","enum":["in_progress","completed","blocked","failed"]},
                 "summary": {"type":"string","minLength":1},
-                "metadata": {"type":"object","description":"machine evidence, paths, hashes, metrics, and structured findings"},
+                "metadata": {"type":"object","description":"Optional machine evidence object; omit it to use an empty object. Explicit null, scalar, or array values are invalid. metadata.artifact_revision is required and non-empty for manager-owned leads_mass_redesign BUILD completed, TEST completed/failed, and DEPLOY failed terminal reports"},
                 "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
             },"required":["task_id","status","summary","idempotency_key"]}
         }),
@@ -808,7 +808,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "task_message",
-            "description": "Append a durable message to a task conversation. Recipient must be that task's issuer or assignee. The result includes a content-free wake envelope for an optional transport; the message body remains canonical only here. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "description": "Append a durable message to a task conversation. Recipient must be that task's issuer or assignee. A newly appended message returns replayed=false and a content-free wake envelope for an optional transport; exact idempotent replay returns replayed=true with the original event and no delivery, wake, or SSE notification. Fingerprint mismatch remains an error. The message body remains canonical only here. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "recipient": {"type":"string"},
@@ -2274,8 +2274,8 @@ async fn call_tool(
             let auto_load = str_array(args, "auto_load");
             let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
             let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
-            let task = engine
-                .workflow_assign_task(
+            let assignment = engine
+                .workflow_assign_task_with_outcome(
                     seat_id,
                     assignee,
                     name,
@@ -2288,38 +2288,53 @@ async fn call_tool(
                 )
                 .await
                 .map_err(json_err)?;
-            let queue = engine
-                .workflow_reconcile_task_queue(seat_id, assignee)
-                .await
-                .map_err(json_err)?;
-            let wake_recommended = task.queue_state.as_deref()
-                == Some(slc_core::workflow::QUEUE_STATE_READY)
-                && queue.ready_task_id.as_deref() == Some(task.task_id.as_str());
+            let created = assignment.invocation_outcome
+                == slc_core::workflow::AssignmentInvocationOutcome::Created;
+            let queue = if created || assignment.fresh_transition {
+                Some(
+                    engine
+                        .workflow_reconcile_task_queue(seat_id, assignee)
+                        .await
+                        .map_err(json_err)?,
+                )
+            } else {
+                None
+            };
+            let wake_recommended = assignment.delivery_needed;
             let delivery = wake_recommended.then(|| {
                 workflow_delivery_if_released(
                     engine,
                     Some(assignee),
-                    &task.task_id,
-                    task.queue_ready_event_id.as_deref(),
+                    &assignment.task.task_id,
+                    assignment.task.queue_ready_event_id.as_deref(),
                     "ready",
                 )
             });
-            if let Some(target_seat) = engine.workflow_seat(assignee) {
+            if assignment.fresh_transition
+                && let Some(target_seat) = engine.workflow_seat(assignee)
+            {
                 let _ = events.send(json!({
                     "type": "task_assigned",
                     "seat_id": target_seat,
-                    "task_id": task.task_id,
-                    "issuer": task.issuer,
-                    "assignee": task.assignee,
-                    "queue_state": task.queue_state,
+                    "task_id": assignment.task.task_id,
+                    "issuer": assignment.task.issuer,
+                    "assignee": assignment.task.assignee,
+                    "queue_state": assignment.task.queue_state,
                 }));
             }
             json!({
                 "success": true,
-                "task": task,
+                "task": assignment.task,
                 "queue": queue,
                 "delivery": delivery,
                 "wake_recommended": wake_recommended,
+                "invocation_outcome": assignment.invocation_outcome,
+                "fresh_transition": assignment.fresh_transition,
+                "delivery_needed": assignment.delivery_needed,
+                "replayed": assignment.invocation_outcome == slc_core::workflow::AssignmentInvocationOutcome::Replayed,
+                "portfolio_identity_conflict": assignment.invocation_outcome == slc_core::workflow::AssignmentInvocationOutcome::PortfolioIdentityConflict,
+                "existing_task_id": assignment.existing_task_id,
+                "next_attempt": assignment.next_attempt,
             })
         }
         "assign_portfolio_task" => {
@@ -2362,8 +2377,8 @@ async fn call_tool(
                 metadata["tester_verdict"] = json!(value);
             }
             let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
-            let task = engine
-                .workflow_assign_task(
+            let assignment = engine
+                .workflow_assign_task_with_outcome(
                     seat_id,
                     assignee,
                     name,
@@ -2376,38 +2391,53 @@ async fn call_tool(
                 )
                 .await
                 .map_err(json_err)?;
-            let queue = engine
-                .workflow_reconcile_task_queue(seat_id, assignee)
-                .await
-                .map_err(json_err)?;
-            let wake_recommended = task.queue_state.as_deref()
-                == Some(slc_core::workflow::QUEUE_STATE_READY)
-                && queue.ready_task_id.as_deref() == Some(task.task_id.as_str());
+            let created = assignment.invocation_outcome
+                == slc_core::workflow::AssignmentInvocationOutcome::Created;
+            let queue = if created || assignment.fresh_transition {
+                Some(
+                    engine
+                        .workflow_reconcile_task_queue(seat_id, assignee)
+                        .await
+                        .map_err(json_err)?,
+                )
+            } else {
+                None
+            };
+            let wake_recommended = assignment.delivery_needed;
             let delivery = wake_recommended.then(|| {
                 workflow_delivery_if_released(
                     engine,
                     Some(assignee),
-                    &task.task_id,
-                    task.queue_ready_event_id.as_deref(),
+                    &assignment.task.task_id,
+                    assignment.task.queue_ready_event_id.as_deref(),
                     "ready",
                 )
             });
-            if let Some(target_seat) = engine.workflow_seat(assignee) {
+            if assignment.fresh_transition
+                && let Some(target_seat) = engine.workflow_seat(assignee)
+            {
                 let _ = events.send(json!({
                     "type": "task_assigned",
                     "seat_id": target_seat,
-                    "task_id": task.task_id,
-                    "issuer": task.issuer,
-                    "assignee": task.assignee,
-                    "queue_state": task.queue_state,
+                    "task_id": assignment.task.task_id,
+                    "issuer": assignment.task.issuer,
+                    "assignee": assignment.task.assignee,
+                    "queue_state": assignment.task.queue_state,
                 }));
             }
             json!({
                 "success": true,
-                "task": task,
+                "task": assignment.task,
                 "queue": queue,
                 "delivery": delivery,
                 "wake_recommended": wake_recommended,
+                "invocation_outcome": assignment.invocation_outcome,
+                "fresh_transition": assignment.fresh_transition,
+                "delivery_needed": assignment.delivery_needed,
+                "replayed": assignment.invocation_outcome == slc_core::workflow::AssignmentInvocationOutcome::Replayed,
+                "portfolio_identity_conflict": assignment.invocation_outcome == slc_core::workflow::AssignmentInvocationOutcome::PortfolioIdentityConflict,
+                "existing_task_id": assignment.existing_task_id,
+                "next_attempt": assignment.next_attempt,
             })
         }
         "portfolio_index" => {
@@ -2488,6 +2518,9 @@ async fn call_tool(
             let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
             let status = args.get("status").and_then(Value::as_str).unwrap_or("");
             let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
+            // Omitted metadata preserves the historical empty-object default;
+            // explicit null/scalar/array values reach the engine and are rejected
+            // as typed InvalidInput instead of being silently normalized.
             let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
             let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
             let (task, event, _next_ready_task) = engine
@@ -2589,8 +2622,8 @@ async fn call_tool(
             let message = args.get("message").and_then(Value::as_str).unwrap_or("");
             let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
             let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
-            let event = engine
-                .workflow_task_message(
+            let result = engine
+                .workflow_task_message_with_outcome(
                     seat_id,
                     task_id,
                     recipient,
@@ -2601,28 +2634,34 @@ async fn call_tool(
                 .await
                 .map_err(json_err)?;
             // The core may resolve an omitted task ID from the active task.
-            // Use its canonical event identity for notifications and fencing.
-            let task_id = event.task_id.as_str();
-            if let Some(target_seat) = engine.workflow_seat(recipient) {
+            // Use its canonical event identity for notifications, delivery, and fencing.
+            if !result.replayed
+                && let Some(target_seat) = engine.workflow_seat(recipient)
+            {
                 let _ = events.send(json!({
                     "type": "task_message",
                     "seat_id": target_seat,
-                    "task_id": task_id,
-                    "event_id": event.event_id,
-                    "actor": event.actor,
+                    "task_id": result.event.task_id,
+                    "event_id": result.event.event_id,
+                    "actor": result.event.actor,
                 }));
             }
-            json!({
-                "success": true,
-                "event": event,
-                "delivery": workflow_delivery_if_released(
+            let delivery = (!result.replayed).then(|| {
+                workflow_delivery_if_released(
                     engine,
                     Some(recipient),
-                    task_id,
-                    Some(&event.event_id),
+                    &result.event.task_id,
+                    Some(&result.event.event_id),
                     "message",
-                ),
-                "wake_recommended": !engine.workflow_principal_held(recipient),
+                )
+            });
+            let wake_recommended = delivery.as_ref().is_some_and(|value| !value.is_null());
+            json!({
+                "success": true,
+                "event": result.event,
+                "replayed": result.replayed,
+                "delivery": delivery,
+                "wake_recommended": wake_recommended,
             })
         }
         "list_task_events" => {
@@ -3867,6 +3906,17 @@ fn ru_error_text(tool: &str, kind: &str, message: &str) -> String {
              get_document/list_documents. Если объект существует под другим id, передавайте \
              фактический id."
         ),
+        "invalid_input" if message.contains("metadata.artifact_revision") => format!(
+            "{message}\n\
+             Действие: повторите report_task с точной неизменяемой ревизией проверяемого \
+             артефакта в metadata.artifact_revision (например commit или sha256), сохранив \
+             исходные task_id, status, summary и idempotency_key."
+        ),
+        "invalid_input" if message.contains("metadata must be a JSON object") => format!(
+            "{message}\n\
+             Действие: передайте metadata как JSON-объект; если метаданных нет, удалите поле \
+             metadata из вызова или передайте пустой объект {{}}."
+        ),
         "invalid_input" if message.contains("workflow") || message.contains("append-only") => {
             format!(
                 "{message}\n\
@@ -4003,7 +4053,7 @@ mod seat_filter_tests {
             ..Default::default()
         };
         let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
-        let (events, _) = tokio::sync::broadcast::channel(8);
+        let (events, mut event_rx) = tokio::sync::broadcast::channel(8);
         let policy = PaginationPolicy {
             enabled: false,
             page_token_limit: None,
@@ -4040,6 +4090,454 @@ mod seat_filter_tests {
         assert_eq!(assigned["task"]["metadata"]["stage"], "BUILD");
         assert_eq!(assigned["task"]["metadata"]["attempt"], 2);
         assert_eq!(assigned["task"]["metadata"]["artifact_revision"], "rev-2");
+        assert_eq!(assigned["invocation_outcome"], "created");
+        assert_eq!(assigned["replayed"], false);
+        assert_eq!(assigned["portfolio_identity_conflict"], false);
+        assert_eq!(assigned["wake_recommended"], true);
+        assert!(assigned["delivery"].is_object());
+        let first_notification = event_rx.try_recv().unwrap();
+        assert_eq!(first_notification["type"], "task_assigned");
+
+        let replay = call_tool(
+            &engine,
+            "seat-manager",
+            "assign_portfolio_task",
+            &json!({
+                "assignee":"worker",
+                "name":"bounded build",
+                "slug":"exact-slug",
+                "stage":"BUILD",
+                "artifact_root":"/work/shared/leads-mass-redesign/exact-slug/layout",
+                "attempt":2,
+                "artifact_revision":"rev-2",
+                "idempotency_key":"portfolio-assign-1"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let replay: Value =
+            serde_json::from_str(replay["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(replay["invocation_outcome"], "replayed");
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["portfolio_identity_conflict"], false);
+        assert_eq!(replay["wake_recommended"], false);
+        assert!(replay["delivery"].is_null());
+        assert!(replay["queue"].is_null());
+        assert!(event_rx.try_recv().is_err());
+
+        let conflict = call_tool(
+            &engine,
+            "seat-manager",
+            "assign_portfolio_task",
+            &json!({
+                "assignee":"worker",
+                "name":"renamed duplicate",
+                "slug":"exact-slug",
+                "stage":"BUILD",
+                "artifact_root":"/work/shared/leads-mass-redesign/exact-slug/layout",
+                "attempt":2,
+                "artifact_revision":"rev-2",
+                "idempotency_key":"portfolio-assign-conflict"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let conflict: Value =
+            serde_json::from_str(conflict["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            conflict["invocation_outcome"],
+            "portfolio_identity_conflict"
+        );
+        assert_eq!(conflict["replayed"], false);
+        assert_eq!(conflict["portfolio_identity_conflict"], true);
+        assert_eq!(conflict["existing_task_id"], assigned["task"]["task_id"]);
+        assert_eq!(conflict["next_attempt"], 3);
+        assert_eq!(conflict["wake_recommended"], false);
+        assert!(conflict["delivery"].is_null());
+        assert!(conflict["queue"].is_null());
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn report_task_advertises_portfolio_artifact_revision_boundary() {
+        let report = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "report_task")
+            .expect("report_task tool");
+        let description = report["description"].as_str().unwrap();
+        let metadata_description = report["inputSchema"]["properties"]["metadata"]["description"]
+            .as_str()
+            .unwrap();
+
+        for expected in [
+            "BUILD completed",
+            "TEST completed/failed",
+            "DEPLOY failed",
+            "metadata.artifact_revision",
+        ] {
+            assert!(description.contains(expected), "{description}");
+        }
+        assert!(
+            metadata_description.contains("metadata.artifact_revision"),
+            "{metadata_description}"
+        );
+        assert!(
+            metadata_description.contains("omit it"),
+            "{metadata_description}"
+        );
+        assert!(
+            metadata_description.contains("Explicit null, scalar, or array values are invalid"),
+            "{metadata_description}"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_task_returns_typed_application_error_before_portfolio_event_append() {
+        use slc_core::storage::sqlite::SqliteStore;
+        use slc_core::{MockLlm, SlcConfig, StorageBackend};
+        use std::collections::{HashMap, HashSet};
+
+        let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
+        let config = SlcConfig {
+            principal_seats: HashMap::from([
+                ("manager".into(), "seat-manager".into()),
+                ("worker".into(), "seat-worker".into()),
+            ]),
+            task_assign_acl: HashMap::from([("manager".into(), HashSet::from(["worker".into()]))]),
+            ..Default::default()
+        };
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let policy = PaginationPolicy {
+            enabled: false,
+            page_token_limit: None,
+            context_token_limit: None,
+        };
+        let assigned = call_tool(
+            &engine,
+            "seat-manager",
+            "assign_portfolio_task",
+            &json!({
+                "assignee":"worker",
+                "name":"portfolio build",
+                "slug":"report-boundary",
+                "stage":"BUILD",
+                "artifact_root":"/work/shared/leads-mass-redesign/report-boundary/layout",
+                "attempt":1,
+                "idempotency_key":"report-boundary-assign"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let assigned: Value =
+            serde_json::from_str(assigned["content"][0]["text"].as_str().unwrap()).unwrap();
+        let task_id = assigned["task"]["task_id"].as_str().unwrap();
+        call_tool(
+            &engine,
+            "seat-worker",
+            "start_task",
+            &json!({"task_id":task_id,"idempotency_key":"report-boundary-start"}),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let before = engine
+            .workflow_task_events("seat-worker", task_id, 20)
+            .await
+            .unwrap()
+            .len();
+
+        let error = call_tool(
+            &engine,
+            "seat-worker",
+            "report_task",
+            &json!({
+                "task_id":task_id,
+                "status":"completed",
+                "summary":"Build complete",
+                "metadata":{},
+                "idempotency_key":"report-boundary-terminal"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error["kind"], "invalid_input", "{error}");
+
+        let result = tool_error_result("report_task", &error);
+        assert_eq!(result["isError"], true, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("invalid input"), "{text}");
+        assert!(text.contains("metadata.artifact_revision"), "{text}");
+        assert!(text.contains("BUILD COMPLETED"), "{text}");
+        assert!(text.contains("Действие:"), "{text}");
+        assert!(text.contains("commit или sha256"), "{text}");
+        assert_eq!(
+            engine
+                .workflow_task_events("seat-worker", task_id, 20)
+                .await
+                .unwrap()
+                .len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn report_task_omitted_metadata_is_empty_object_but_explicit_non_object_is_error() {
+        use slc_core::storage::sqlite::SqliteStore;
+        use slc_core::{MockLlm, SlcConfig, StorageBackend};
+        use std::collections::{HashMap, HashSet};
+
+        let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
+        let config = SlcConfig {
+            principal_seats: HashMap::from([
+                ("issuer".into(), "seat-issuer".into()),
+                ("worker".into(), "seat-worker".into()),
+            ]),
+            task_assign_acl: HashMap::from([("issuer".into(), HashSet::from(["worker".into()]))]),
+            ..Default::default()
+        };
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let policy = PaginationPolicy {
+            enabled: false,
+            page_token_limit: None,
+            context_token_limit: None,
+        };
+        let assign_and_start = async |suffix: &str| {
+            let assigned = call_tool(
+                &engine,
+                "seat-issuer",
+                "assign_task",
+                &json!({
+                    "assignee":"worker",
+                    "name":format!("metadata shape {suffix}"),
+                    "idempotency_key":format!("metadata-shape-assign-{suffix}")
+                }),
+                &events,
+                policy,
+            )
+            .await
+            .unwrap();
+            let assigned: Value =
+                serde_json::from_str(assigned["content"][0]["text"].as_str().unwrap()).unwrap();
+            let task_id = assigned["task"]["task_id"].as_str().unwrap().to_string();
+            call_tool(
+                &engine,
+                "seat-worker",
+                "start_task",
+                &json!({
+                    "task_id":task_id,
+                    "idempotency_key":format!("metadata-shape-start-{suffix}")
+                }),
+                &events,
+                policy,
+            )
+            .await
+            .unwrap();
+            task_id
+        };
+
+        let omitted_task = assign_and_start("omitted").await;
+        let omitted = call_tool(
+            &engine,
+            "seat-worker",
+            "report_task",
+            &json!({
+                "task_id":omitted_task,
+                "status":"completed",
+                "summary":"No metadata needed",
+                "idempotency_key":"metadata-shape-report-omitted"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let omitted: Value =
+            serde_json::from_str(omitted["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(omitted["event"]["metadata"].as_object().unwrap().is_empty());
+
+        let invalid_task = assign_and_start("invalid").await;
+        for (suffix, metadata) in [
+            ("null", Value::Null),
+            ("scalar", json!("value")),
+            ("array", json!(["value"])),
+        ] {
+            let error = call_tool(
+                &engine,
+                "seat-worker",
+                "report_task",
+                &json!({
+                    "task_id":invalid_task,
+                    "status":"in_progress",
+                    "summary":format!("Invalid metadata shape {suffix}"),
+                    "metadata":metadata,
+                    "idempotency_key":format!("metadata-shape-report-{suffix}")
+                }),
+                &events,
+                policy,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error["kind"], "invalid_input", "{error}");
+            let result = tool_error_result("report_task", &error);
+            assert_eq!(result["isError"], true, "{result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("metadata must be a JSON object"), "{text}");
+            assert!(text.contains("удалите поле metadata"), "{text}");
+            assert!(text.contains("пустой объект {}"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn task_message_replay_has_marker_without_wake_or_sse() {
+        use slc_core::storage::sqlite::SqliteStore;
+        use slc_core::{MockLlm, SlcConfig, StorageBackend};
+        use std::collections::{HashMap, HashSet};
+
+        let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::in_memory().unwrap());
+        let config = SlcConfig {
+            principal_seats: HashMap::from([
+                ("issuer".into(), "seat-issuer".into()),
+                ("worker".into(), "seat-worker".into()),
+            ]),
+            task_assign_acl: HashMap::from([("issuer".into(), HashSet::from(["worker".into()]))]),
+            ..Default::default()
+        };
+        let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
+        let (events, mut event_rx) = tokio::sync::broadcast::channel(8);
+        let policy = PaginationPolicy {
+            enabled: false,
+            page_token_limit: None,
+            context_token_limit: None,
+        };
+        let assigned = call_tool(
+            &engine,
+            "seat-issuer",
+            "assign_task",
+            &json!({
+                "assignee":"worker",
+                "name":"Message replay",
+                "idempotency_key":"assign-message-replay"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let assigned: Value =
+            serde_json::from_str(assigned["content"][0]["text"].as_str().unwrap()).unwrap();
+        let task_id = assigned["task"]["task_id"].as_str().unwrap();
+        let _ = event_rx.try_recv().unwrap();
+        // Simulate the portable-backend crash window: assignment/task/index are
+        // durable, but reconciliation has not persisted the ready reservation.
+        let mut stale_assignment = engine.store().kb_get(task_id).await.unwrap().unwrap();
+        stale_assignment
+            .metadata
+            .extra
+            .insert("queue_state".into(), json!("queued"));
+        stale_assignment
+            .metadata
+            .extra
+            .remove("queue_ready_event_id");
+        engine.store().kb_replace(&stale_assignment).await.unwrap();
+        let assignment_replay = call_tool(
+            &engine,
+            "seat-issuer",
+            "assign_task",
+            &json!({
+                "assignee":"worker",
+                "name":"Message replay",
+                "idempotency_key":"assign-message-replay"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let assignment_replay: Value =
+            serde_json::from_str(assignment_replay["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(assignment_replay["invocation_outcome"], "replayed");
+        assert_eq!(assignment_replay["replayed"], true);
+        assert_eq!(assignment_replay["fresh_transition"], true);
+        assert_eq!(assignment_replay["delivery_needed"], true);
+        assert_eq!(assignment_replay["wake_recommended"], true);
+        assert!(assignment_replay["delivery"].is_object());
+        assert!(assignment_replay["queue"].is_object());
+        assert_eq!(event_rx.try_recv().unwrap()["type"], "task_assigned");
+        let pure_replay = call_tool(
+            &engine,
+            "seat-issuer",
+            "assign_task",
+            &json!({
+                "assignee":"worker",
+                "name":"Message replay",
+                "idempotency_key":"assign-message-replay"
+            }),
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let pure_replay: Value =
+            serde_json::from_str(pure_replay["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(pure_replay["fresh_transition"], false);
+        assert_eq!(pure_replay["delivery_needed"], false);
+        assert_eq!(pure_replay["wake_recommended"], false);
+        assert!(pure_replay["delivery"].is_null());
+        assert!(pure_replay["queue"].is_null());
+        assert!(event_rx.try_recv().is_err());
+
+        let args = json!({
+            "task_id":task_id,
+            "recipient":"worker",
+            "message":"Read the durable detail",
+            "idempotency_key":"message-replay"
+        });
+        let first = call_tool(
+            &engine,
+            "seat-issuer",
+            "task_message",
+            &args,
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let first: Value =
+            serde_json::from_str(first["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(first["replayed"], false);
+        assert_eq!(first["wake_recommended"], true);
+        assert!(first["delivery"].is_object());
+        assert_eq!(event_rx.try_recv().unwrap()["type"], "task_message");
+
+        let replay = call_tool(
+            &engine,
+            "seat-issuer",
+            "task_message",
+            &args,
+            &events,
+            policy,
+        )
+        .await
+        .unwrap();
+        let replay: Value =
+            serde_json::from_str(replay["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(replay["event"]["event_id"], first["event"]["event_id"]);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["wake_recommended"], false);
+        assert!(replay["delivery"].is_null());
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]
@@ -4613,6 +5111,7 @@ mod seat_filter_tests {
                 "task_id":task_id,
                 "status":"completed",
                 "summary":"done",
+                "metadata":{"artifact_revision":"sha256:portfolio-build"},
                 "idempotency_key":"report-portfolio"
             }),
             &events,
@@ -4950,7 +5449,7 @@ mod seat_filter_tests {
             json!({"task_id":id,"idempotency_key":"active-message-start"}),
         )
         .await;
-        for supplied_id in [None, Some("")] {
+        for (supplied_id, replayed) in [(None, false), (Some(""), true)] {
             let mut args = json!({"recipient":"manager","message":"Evidence",
                 "idempotency_key":"active-message-send"});
             if let Some(value) = supplied_id {
@@ -4970,9 +5469,16 @@ mod seat_filter_tests {
             let result: Value =
                 serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
             assert_eq!(result["event"]["task_id"], id);
-            assert_eq!(result["delivery"]["correlation_id"], id);
-            assert_eq!(result["wake_recommended"], true);
-            assert_eq!(receiver.try_recv().unwrap()["task_id"], id);
+            assert_eq!(result["replayed"], replayed);
+            if replayed {
+                assert!(result["delivery"].is_null());
+                assert_eq!(result["wake_recommended"], false);
+                assert!(receiver.try_recv().is_err());
+            } else {
+                assert_eq!(result["delivery"]["correlation_id"], id);
+                assert_eq!(result["wake_recommended"], true);
+                assert_eq!(receiver.try_recv().unwrap()["task_id"], id);
+            }
         }
         engine.config.workflow_generation = Some("next-message-generation".into());
         let stale = tool_json(&engine, "seat-contactor", "task_message",
