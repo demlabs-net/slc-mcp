@@ -4,7 +4,9 @@
 //! the "history is not RAG'd" invariant holds at the schema level. All ops
 //! run on a `spawn_blocking` worker (rusqlite is sync; the trait is async).
 
-use super::{DocFilter, DocSort, MetaPatch, SortDir, SortField, StorageBackend};
+use super::{
+    DocFilter, DocSort, KbMetadataProjection, MetaPatch, SortDir, SortField, StorageBackend,
+};
 use crate::error::{SlcError, SlcResult};
 use crate::model::{
     Document, DocumentCategory, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat, SeatStatus,
@@ -503,6 +505,80 @@ impl StorageBackend for SqliteStore {
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn kb_find_unbounded(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> SlcResult<Vec<Document>> {
+        let f = filter.clone();
+        let sort = *sort;
+        self.blocking(move |conn| {
+            let (where_sql, params) = build_where(&f);
+            let sql = format!(
+                "SELECT document_id, category, folder, content, content_hash, metadata, tags, auto_load, refs, seat_id, created_at, updated_at, version, deleted_at
+                 FROM documents {where_sql} ORDER BY {} {}",
+                order_by(&sort),
+                order_dir(&sort),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(kv_params(&params).as_slice(), row_to_doc)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn kb_find_metadata_unbounded(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> SlcResult<Vec<KbMetadataProjection>> {
+        let f = filter.clone();
+        let sort = *sort;
+        self.blocking(move |conn| {
+            let (where_sql, params) = build_where(&f);
+            let sql = format!(
+                "SELECT document_id, category, seat_id, metadata
+                 FROM documents {where_sql} ORDER BY {} {}",
+                order_by(&sort),
+                order_dir(&sort),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(kv_params(&params).as_slice(), |row| {
+                let category: String = row.get(1)?;
+                let metadata: String = row.get(3)?;
+                let metadata =
+                    serde_json::from_str::<crate::model::DocMeta>(&metadata).unwrap_or_default();
+                Ok((
+                    row.get::<_, String>(0)?,
+                    category,
+                    row.get(2)?,
+                    metadata.extra,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (document_id, category, seat_id, metadata_extra) = row?;
+                let category = DocumentCategory::parse(&category).ok_or_else(|| {
+                    SlcError::Storage(format!(
+                        "invalid category {category} in metadata projection for {document_id}"
+                    ))
+                })?;
+                out.push(KbMetadataProjection {
+                    document_id,
+                    category,
+                    seat_id,
+                    metadata_extra,
+                });
             }
             Ok(out)
         })

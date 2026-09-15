@@ -8,7 +8,7 @@
 use crate::SlcEngine;
 use crate::error::{SlcError, SlcResult};
 use crate::model::{Document, DocumentCategory, content_hash};
-use crate::storage::{DocFilter, DocSort, SortDir};
+use crate::storage::{DocFilter, DocSort, KbMetadataProjection, SortDir};
 use crate::tasks::{
     STATUS_ACTIVE, STATUS_BLOCKED, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED,
     STATUS_PENDING, TaskInfo, apply_description_patch, doc_to_task, is_workflow_task,
@@ -131,6 +131,88 @@ pub struct PortfolioIndexSnapshot {
     pub roots: Vec<PortfolioRootIndexEntry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentInvocationOutcome {
+    Created,
+    Replayed,
+    PortfolioIdentityConflict,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskAssignmentResult {
+    pub task: TaskInfo,
+    pub invocation_outcome: AssignmentInvocationOutcome,
+    /// True only when this invocation durably created a new ready reservation
+    /// that has not previously been surfaced to the caller for delivery.
+    pub fresh_transition: bool,
+    pub delivery_needed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub existing_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_attempt: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskEventResult {
+    pub event: TaskEvent,
+    pub replayed: bool,
+}
+
+impl std::ops::Deref for TaskEventResult {
+    type Target = TaskEvent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
+}
+
+impl std::ops::Deref for TaskAssignmentResult {
+    type Target = TaskInfo;
+
+    fn deref(&self) -> &Self::Target {
+        &self.task
+    }
+}
+
+impl TaskAssignmentResult {
+    fn created(task: TaskInfo) -> Self {
+        let delivery_needed = task.queue_state.as_deref() == Some(QUEUE_STATE_READY);
+        Self {
+            task,
+            invocation_outcome: AssignmentInvocationOutcome::Created,
+            fresh_transition: true,
+            delivery_needed,
+            existing_task_id: None,
+            next_attempt: None,
+        }
+    }
+
+    fn replayed(task: TaskInfo, fresh_transition: bool) -> Self {
+        let delivery_needed =
+            fresh_transition && task.queue_state.as_deref() == Some(QUEUE_STATE_READY);
+        Self {
+            task,
+            invocation_outcome: AssignmentInvocationOutcome::Replayed,
+            fresh_transition,
+            delivery_needed,
+            existing_task_id: None,
+            next_attempt: None,
+        }
+    }
+
+    fn portfolio_identity_conflict(task: TaskInfo, next_attempt: u64) -> Self {
+        Self {
+            existing_task_id: Some(task.task_id.clone()),
+            task,
+            invocation_outcome: AssignmentInvocationOutcome::PortfolioIdentityConflict,
+            fresh_transition: false,
+            delivery_needed: false,
+            next_attempt: Some(next_attempt),
+        }
+    }
+}
+
 impl TaskQueueSnapshot {
     pub fn ready_task(&self) -> Option<TaskInfo> {
         self.entries
@@ -146,6 +228,22 @@ fn workflow_string(doc: &Document, key: &str) -> Option<String> {
         .get(key)
         .and_then(Value::as_str)
         .map(String::from)
+}
+
+fn projected_workflow_string(doc: &KbMetadataProjection, key: &str) -> Option<String> {
+    doc.metadata_extra
+        .get(key)
+        .and_then(Value::as_str)
+        .map(String::from)
+}
+
+fn is_projected_workflow_task(doc: &KbMetadataProjection) -> bool {
+    doc.category == DocumentCategory::Task
+        && doc
+            .metadata_extra
+            .get("workflow_version")
+            .and_then(Value::as_u64)
+            .is_some()
 }
 
 fn task_document(doc: Option<Document>, task_id: &str) -> SlcResult<Document> {
@@ -321,6 +419,45 @@ fn is_terminal_status(status: &str) -> bool {
         status,
         STATUS_COMPLETED | STATUS_BLOCKED | STATUS_FAILED | STATUS_CANCELLED
     )
+}
+
+fn validate_portfolio_terminal_report_artifact_revision(
+    doc: &Document,
+    status: &str,
+    metadata: &Value,
+) -> SlcResult<()> {
+    if workflow_string(doc, "issuer").as_deref() != Some("manager")
+        || doc.metadata.extra.get("project").and_then(Value::as_str)
+            != Some(LEADS_PORTFOLIO_PROJECT)
+    {
+        return Ok(());
+    }
+
+    let stage = doc
+        .metadata
+        .extra
+        .get("workflow_metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("stage"))
+        .and_then(Value::as_str);
+    let requires_revision = matches!(
+        (stage, status),
+        (Some("BUILD"), STATUS_COMPLETED)
+            | (Some("TEST"), STATUS_COMPLETED | STATUS_FAILED)
+            | (Some("DEPLOY"), STATUS_FAILED)
+    );
+    if requires_revision
+        && metadata
+            .get("artifact_revision")
+            .and_then(Value::as_str)
+            .is_none_or(|revision| revision.trim().is_empty())
+    {
+        let stage = stage.expect("revision-requiring transition has a known stage");
+        return Err(SlcError::InvalidInput(format!(
+            "manager-owned {LEADS_PORTFOLIO_PROJECT} {stage} {status} terminal reports require non-empty metadata.artifact_revision so the dispatcher can preserve immutable artifact identity"
+        )));
+    }
+    Ok(())
 }
 
 fn effective_queue_state(doc: &Document) -> &'static str {
@@ -1006,6 +1143,42 @@ impl SlcEngine {
         metadata: &Value,
         supplied_idempotency_key: Option<&str>,
     ) -> SlcResult<TaskInfo> {
+        let result = self
+            .workflow_assign_task_with_outcome(
+                seat_id,
+                assignee,
+                name,
+                description,
+                parent_task_id,
+                project_id,
+                auto_load,
+                metadata,
+                supplied_idempotency_key,
+            )
+            .await?;
+        if result.invocation_outcome == AssignmentInvocationOutcome::PortfolioIdentityConflict {
+            return Err(SlcError::InvalidInput(format!(
+                "portfolio identity already belongs to task {}; inspect that task and use attempt {} for a genuine replacement",
+                result.task.task_id,
+                result.next_attempt.unwrap_or(1),
+            )));
+        }
+        Ok(result.task)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn workflow_assign_task_with_outcome(
+        &self,
+        seat_id: &str,
+        assignee: &str,
+        name: &str,
+        description: &str,
+        parent_task_id: Option<&str>,
+        project_id: Option<&str>,
+        auto_load: &[String],
+        metadata: &Value,
+        supplied_idempotency_key: Option<&str>,
+    ) -> SlcResult<TaskAssignmentResult> {
         let _workflow_guard = self.workflow_lock.lock().await;
         let actor = self.workflow_principal(seat_id);
         let assignee = clean_required(assignee, "assignee", 128)?;
@@ -1081,11 +1254,12 @@ impl SlcEngine {
                 // projection instead of manufacturing a replacement.
                 let task = self.workflow_task_document(seat_id, task_id).await?;
                 self.require_workflow_generation(&task)?;
-                if effective_queue_state(&task) == QUEUE_STATE_TERMINAL {
-                    return Ok(doc_to_task(&task));
+                let previous_queue_state = effective_queue_state(&task);
+                if previous_queue_state == QUEUE_STATE_TERMINAL {
+                    return Ok(TaskAssignmentResult::replayed(doc_to_task(&task), false));
                 }
                 let queue = self.reconcile_task_queue_locked(&assignee).await?;
-                return queue
+                let task = queue
                     .entries
                     .into_iter()
                     .find(|entry| entry.task.task_id == task_id)
@@ -1094,7 +1268,10 @@ impl SlcEngine {
                         SlcError::Storage(
                             "idempotent assignment disappeared from its task queue".into(),
                         )
-                    });
+                    })?;
+                let fresh_transition = previous_queue_state == QUEUE_STATE_QUEUED
+                    && task.queue_state.as_deref() == Some(QUEUE_STATE_READY);
+                return Ok(TaskAssignmentResult::replayed(task, fresh_transition));
             }
 
             // Repair the portable-backend crash window in which the task
@@ -1161,10 +1338,14 @@ impl SlcEngine {
                     let recovered = self
                         .workflow_task_document(seat_id, &recovered_doc.document_id)
                         .await?;
-                    return Ok(doc_to_task(&recovered));
+                    return Ok(TaskAssignmentResult::replayed(
+                        doc_to_task(&recovered),
+                        false,
+                    ));
                 }
+                let previous_queue_state = effective_queue_state(&recovered_doc);
                 let queue = self.reconcile_task_queue_locked(&assignee).await?;
-                return queue
+                let task = queue
                     .entries
                     .into_iter()
                     .find(|entry| entry.task.task_id == recovered_doc.document_id)
@@ -1173,7 +1354,10 @@ impl SlcEngine {
                         SlcError::Storage(
                             "recovered assignment disappeared from its task queue".into(),
                         )
-                    });
+                    })?;
+                let fresh_transition = previous_queue_state == QUEUE_STATE_QUEUED
+                    && task.queue_state.as_deref() == Some(QUEUE_STATE_READY);
+                return Ok(TaskAssignmentResult::replayed(task, fresh_transition));
             }
         }
 
@@ -1216,7 +1400,7 @@ impl SlcEngine {
                 .unwrap_or_default();
             let portfolio_tasks = self
                 .store()
-                .kb_find(
+                .kb_find_metadata_unbounded(
                     &DocFilter {
                         category: Some(DocumentCategory::Task),
                         extra_strings: BTreeMap::from([(
@@ -1226,21 +1410,19 @@ impl SlcEngine {
                         ..Default::default()
                     },
                     &DocSort::by_created(SortDir::Asc),
-                    MAX_ASSIGNEE_QUEUE_DEPTH,
                 )
                 .await?;
             let mut max_attempt = 0;
-            let mut existing_identity: Option<&Document> = None;
+            let mut existing_identity: Option<&KbMetadataProjection> = None;
             for doc in &portfolio_tasks {
-                if !is_workflow_task(doc)
-                    || workflow_string(doc, "issuer").as_deref() != Some("manager")
-                    || workflow_string(doc, "parent_task_id").is_some()
+                if !is_projected_workflow_task(doc)
+                    || projected_workflow_string(doc, "issuer").as_deref() != Some("manager")
+                    || projected_workflow_string(doc, "parent_task_id").is_some()
                 {
                     continue;
                 }
                 let Some(metadata) = doc
-                    .metadata
-                    .extra
+                    .metadata_extra
                     .get("workflow_metadata")
                     .and_then(Value::as_object)
                 else {
@@ -1262,13 +1444,13 @@ impl SlcEngine {
                 }
             }
             if let Some(existing) = existing_identity {
-                let status = workflow_string(existing, "status")
-                    .unwrap_or_else(|| STATUS_PENDING.to_string());
-                return Err(SlcError::InvalidInput(format!(
-                    "portfolio identity slug={requested_slug}, stage={requested_stage}, attempt={requested_attempt} already belongs to task {} (status {status}); inspect that task and either replay its exact original assignment or create a genuine replacement root with attempt {} and a new key",
-                    existing.document_id,
+                let existing = self
+                    .workflow_task_document(seat_id, &existing.document_id)
+                    .await?;
+                return Ok(TaskAssignmentResult::portfolio_identity_conflict(
+                    doc_to_task(&existing),
                     max_attempt.saturating_add(1),
-                )));
+                ));
             }
         }
         let root_task_id = parent.as_ref().map(|doc| {
@@ -1358,12 +1540,13 @@ impl SlcEngine {
                 .await?;
         }
         let queue = self.reconcile_task_queue_locked(&assignee).await?;
-        queue
+        let task = queue
             .entries
             .into_iter()
             .find(|entry| entry.task.task_id == task.task_id)
             .map(|entry| entry.task)
-            .ok_or_else(|| SlcError::Storage("assigned task disappeared from its queue".into()))
+            .ok_or_else(|| SlcError::Storage("assigned task disappeared from its queue".into()))?;
+        Ok(TaskAssignmentResult::created(task))
     }
 
     pub async fn workflow_get_task(&self, seat_id: &str, task_id: &str) -> SlcResult<TaskInfo> {
@@ -1388,7 +1571,7 @@ impl SlcEngine {
         }
         let docs = self
             .store()
-            .kb_find(
+            .kb_find_metadata_unbounded(
                 &DocFilter {
                     category: Some(DocumentCategory::Task),
                     extra_strings: BTreeMap::from([(
@@ -1398,28 +1581,26 @@ impl SlcEngine {
                     ..Default::default()
                 },
                 &DocSort::by_created(SortDir::Asc),
-                MAX_ASSIGNEE_QUEUE_DEPTH,
             )
             .await?;
         let mut status_counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut roots: BTreeMap<(String, String), PortfolioRootIndexEntry> = BTreeMap::new();
         let mut task_count = 0;
         for doc in docs {
-            if !is_workflow_task(&doc) {
+            if !is_projected_workflow_task(&doc) {
                 continue;
             }
             task_count += 1;
-            let status =
-                workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
+            let status = projected_workflow_string(&doc, "status")
+                .unwrap_or_else(|| STATUS_PENDING.to_string());
             *status_counts.entry(status.clone()).or_default() += 1;
-            if workflow_string(&doc, "issuer").as_deref() != Some("manager")
-                || workflow_string(&doc, "parent_task_id").is_some()
+            if projected_workflow_string(&doc, "issuer").as_deref() != Some("manager")
+                || projected_workflow_string(&doc, "parent_task_id").is_some()
             {
                 continue;
             }
             let Some(metadata) = doc
-                .metadata
-                .extra
+                .metadata_extra
                 .get("workflow_metadata")
                 .and_then(Value::as_object)
             else {
@@ -1748,30 +1929,29 @@ impl SlcEngine {
             TaskEventKind::Progress
         };
         let issuer = workflow_string(&doc, "issuer");
-        let current_status =
-            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
-        if is_terminal_status(&current_status) {
-            if current_status != status
-                || workflow_string(&doc, "terminal_summary").as_deref() != Some(summary.as_str())
-            {
-                return Err(SlcError::InvalidInput(format!(
-                    "terminal task cannot transition from {current_status} to {status}"
-                )));
-            }
-            let fingerprint = task_event_fingerprint(
-                task_id,
-                event_kind,
-                &actor,
-                issuer.as_deref(),
-                Some(status),
-                &summary,
-                &metadata,
-            )?;
-            if let Some(event) = self
-                .existing_task_event(&actor, idempotency_key, &fingerprint)
-                .await?
-            {
-                let repaired = self
+        let fingerprint = task_event_fingerprint(
+            task_id,
+            event_kind,
+            &actor,
+            issuer.as_deref(),
+            Some(status),
+            &summary,
+            &metadata,
+        )?;
+        if let Some(event) = self
+            .existing_task_event(&actor, idempotency_key, &fingerprint)
+            .await?
+        {
+            let mut repaired = self
+                .touch_task_projection(
+                    task_id,
+                    &event,
+                    Some(status),
+                    terminal.then_some(summary.as_str()),
+                )
+                .await?;
+            if terminal {
+                repaired = self
                     .set_task_queue_projection(task_id, QUEUE_STATE_TERMINAL, None)
                     .await?;
                 if let Some(assignee_seat) = self.workflow_seat(&assignee)
@@ -1785,9 +1965,37 @@ impl SlcEngine {
                 let queue = self.reconcile_task_queue_locked(&assignee).await?;
                 return Ok((repaired, event, queue.ready_task()));
             }
+            if repaired.status == STATUS_ACTIVE
+                && repaired.queue_state.as_deref() != Some(QUEUE_STATE_RUNNING)
+            {
+                repaired = self
+                    .set_task_queue_projection(
+                        task_id,
+                        QUEUE_STATE_RUNNING,
+                        repaired.queue_ready_event_id.as_deref(),
+                    )
+                    .await?;
+            }
+            return Ok((repaired, event, None));
+        }
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
+        if is_terminal_status(&current_status) {
+            if current_status != status
+                || workflow_string(&doc, "terminal_summary").as_deref() != Some(summary.as_str())
+            {
+                return Err(SlcError::InvalidInput(format!(
+                    "terminal task cannot transition from {current_status} to {status}"
+                )));
+            }
             return Err(SlcError::InvalidInput(
                 "terminal task already has a report; retry only with the original idempotency_key"
                     .into(),
+            ));
+        }
+        if !metadata.is_object() {
+            return Err(SlcError::InvalidInput(
+                "metadata must be a JSON object; omit metadata to use an empty object".into(),
             ));
         }
         if actor != assignee {
@@ -1808,6 +2016,9 @@ impl SlcEngine {
             return Err(SlcError::InvalidInput(format!(
                 "text-only principal cannot assert visual completion ({claim}); report numeric evidence and request vision-capable verification"
             )));
+        }
+        if terminal {
+            validate_portfolio_terminal_report_artifact_revision(&doc, status, &metadata)?;
         }
         let event = self
             .append_task_event(
@@ -2001,6 +2212,28 @@ impl SlcEngine {
         metadata: Value,
         idempotency_key: Option<&str>,
     ) -> SlcResult<TaskEvent> {
+        Ok(self
+            .workflow_task_message_with_outcome(
+                seat_id,
+                task_id,
+                recipient,
+                message,
+                metadata,
+                idempotency_key,
+            )
+            .await?
+            .event)
+    }
+
+    pub async fn workflow_task_message_with_outcome(
+        &self,
+        seat_id: &str,
+        task_id: &str,
+        recipient: &str,
+        message: &str,
+        metadata: Value,
+        idempotency_key: Option<&str>,
+    ) -> SlcResult<TaskEventResult> {
         let _workflow_guard = self.workflow_lock.lock().await;
         let task_id = self.workflow_task_id_or_active(seat_id, task_id).await?;
         let task_id = task_id.as_str();
@@ -2015,6 +2248,26 @@ impl SlcEngine {
             ));
         }
         let message = clean_required(message, "message", 100_000)?;
+        let fingerprint = task_event_fingerprint(
+            task_id,
+            TaskEventKind::Message,
+            &actor,
+            Some(&recipient),
+            None,
+            &message,
+            &metadata,
+        )?;
+        if let Some(event) = self
+            .existing_task_event(&actor, idempotency_key, &fingerprint)
+            .await?
+        {
+            self.touch_task_projection(task_id, &event, None, None)
+                .await?;
+            return Ok(TaskEventResult {
+                event,
+                replayed: true,
+            });
+        }
         let event = self
             .append_task_event(
                 task_id,
@@ -2029,7 +2282,10 @@ impl SlcEngine {
             .await?;
         self.touch_task_projection(task_id, &event, None, None)
             .await?;
-        Ok(event)
+        Ok(TaskEventResult {
+            event,
+            replayed: false,
+        })
     }
 
     /// Canonical manager update of a workflow task.
@@ -2565,6 +2821,415 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_portfolio_transition_reports_require_artifact_revision_before_append() {
+        for (stage, status) in [
+            ("BUILD", "completed"),
+            ("TEST", "completed"),
+            ("TEST", "failed"),
+            ("DEPLOY", "failed"),
+        ] {
+            let engine = engine();
+            let key = format!("required-{stage}-{status}");
+            let task = engine
+                .workflow_assign_task(
+                    "seat-manager",
+                    "senior",
+                    &format!("{stage} artifact identity"),
+                    "Transition source",
+                    None,
+                    Some(LEADS_PORTFOLIO_PROJECT),
+                    &[],
+                    &json!({
+                        "pipeline": LEADS_PORTFOLIO_PROJECT,
+                        "slug": format!("{stage}-{status}").to_ascii_lowercase(),
+                        "stage": stage,
+                        "artifact_root": "/work/shared/leads-mass-redesign/identity/layout",
+                        "attempt": 1,
+                    }),
+                    Some(&format!("{key}-assign")),
+                )
+                .await
+                .unwrap();
+            engine
+                .workflow_start_task(
+                    "seat-senior",
+                    &task.task_id,
+                    "Starting",
+                    Some(&format!("{key}-start")),
+                )
+                .await
+                .unwrap();
+            let event_count = engine
+                .workflow_task_events("seat-senior", &task.task_id, 20)
+                .await
+                .unwrap()
+                .len();
+
+            for (suffix, metadata) in [
+                ("missing", json!({})),
+                ("blank", json!({"artifact_revision": "  "})),
+                ("wrong-type", json!({"artifact_revision": 42})),
+            ] {
+                let error = engine
+                    .workflow_report_task(
+                        "seat-senior",
+                        &task.task_id,
+                        status,
+                        "Canonical terminal result",
+                        metadata,
+                        Some(&format!("{key}-{suffix}")),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SlcError::InvalidInput(_)));
+                assert!(
+                    error.to_string().contains("metadata.artifact_revision"),
+                    "{stage} {status}: {error}"
+                );
+                assert_eq!(
+                    engine
+                        .workflow_task_events("seat-senior", &task.task_id, 20)
+                        .await
+                        .unwrap()
+                        .len(),
+                    event_count,
+                    "validation must run before appending the report event"
+                );
+            }
+
+            let (reported, event, _) = engine
+                .workflow_report_task(
+                    "seat-senior",
+                    &task.task_id,
+                    status,
+                    "Canonical terminal result",
+                    json!({"artifact_revision": "sha256:immutable"}),
+                    Some(&format!("{key}-valid")),
+                )
+                .await
+                .unwrap();
+            assert!(is_terminal_status(&reported.status));
+            assert_eq!(event.metadata["artifact_revision"], "sha256:immutable");
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_revision_report_rule_is_narrow_to_consumed_portfolio_transitions() {
+        for (stage, status) in [
+            ("DESIGN", "completed"),
+            ("BUILD", "failed"),
+            ("BUILD", "blocked"),
+            ("TEST", "blocked"),
+            ("DEPLOY", "completed"),
+            ("DEPLOY", "blocked"),
+        ] {
+            let engine = engine();
+            let key = format!("optional-{stage}-{status}");
+            let task = engine
+                .workflow_assign_task(
+                    "seat-manager",
+                    "senior",
+                    &format!("{stage} terminal without downstream revision"),
+                    "No revision-consuming transition",
+                    None,
+                    Some(LEADS_PORTFOLIO_PROJECT),
+                    &[],
+                    &json!({
+                        "pipeline": LEADS_PORTFOLIO_PROJECT,
+                        "slug": format!("optional-{stage}-{status}").to_ascii_lowercase(),
+                        "stage": stage,
+                        "artifact_root": "/work/shared/leads-mass-redesign/optional/layout",
+                        "attempt": 1,
+                    }),
+                    Some(&format!("{key}-assign")),
+                )
+                .await
+                .unwrap();
+            engine
+                .workflow_start_task(
+                    "seat-senior",
+                    &task.task_id,
+                    "Starting",
+                    Some(&format!("{key}-start")),
+                )
+                .await
+                .unwrap();
+            engine
+                .workflow_report_task(
+                    "seat-senior",
+                    &task.task_id,
+                    status,
+                    "Terminal result without a revision",
+                    json!({}),
+                    Some(&format!("{key}-report")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let engine = engine();
+        let generic = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "senior",
+                "Generic BUILD-shaped task",
+                "Not in the portfolio",
+                None,
+                None,
+                &[],
+                &json!({"stage": "BUILD"}),
+                Some("generic-build-assign"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-senior",
+                &generic.task_id,
+                "Starting",
+                Some("generic-build-start"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_report_task(
+                "seat-senior",
+                &generic.task_id,
+                "completed",
+                "Generic completion",
+                json!({}),
+                Some("generic-build-report"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_portfolio_report_without_revision_remains_readable_and_replayable() {
+        let engine = engine();
+        let task = engine
+            .workflow_assign_task(
+                "seat-manager",
+                "senior",
+                "Historical BUILD",
+                "Predates artifact revision validation",
+                None,
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &json!({
+                    "pipeline": LEADS_PORTFOLIO_PROJECT,
+                    "slug": "historical-build",
+                    "stage": "BUILD",
+                    "artifact_root": "/work/shared/leads-mass-redesign/historical-build/layout",
+                    "attempt": 1,
+                }),
+                Some("historical-build-assign"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-senior",
+                &task.task_id,
+                "Starting",
+                Some("historical-build-start"),
+            )
+            .await
+            .unwrap();
+        let event = engine
+            .append_task_event(
+                &task.task_id,
+                TaskEventKind::Report,
+                "senior",
+                Some("manager"),
+                Some(STATUS_COMPLETED),
+                "Historical completion",
+                json!({}),
+                Some("historical-build-report"),
+            )
+            .await
+            .unwrap();
+        let event_key = idempotency_key("senior", "historical-build-report");
+        engine
+            .store()
+            .delete_record(TASK_EVENT_IDEMPOTENCY, &event_key)
+            .await
+            .unwrap();
+        let before_replay = engine
+            .workflow_get_task("seat-senior", &task.task_id)
+            .await
+            .unwrap();
+        assert_eq!(before_replay.status, STATUS_ACTIVE);
+        assert_eq!(
+            before_replay.queue_state.as_deref(),
+            Some(QUEUE_STATE_RUNNING)
+        );
+
+        let events = engine
+            .workflow_task_events("seat-manager", &task.task_id, 20)
+            .await
+            .unwrap();
+        assert_eq!(events.last().unwrap().event_id, event.event_id);
+        assert!(
+            events
+                .last()
+                .unwrap()
+                .metadata
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+
+        let (replayed, replayed_event, _) = engine
+            .workflow_report_task(
+                "seat-senior",
+                &task.task_id,
+                "completed",
+                "Historical completion",
+                json!({}),
+                Some("historical-build-report"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed.status, STATUS_COMPLETED);
+        assert_eq!(replayed.queue_state.as_deref(), Some(QUEUE_STATE_TERMINAL));
+        assert_eq!(replayed_event.event_id, event.event_id);
+        assert!(
+            engine
+                .store()
+                .get_record(TASK_EVENT_IDEMPOTENCY, &event_key)
+                .await
+                .unwrap()
+                .is_some(),
+            "exact replay repairs the missing portable idempotency index"
+        );
+        assert!(
+            engine
+                .task_get_active("seat-senior")
+                .await
+                .unwrap()
+                .is_none(),
+            "terminal replay repair releases the active task anchor"
+        );
+
+        let mismatch = engine
+            .workflow_report_task(
+                "seat-senior",
+                &task.task_id,
+                "completed",
+                "Historical completion",
+                json!({"artifact_revision": "changed-request"}),
+                Some("historical-build-report"),
+            )
+            .await
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("different task event"));
+    }
+
+    #[tokio::test]
+    async fn report_metadata_must_be_an_object_for_new_events() {
+        for (suffix, metadata) in [
+            ("null", Value::Null),
+            ("scalar", json!("scalar")),
+            ("array", json!(["array"])),
+            ("number", json!(42)),
+        ] {
+            let engine = engine();
+            let task = engine
+                .workflow_assign_task(
+                    "seat-senior",
+                    "junior",
+                    "Validate report metadata",
+                    "Engine boundary",
+                    None,
+                    None,
+                    &[],
+                    &json!({}),
+                    Some(&format!("metadata-shape-assign-{suffix}")),
+                )
+                .await
+                .unwrap();
+            engine
+                .workflow_start_task(
+                    "seat-junior",
+                    &task.task_id,
+                    "Starting",
+                    Some(&format!("metadata-shape-start-{suffix}")),
+                )
+                .await
+                .unwrap();
+            let before = engine
+                .workflow_task_events("seat-junior", &task.task_id, 20)
+                .await
+                .unwrap()
+                .len();
+
+            let error = engine
+                .workflow_report_task(
+                    "seat-junior",
+                    &task.task_id,
+                    "in_progress",
+                    "Still working",
+                    metadata,
+                    Some(&format!("metadata-shape-report-{suffix}")),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SlcError::InvalidInput(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("metadata must be a JSON object; omit metadata")
+            );
+            assert_eq!(
+                engine
+                    .workflow_task_events("seat-junior", &task.task_id, 20)
+                    .await
+                    .unwrap()
+                    .len(),
+                before
+            );
+        }
+
+        let engine = engine();
+        let task = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Optional empty metadata",
+                "Empty object remains valid",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("empty-metadata-assign"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-junior",
+                &task.task_id,
+                "Starting",
+                Some("empty-metadata-start"),
+            )
+            .await
+            .unwrap();
+        let (_, event, _) = engine
+            .workflow_report_task(
+                "seat-junior",
+                &task.task_id,
+                "in_progress",
+                "Still working",
+                json!({}),
+                Some("empty-metadata-report"),
+            )
+            .await
+            .unwrap();
+        assert!(event.metadata.as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn manager_portfolio_root_identity_cannot_be_recreated_with_a_new_key() {
         let engine = engine();
         let metadata = json!({
@@ -2609,8 +3274,8 @@ mod tests {
             .await
             .unwrap();
 
-        let error = engine
-            .workflow_assign_task(
+        let conflict = engine
+            .workflow_assign_task_with_outcome(
                 "seat-manager",
                 "junior",
                 "Renamed design root",
@@ -2622,10 +3287,17 @@ mod tests {
                 Some("unique-root-bypass"),
             )
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("already belongs to task"));
-        assert!(error.to_string().contains(&first.task_id));
-        assert!(error.to_string().contains("attempt 2"));
+            .unwrap();
+        assert_eq!(
+            conflict.invocation_outcome,
+            AssignmentInvocationOutcome::PortfolioIdentityConflict
+        );
+        assert_eq!(conflict.task_id, first.task_id);
+        assert_eq!(
+            conflict.existing_task_id.as_deref(),
+            Some(first.task_id.as_str())
+        );
+        assert_eq!(conflict.next_attempt, Some(2));
 
         let replacement = engine
             .workflow_assign_task(
@@ -2733,6 +3405,80 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(denied, SlcError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn portfolio_history_scan_includes_identity_beyond_5000_documents() {
+        use crate::model::DocMeta;
+
+        let engine = engine();
+        for attempt in 1..=5_001u64 {
+            let mut extra = Map::new();
+            extra.insert("name".into(), json!(format!("Historical root {attempt}")));
+            extra.insert("project".into(), json!(LEADS_PORTFOLIO_PROJECT));
+            extra.insert("workflow_version".into(), json!(1));
+            extra.insert("issuer".into(), json!("manager"));
+            extra.insert("assignee".into(), json!("senior"));
+            extra.insert("status".into(), json!(STATUS_COMPLETED));
+            extra.insert("queue_state".into(), json!(QUEUE_STATE_TERMINAL));
+            extra.insert(
+                "workflow_metadata".into(),
+                json!({
+                    "pipeline": LEADS_PORTFOLIO_PROJECT,
+                    "slug": "boundary-slug",
+                    "stage": "DESIGN",
+                    "artifact_root": "/work/shared/leads-mass-redesign/boundary-slug",
+                    "attempt": attempt,
+                }),
+            );
+            let document = Document::new(
+                format!("portfolio_boundary_{attempt:04}"),
+                DocumentCategory::Task,
+                "historical root",
+                DocMeta {
+                    extra,
+                    ..Default::default()
+                },
+                vec![],
+                Some("seat-senior".into()),
+            );
+            engine.store().kb_insert(&document).await.unwrap();
+        }
+
+        let index = engine
+            .workflow_portfolio_index("seat-manager")
+            .await
+            .unwrap();
+        assert_eq!(index.task_count, 5_001);
+        assert_eq!(index.roots[0].root_count, 5_001);
+        assert_eq!(index.roots[0].max_attempt, 5_001);
+
+        let conflict = engine
+            .workflow_assign_task_with_outcome(
+                "seat-manager",
+                "senior",
+                "Duplicate boundary identity",
+                "Must find the 5001st historical root",
+                None,
+                Some(LEADS_PORTFOLIO_PROJECT),
+                &[],
+                &json!({
+                    "pipeline": LEADS_PORTFOLIO_PROJECT,
+                    "slug": "boundary-slug",
+                    "stage": "DESIGN",
+                    "artifact_root": "/work/shared/leads-mass-redesign/boundary-slug",
+                    "attempt": 5_001,
+                }),
+                Some("boundary-conflict"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            conflict.invocation_outcome,
+            AssignmentInvocationOutcome::PortfolioIdentityConflict
+        );
+        assert_eq!(conflict.task_id, "portfolio_boundary_5001");
+        assert_eq!(conflict.next_attempt, Some(5_002));
     }
 
     #[tokio::test]
@@ -3009,7 +3755,7 @@ mod tests {
     async fn idempotency_and_text_only_visual_policy_are_enforced() {
         let engine = engine();
         let first = engine
-            .workflow_assign_task(
+            .workflow_assign_task_with_outcome(
                 "seat-senior",
                 "junior",
                 "Narrow patch",
@@ -3032,7 +3778,7 @@ mod tests {
             .await
             .unwrap();
         let replay = engine
-            .workflow_assign_task(
+            .workflow_assign_task_with_outcome(
                 "seat-senior",
                 "junior",
                 "Narrow patch",
@@ -3046,6 +3792,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.task_id, replay.task_id);
+        assert_eq!(
+            first.invocation_outcome,
+            AssignmentInvocationOutcome::Created
+        );
+        assert_eq!(
+            replay.invocation_outcome,
+            AssignmentInvocationOutcome::Replayed
+        );
+        let mismatch = engine
+            .workflow_assign_task_with_outcome(
+                "seat-senior",
+                "junior",
+                "Narrow patch changed",
+                "Edit one selector",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("same-assignment"),
+            )
+            .await
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("different assignment fields"));
+
         let error = engine
             .workflow_report_task(
                 "seat-junior",
@@ -3437,7 +4207,7 @@ mod tests {
             .await
             .unwrap();
         let indexed_replay = engine
-            .workflow_assign_task(
+            .workflow_assign_task_with_outcome(
                 "seat-senior",
                 "junior",
                 "Recover portable write",
@@ -3454,6 +4224,28 @@ mod tests {
             indexed_replay.queue_state.as_deref(),
             Some(QUEUE_STATE_READY)
         );
+        assert_eq!(
+            indexed_replay.invocation_outcome,
+            AssignmentInvocationOutcome::Replayed
+        );
+        assert!(indexed_replay.fresh_transition);
+        assert!(indexed_replay.delivery_needed);
+        let pure_replay = engine
+            .workflow_assign_task_with_outcome(
+                "seat-senior",
+                "junior",
+                "Recover portable write",
+                "One exact patch",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("recover-assignment"),
+            )
+            .await
+            .unwrap();
+        assert!(!pure_replay.fresh_transition);
+        assert!(!pure_replay.delivery_needed);
         engine
             .store()
             .delete_record(TASK_ASSIGN_IDEMPOTENCY, &assignment_key)
@@ -3486,7 +4278,7 @@ mod tests {
             .await
             .unwrap();
         let first_message = engine
-            .workflow_task_message(
+            .workflow_task_message_with_outcome(
                 "seat-junior",
                 &task.task_id,
                 "senior",
@@ -3497,13 +4289,17 @@ mod tests {
             .await
             .unwrap();
         let event_key = idempotency_key("junior", "recover-message");
+        let mut stale_projection = engine.store().kb_get(&task.task_id).await.unwrap().unwrap();
+        stale_projection.metadata.extra.remove("last_event_id");
+        stale_projection.metadata.extra.remove("last_event_at");
+        engine.store().kb_replace(&stale_projection).await.unwrap();
         engine
             .store()
             .delete_record(TASK_EVENT_IDEMPOTENCY, &event_key)
             .await
             .unwrap();
         let replayed_message = engine
-            .workflow_task_message(
+            .workflow_task_message_with_outcome(
                 "seat-junior",
                 &task.task_id,
                 "senior",
@@ -3514,6 +4310,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replayed_message.event_id, first_message.event_id);
+        assert!(!first_message.replayed);
+        assert!(replayed_message.replayed);
+        let repaired_projection = engine
+            .workflow_get_task("seat-junior", &task.task_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            repaired_projection.last_event_id.as_deref(),
+            Some(first_message.event_id.as_str())
+        );
+        let mismatch = engine
+            .workflow_task_message_with_outcome(
+                "seat-junior",
+                &task.task_id,
+                "senior",
+                "Changed durable message",
+                json!({}),
+                Some("recover-message"),
+            )
+            .await
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("different task event"));
         let events = engine
             .workflow_task_events("seat-senior", &task.task_id, 50)
             .await

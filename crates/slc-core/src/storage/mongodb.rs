@@ -17,7 +17,9 @@
 
 use crate::error::{SlcError, SlcResult};
 use crate::model::{Document, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat, SeatStatus};
-use crate::storage::{DocFilter, DocSort, MetaPatch, SortDir, SortField, StorageBackend};
+use crate::storage::{
+    DocFilter, DocSort, KbMetadataProjection, MetaPatch, SortDir, SortField, StorageBackend,
+};
 use bson::{Bson, Document as BsonDoc, doc};
 use chrono::{DateTime, Utc};
 use mongodb::options::IndexOptions;
@@ -344,6 +346,90 @@ impl StorageBackend for MongoStore {
                 .deserialize_current()
                 .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
             out.push(bson_to_doc(b)?);
+        }
+        Ok(out)
+    }
+
+    async fn kb_find_unbounded(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> SlcResult<Vec<Document>> {
+        let mut cursor = self
+            .docs()
+            .find(filter_query(KIND_KB, filter))
+            .sort(sort_doc(sort))
+            .await
+            .map_err(|e| SlcError::Storage(format!("kb find unbounded: {e}")))?;
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let document: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+            out.push(bson_to_doc(document)?);
+        }
+        Ok(out)
+    }
+
+    async fn kb_find_metadata_unbounded(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> SlcResult<Vec<KbMetadataProjection>> {
+        let mut cursor = self
+            .docs()
+            .find(filter_query(KIND_KB, filter))
+            .sort(sort_doc(sort))
+            .projection(doc! {
+                "_id": 1,
+                "category": 1,
+                "seat_id": 1,
+                "metadata": 1,
+            })
+            .await
+            .map_err(|e| SlcError::Storage(format!("kb metadata find unbounded: {e}")))?;
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SlcError::Storage(format!("cursor: {e}")))?
+        {
+            let document: BsonDoc = cursor
+                .deserialize_current()
+                .map_err(|e| SlcError::Storage(format!("row: {e}")))?;
+            let document_id = document
+                .get_str("_id")
+                .map(str::to_string)
+                .map_err(|e| SlcError::Storage(format!("metadata projection id: {e}")))?;
+            let category_raw = document
+                .get_str("category")
+                .map_err(|e| SlcError::Storage(format!("metadata projection category: {e}")))?;
+            let category =
+                crate::model::DocumentCategory::parse(category_raw).ok_or_else(|| {
+                    SlcError::Storage(format!(
+                        "invalid category {category_raw} in metadata projection for {document_id}"
+                    ))
+                })?;
+            let seat_id = document.get_str("seat_id").ok().map(str::to_string);
+            let metadata_extra = document
+                .get_document("metadata")
+                .ok()
+                .cloned()
+                .map(|metadata| bson::deserialize_from_document::<crate::model::DocMeta>(metadata))
+                .transpose()
+                .map_err(|e| SlcError::Storage(format!("metadata projection decode: {e}")))?
+                .unwrap_or_default()
+                .extra;
+            out.push(KbMetadataProjection {
+                document_id,
+                category,
+                seat_id,
+                metadata_extra,
+            });
         }
         Ok(out)
     }

@@ -24,7 +24,7 @@ use crate::model::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::{collections::BTreeMap, sync::Arc};
 
 /// Filter for document queries — typed subset the engine actually uses.
@@ -111,6 +111,16 @@ pub struct MetaPatch {
     pub set_compression_batch_id: Option<String>,
 }
 
+/// Compact KB projection for scans that only need identity and metadata.
+/// Avoids cloning or transferring document bodies, tags, and dependency lists.
+#[derive(Debug, Clone)]
+pub struct KbMetadataProjection {
+    pub document_id: String,
+    pub category: DocumentCategory,
+    pub seat_id: Option<String>,
+    pub metadata_extra: Map<String, Value>,
+}
+
 /// The engine's storage contract. [`sqlite::SqliteStore`] is the embedded
 /// default (used by both the standalone binary and the app-embedded static
 /// lib).
@@ -161,6 +171,36 @@ pub trait StorageBackend: Send + Sync {
         sort: &DocSort,
         limit: usize,
     ) -> SlcResult<Vec<Document>>;
+    /// Return every matching KB document. The compatibility default preserves
+    /// the pre-existing `kb_find(..., usize::MAX)` convention for downstream
+    /// backends; built-in backends override it with native unbounded queries.
+    async fn kb_find_unbounded(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> SlcResult<Vec<Document>> {
+        self.kb_find(filter, sort, usize::MAX).await
+    }
+    /// Return every matching KB identity/metadata projection. The compatibility
+    /// default derives it from [`StorageBackend::kb_find_unbounded`]; built-in
+    /// backends override it to avoid loading document bodies.
+    async fn kb_find_metadata_unbounded(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> SlcResult<Vec<KbMetadataProjection>> {
+        Ok(self
+            .kb_find_unbounded(filter, sort)
+            .await?
+            .into_iter()
+            .map(|document| KbMetadataProjection {
+                document_id: document.document_id,
+                category: document.category,
+                seat_id: document.seat_id,
+                metadata_extra: document.metadata.extra,
+            })
+            .collect())
+    }
     async fn kb_count(&self, filter: &DocFilter) -> SlcResult<u64>;
     /// Apply a metadata patch to all matching KB docs.
     async fn kb_patch_meta(&self, filter: &DocFilter, patch: &MetaPatch) -> SlcResult<usize>;
@@ -289,6 +329,20 @@ impl StorageBackend for Arc<dyn StorageBackend> {
         limit: usize,
     ) -> SlcResult<Vec<Document>> {
         self.as_ref().kb_find(filter, sort, limit).await
+    }
+    async fn kb_find_unbounded(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> SlcResult<Vec<Document>> {
+        self.as_ref().kb_find_unbounded(filter, sort).await
+    }
+    async fn kb_find_metadata_unbounded(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> SlcResult<Vec<KbMetadataProjection>> {
+        self.as_ref().kb_find_metadata_unbounded(filter, sort).await
     }
     async fn kb_count(&self, filter: &DocFilter) -> SlcResult<u64> {
         self.as_ref().kb_count(filter).await
@@ -436,5 +490,210 @@ impl StorageBackend for Arc<dyn StorageBackend> {
 
     async fn close(&self) -> SlcResult<()> {
         self.as_ref().close().await
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use crate::model::DocMeta;
+    use sqlite::SqliteStore;
+
+    /// Models a downstream backend written against the previous trait surface:
+    /// every old required method is present, while the two new unbounded methods
+    /// are deliberately omitted so their defaults must compile and run.
+    struct LegacyBackend(SqliteStore);
+
+    #[async_trait]
+    impl StorageBackend for LegacyBackend {
+        async fn kb_insert(&self, doc: &Document) -> SlcResult<()> {
+            self.0.kb_insert(doc).await
+        }
+        async fn kb_get(&self, document_id: &str) -> SlcResult<Option<Document>> {
+            self.0.kb_get(document_id).await
+        }
+        async fn kb_update_content(&self, document_id: &str, content: &str) -> SlcResult<bool> {
+            self.0.kb_update_content(document_id, content).await
+        }
+        async fn kb_upsert(&self, doc: &Document) -> SlcResult<bool> {
+            self.0.kb_upsert(doc).await
+        }
+        async fn kb_replace(&self, doc: &Document) -> SlcResult<bool> {
+            self.0.kb_replace(doc).await
+        }
+        async fn kb_find(
+            &self,
+            filter: &DocFilter,
+            sort: &DocSort,
+            limit: usize,
+        ) -> SlcResult<Vec<Document>> {
+            self.0.kb_find(filter, sort, limit).await
+        }
+        async fn kb_count(&self, filter: &DocFilter) -> SlcResult<u64> {
+            self.0.kb_count(filter).await
+        }
+        async fn kb_patch_meta(&self, filter: &DocFilter, patch: &MetaPatch) -> SlcResult<usize> {
+            self.0.kb_patch_meta(filter, patch).await
+        }
+        async fn kb_soft_delete(&self, document_id: &str) -> SlcResult<bool> {
+            self.0.kb_soft_delete(document_id).await
+        }
+        async fn kb_restore(&self, document_id: &str) -> SlcResult<bool> {
+            self.0.kb_restore(document_id).await
+        }
+        async fn kb_purge(&self, document_id: &str) -> SlcResult<bool> {
+            self.0.kb_purge(document_id).await
+        }
+        async fn kb_graveyard(&self, days: Option<i64>) -> SlcResult<Vec<Document>> {
+            self.0.kb_graveyard(days).await
+        }
+        async fn kb_cleanup_graveyard(&self, days: i64) -> SlcResult<u64> {
+            self.0.kb_cleanup_graveyard(days).await
+        }
+        async fn episodic_insert(&self, doc: &Document) -> SlcResult<()> {
+            self.0.episodic_insert(doc).await
+        }
+        async fn episodic_upsert(&self, doc: &Document) -> SlcResult<bool> {
+            self.0.episodic_upsert(doc).await
+        }
+        async fn episodic_find(
+            &self,
+            filter: &DocFilter,
+            sort: &DocSort,
+            limit: usize,
+        ) -> SlcResult<Vec<Document>> {
+            self.0.episodic_find(filter, sort, limit).await
+        }
+        async fn episodic_count(&self, filter: &DocFilter) -> SlcResult<u64> {
+            self.0.episodic_count(filter).await
+        }
+        async fn episodic_patch_meta(
+            &self,
+            filter: &DocFilter,
+            patch: &MetaPatch,
+        ) -> SlcResult<usize> {
+            self.0.episodic_patch_meta(filter, patch).await
+        }
+        async fn episodic_purge(&self, document_id: &str) -> SlcResult<bool> {
+            self.0.episodic_purge(document_id).await
+        }
+        async fn insert_embeddings(&self, records: &[EmbeddingRecord]) -> SlcResult<()> {
+            self.0.insert_embeddings(records).await
+        }
+        async fn get_embedding(&self, document_id: &str) -> SlcResult<Option<Vec<f32>>> {
+            self.0.get_embedding(document_id).await
+        }
+        async fn get_all_chunks(&self, document_id: &str) -> SlcResult<Vec<EmbeddingRecord>> {
+            self.0.get_all_chunks(document_id).await
+        }
+        async fn all_embeddings(
+            &self,
+            scope: EmbeddingScope,
+            seat_id: Option<&str>,
+        ) -> SlcResult<Vec<EmbeddingRecord>> {
+            self.0.all_embeddings(scope, seat_id).await
+        }
+        async fn delete_embeddings(&self, document_id: &str) -> SlcResult<()> {
+            self.0.delete_embeddings(document_id).await
+        }
+        async fn insert_seat(&self, seat: &Seat) -> SlcResult<()> {
+            self.0.insert_seat(seat).await
+        }
+        async fn get_seat(&self, seat_id: &str) -> SlcResult<Option<Seat>> {
+            self.0.get_seat(seat_id).await
+        }
+        async fn list_active_seats(&self, limit: usize) -> SlcResult<Vec<Seat>> {
+            self.0.list_active_seats(limit).await
+        }
+        async fn touch_seat(&self, seat_id: &str) -> SlcResult<bool> {
+            self.0.touch_seat(seat_id).await
+        }
+        async fn set_seat_status(&self, seat_id: &str, status: SeatStatus) -> SlcResult<bool> {
+            self.0.set_seat_status(seat_id, status).await
+        }
+        async fn set_seat_active_task(&self, seat_id: &str, task_id: &str) -> SlcResult<bool> {
+            self.0.set_seat_active_task(seat_id, task_id).await
+        }
+        async fn set_seat_active_document(
+            &self,
+            seat_id: &str,
+            document_id: Option<&str>,
+        ) -> SlcResult<bool> {
+            self.0.set_seat_active_document(seat_id, document_id).await
+        }
+        async fn get_seat_active_document(&self, seat_id: &str) -> SlcResult<Option<String>> {
+            self.0.get_seat_active_document(seat_id).await
+        }
+        async fn incr_seat_stats(
+            &self,
+            seat_id: &str,
+            tool_name: &str,
+            tokens_used: i64,
+        ) -> SlcResult<bool> {
+            self.0
+                .incr_seat_stats(seat_id, tool_name, tokens_used)
+                .await
+        }
+        async fn insert_timer(&self, timer: &PersistedTimer) -> SlcResult<()> {
+            self.0.insert_timer(timer).await
+        }
+        async fn get_timer(&self, timer_id: &str) -> SlcResult<Option<PersistedTimer>> {
+            self.0.get_timer(timer_id).await
+        }
+        async fn active_timers(&self, seat_id: Option<&str>) -> SlcResult<Vec<PersistedTimer>> {
+            self.0.active_timers(seat_id).await
+        }
+        async fn set_timer_fired(&self, timer_id: &str, now: DateTime<Utc>) -> SlcResult<()> {
+            self.0.set_timer_fired(timer_id, now).await
+        }
+        async fn put_record(&self, collection: &str, key: &str, value: &Value) -> SlcResult<()> {
+            self.0.put_record(collection, key, value).await
+        }
+        async fn get_record(&self, collection: &str, key: &str) -> SlcResult<Option<Value>> {
+            self.0.get_record(collection, key).await
+        }
+        async fn delete_record(&self, collection: &str, key: &str) -> SlcResult<bool> {
+            self.0.delete_record(collection, key).await
+        }
+        async fn list_records(&self, collection: &str) -> SlcResult<Vec<(String, Value)>> {
+            self.0.list_records(collection).await
+        }
+        async fn health_check(&self) -> bool {
+            self.0.health_check().await
+        }
+        async fn close(&self) -> SlcResult<()> {
+            self.0.close().await
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_backend_inherits_unbounded_query_defaults() {
+        let backend = LegacyBackend(SqliteStore::in_memory().unwrap());
+        let mut metadata = DocMeta::default();
+        metadata
+            .extra
+            .insert("marker".into(), Value::String("kept".into()));
+        let document = Document::new(
+            "legacy-default-query",
+            DocumentCategory::Documentation,
+            "body loaded only by the compatibility fallback",
+            metadata,
+            vec![],
+            Some("legacy-seat".into()),
+        );
+        backend.kb_insert(&document).await.unwrap();
+
+        let documents = backend
+            .kb_find_unbounded(&DocFilter::default(), &DocSort::default())
+            .await
+            .unwrap();
+        assert_eq!(documents.len(), 1);
+        let projections = backend
+            .kb_find_metadata_unbounded(&DocFilter::default(), &DocSort::default())
+            .await
+            .unwrap();
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].document_id, "legacy-default-query");
+        assert_eq!(projections[0].metadata_extra["marker"], "kept");
     }
 }
