@@ -441,6 +441,26 @@ pub struct Notification {
     pub delivered_at: Option<DateTime<Utc>>,
 }
 
+/// Upper bound of a *folder* path segment. Pure filesystem safety: user- and
+/// LLM-supplied project names become path components, so they stay short and
+/// ascii. Ids use [`ID_SLUG_MAX_CHARS`] instead — see `slug_name`.
+const SLUG_ASCII_MAX_CHARS: usize = 48;
+
+/// Upper bound of a generated *id* slug, in characters.
+///
+/// Ids are opaque keys, never re-derived: every lookup (`kb_get`, workflow
+/// events, `auto_load`, references) goes through the exact stored string. The
+/// bound therefore exists only so a pathological name cannot overflow a
+/// filesystem name limit (`safe_file_name` + `.md` must stay under 255 bytes),
+/// and it is deliberately far above any realistic human name so that a caller
+/// reconstructing the id from the name lands on the same bytes.
+///
+/// Migration safety: raising this bound cannot invalidate an existing id. Docs
+/// created before the change keep their 48-char prefix — that prefix is the
+/// real key and keeps resolving, including through `did_you_mean` prefix
+/// matching. Only newly created long-named objects get the full slug.
+pub const ID_SLUG_MAX_CHARS: usize = 200;
+
 /// Lowercase ascii slug (words joined with `_`, ≤48 chars); `None` when the
 /// result would be empty. Used for folder segments so user/LLM-supplied
 /// project names can never escape the intended tree.
@@ -454,7 +474,7 @@ pub fn slugify_ascii(raw: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("_");
-    let slug = slug.chars().take(48).collect::<String>();
+    let slug = slug.chars().take(SLUG_ASCII_MAX_CHARS).collect::<String>();
     if slug.is_empty() { None } else { Some(slug) }
 }
 
@@ -530,9 +550,19 @@ fn translit_char(c: char, upper: bool) -> Option<String> {
 }
 
 /// Human-readable slug from a name: Cyrillic transliteration, lowercase,
-/// non-letters → `_`, empty segments collapse, up to 48 characters. If the
-/// result is empty, `task`-style callers should use a unique_id instead.
+/// non-letters → `_`, empty segments collapse, capped at [`ID_SLUG_MAX_CHARS`].
+/// If the result is empty, `task`-style callers should use a unique_id instead.
 pub fn slug_name(raw: &str) -> String {
+    translit_fold(raw).chars().take(ID_SLUG_MAX_CHARS).collect()
+}
+
+/// The uncapped normalization behind [`slug_name`]: transliterate Cyrillic,
+/// lowercase, turn every non-letter into `_`, collapse and trim separator runs.
+///
+/// Exposed for id comparison (`idmatch`): a caller that holds a Cyrillic name
+/// and a stored Latin slug needs the exact fold the id generator applies, so
+/// the two strings can be compared without truncation.
+pub fn translit_fold(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
         if c.is_ascii_alphanumeric() {
@@ -543,11 +573,9 @@ pub fn slug_name(raw: &str) -> String {
             out.push('_');
         }
     }
-    let slug: String = out
-        .to_lowercase()
+    out.to_lowercase()
         .split('_')
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
-        .join("_");
-    slug.chars().take(48).collect()
+        .join("_")
 }

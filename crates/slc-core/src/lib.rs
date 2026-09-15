@@ -18,6 +18,7 @@ use serde_json::json;
 pub mod auth;
 pub mod error;
 pub mod focus;
+pub mod idmatch;
 pub mod llm;
 pub mod memory;
 pub mod migrate;

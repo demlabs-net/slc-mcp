@@ -532,7 +532,10 @@ async fn mcp_request(
             // malformed arguments, storage bootstrap) stay JSON-RPC errors.
             match call_tool(engine, &seat, name, &args, &state.events, pagination).await {
                 Ok(result) => Ok(result),
-                Err(error) if error.get("kind").is_some() => Ok(tool_error_result(name, &error)),
+                Err(error) if error.get("kind").is_some() => {
+                    let error = enrich_not_found(engine, &seat, name, &args, error).await;
+                    Ok(tool_error_result(name, &error))
+                }
                 Err(error) => Err(error),
             }
         }
@@ -587,7 +590,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_document",
-            "description": "Load a document by its unique name id. ВЫХОД ПАГИНИРУЕТСЯ для больших документов: при _pagination.has_more=true ОБЯЗАТЕЛЬНО выполни точную mcp__slc__get_page({...}) команду из самого конца ответа и повторяй до has_more=false. Части part k/n вместе дают полный content.",
+            "description": "Load a document by its unique name id. Id rule: pass document_id byte-for-byte as returned by list_documents/search/get_document; never rebuild it from a human name (a stored slug may be truncated or transliterated, so a rebuilt id points elsewhere). A not-found answer echoes the exact id you sent plus the closest existing ids. ВЫХОД ПАГИНИРУЕТСЯ для больших документов: при _pagination.has_more=true ОБЯЗАТЕЛЬНО выполни точную mcp__slc__get_page({...}) команду из самого конца ответа и повторяй до has_more=false. Части part k/n вместе дают полный content.",
             "inputSchema": {"type":"object","properties":{
                 "document_id": {"type":"string"}
             },"required":["document_id"]}
@@ -771,14 +774,14 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_task",
-            "description": "Read a task visible to the caller as its issuer, assignee, or authorized coordinator. MANAGER FULL ACCESS: a manager seat (operator role with an explicit target in SLC_SEAT_MANAGE_ACL) may read tasks of every managed seat, including workflow tasks in IN_WORK. Unknown task ids and missing rights are explicit application errors (isError=true).",
+            "description": "Read a task visible to the caller as its issuer, assignee, or authorized coordinator. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task; never rebuild it from a human name — a stored slug may be truncated or transliterated, so a rebuilt id points elsewhere. A not-found answer echoes the exact id you sent plus the closest existing ids. MANAGER FULL ACCESS: a manager seat (operator role with an explicit target in SLC_SEAT_MANAGE_ACL) may read tasks of every managed seat, including workflow tasks in IN_WORK. Unknown task ids and missing rights are explicit application errors (isError=true).",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"}
             },"required":["task_id"]}
         }),
         json!({
             "name": "start_task",
-            "description": "Start the ready FIFO head under the serialized workflow lock. Only the assignee may call it; queued tasks are rejected with their position instead of creating a parallel writer. Idempotent replay repairs an interrupted event/projection/active-anchor write. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "description": "Start the ready FIFO head under the serialized workflow lock. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task/reconcile_task_queue; never rebuild it from a human name. A not-found answer echoes the exact id you sent plus the closest existing ids. Only the assignee may call it; queued tasks are rejected with their position instead of creating a parallel writer. Idempotent replay repairs an interrupted event/projection/active-anchor write. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "message": {"type":"string","default":"Started"},
@@ -787,7 +790,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "report_task",
-            "description": "Append the assignee's durable task progress/terminal report and update SLC state. Only the assignee may report, and the task must already be running; coordinators cannot close a live executor lane and terminal reports cannot bypass the FIFO from ready/queued state. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task, but the response deliberately does not disclose that successor. Normally wake the issuer with delivery and end this executor run; the issuer reconciles and wakes the next head as a fresh run. Manager-issued leads_mass_redesign reports are the bounded polling exception: delivery is null and wake_recommended=false because the deterministic manager queue pump observes SLC directly, so do not send a duplicate manager message. Idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "description": "Append the assignee's durable task progress/terminal report and update SLC state. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task/start_task; never rebuild it from a human name. A not-found answer echoes the exact id you sent plus the closest existing ids. Only the assignee may report, and the task must already be running; coordinators cannot close a live executor lane and terminal reports cannot bypass the FIFO from ready/queued state. A terminal report releases the assignee lane and reconciliation promotes the oldest queued task, but the response deliberately does not disclose that successor. Normally wake the issuer with delivery and end this executor run; the issuer reconciles and wakes the next head as a fresh run. Manager-issued leads_mass_redesign reports are the bounded polling exception: delivery is null and wake_recommended=false because the deterministic manager queue pump observes SLC directly, so do not send a duplicate manager message. Idempotent replay repairs interrupted projection/active-anchor writes. Transports must not copy report content or infer task state. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "status": {"type":"string","enum":["in_progress","completed","blocked","failed"]},
@@ -798,7 +801,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "cancel_task",
-            "description": "Cancel a queued or ready workflow task without starting it. The issuer, assignee, or global coordinator may cancel. A running task cannot be cancelled here because SLC does not control the executor process; the assignee must report it, or the transport must first be stopped and the same task recovered. Cancellation appends an immutable SLC event, releases a ready reservation, and promotes the next FIFO item when necessary. The cancellation itself does not request a new agent run; only next_delivery may wake a newly promoted head.",
+            "description": "Cancel a queued or ready workflow task without starting it. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task; never rebuild it from a human name. A not-found answer echoes the exact id you sent plus the closest existing ids. The issuer, assignee, or global coordinator may cancel. A running task cannot be cancelled here because SLC does not control the executor process; the assignee must report it, or the transport must first be stopped and the same task recovered. Cancellation appends an immutable SLC event, releases a ready reservation, and promotes the next FIFO item when necessary. The cancellation itself does not request a new agent run; only next_delivery may wake a newly promoted head.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string","minLength":1},
                 "reason": {"type":"string","minLength":1},
@@ -808,7 +811,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "task_message",
-            "description": "Append a durable message to a task conversation. Recipient must be that task's issuer or assignee. The result includes a content-free wake envelope for an optional transport; the message body remains canonical only here. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
+            "description": "Append a durable message to a task conversation. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task/assign_task; never rebuild it from a human name (a stored slug may be truncated or transliterated). A not-found answer echoes the exact id you sent plus the closest existing ids. Recipient must be that task's issuer or assignee. The result includes a content-free wake envelope for an optional transport; the message body remains canonical only here. If a deferred bridge drops task_id after activate_task, the caller's active SLC task is used as an unambiguous fallback.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "recipient": {"type":"string"},
@@ -819,7 +822,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "list_task_events",
-            "description": "Read the immutable SLC event stream for a visible task: assignment, start, messages, progress, terminal reports, and authorized manager updates (update kind).",
+            "description": "Read the immutable SLC event stream for a visible task: assignment, start, messages, progress, terminal reports, and authorized manager updates (update kind). Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task; never rebuild it from a human name. A not-found answer echoes the exact id you sent plus the closest existing ids.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "limit": {"type":"number","default":100,"minimum":1,"maximum":500}
@@ -834,7 +837,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_task",
-            "description": "Update an existing task. Edit its body only through ordered diff operations: append, prepend, replace_section, or remove_section by markdown heading. MANAGER FULL ACCESS: a manager seat (operator role with an explicit target in SLC_SEAT_MANAGE_ACL) may update tasks of every managed seat, including workflow tasks that are IN_WORK — such updates are persisted canonically through the workflow event store (a durable update audit event is appended, nothing is silently dropped) and the task projection is refreshed. Task owners and non-managers keep the append-only workflow contract: they edit workflow tasks through task_message/report_task/cancel_task. Workflow task status stays event-governed (start_task/report_task/cancel_task); pass status only for legacy (non-workflow) tasks. Application errors (unknown task, missing rights, workflow conflicts) come back with isError=true and an actionable Russian message.",
+            "description": "Update an existing task. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task; never rebuild it from a human name (a stored slug may be truncated or transliterated). A not-found answer echoes the exact id you sent plus the closest existing ids. Edit its body only through ordered diff operations: append, prepend, replace_section, or remove_section by markdown heading. MANAGER FULL ACCESS: a manager seat (operator role with an explicit target in SLC_SEAT_MANAGE_ACL) may update tasks of every managed seat, including workflow tasks that are IN_WORK — such updates are persisted canonically through the workflow event store (a durable update audit event is appended, nothing is silently dropped) and the task projection is refreshed. Task owners and non-managers keep the append-only workflow contract: they edit workflow tasks through task_message/report_task/cancel_task. Workflow task status stays event-governed (start_task/report_task/cancel_task); pass status only for legacy (non-workflow) tasks. Application errors (unknown task, missing rights, workflow conflicts) come back with isError=true and an actionable Russian message.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"},
                 "name": {"type":"string"},
@@ -851,7 +854,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "delete_task",
-            "description": "Delete a task. The owner may delete its own legacy (non-workflow) tasks; MANAGER FULL ACCESS: a manager seat (operator role with an explicit target in SLC_SEAT_MANAGE_ACL) may delete legacy tasks of every managed seat. Workflow tasks are never deleted — their event history is preserved (explicit error); missing rights and unknown ids never masquerade as each other.",
+            "description": "Delete a task. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task; never rebuild it from a human name. The owner may delete its own legacy (non-workflow) tasks; MANAGER FULL ACCESS: a manager seat (operator role with an explicit target in SLC_SEAT_MANAGE_ACL) may delete legacy tasks of every managed seat. Workflow tasks are never deleted — their event history is preserved (explicit error); missing rights and unknown ids never masquerade as each other.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string"}
             },"required":["task_id"]}
@@ -1051,7 +1054,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_document",
-            "description": "Update an existing document. Edit its body only through ordered diff operations; update other fields through patch.",
+            "description": "Update an existing document. Id rule: pass document_id byte-for-byte as returned by list_documents/get_document; never rebuild it from a human name. Edit its body only through ordered diff operations; update other fields through patch.",
             "inputSchema": {"type":"object","properties":{
                 "document_id": {"type":"string"},
                 "diff": {"type":"array","items":{"type":"object","properties":{
@@ -1253,6 +1256,15 @@ and lifecycle save.
 3. **Represent ongoing work as documents.** Use `create_project`, `create_task`,
    or `add_document` for new work. A skill is a document with `category=skill`.
    Generated IDs are slugs without redundant `task_` or `project_` prefixes.
+   **ID rule (applies to every id, for every tool): an SLC id is an opaque key.
+   Copy it byte-for-byte out of the `list_*`/`get_*`/`assign_*` response that
+   returned it; never rebuild it from a human name, a title, or a description,
+   and never retype it from memory.** A stored slug may be truncated, may be a
+   transliteration of a Cyrillic name, and may carry a `_2` collision suffix, so
+   a reconstructed id silently points at nothing. If a lookup misses, the error
+   already echoes the exact id you sent together with the closest existing ids:
+   pick one of those verbatim, and never treat the hint as permission to guess
+   — a wrong id in a write (update/delete/report) is a lost update, not a retry.
    Canonical task statuses are `PENDING`, `IN_WORK`, `COMPLETED`, `BLOCKED`,
    `FAILED`, and `CANCELLED`. Supply `project_id` when a task belongs to a project.
    Delegated work uses `assign_task`: SLC appends it to the assignee's FIFO and
@@ -2045,7 +2057,15 @@ async fn call_tool(
                 Some(d) if engine.can_read_document(seat_id, &d) => {
                     json!({"document_id": d.document_id, "category": d.category.as_str(), "folder": d.folder, "content": d.content, "tags": d.tags, "metadata": d.metadata, "seat_id": d.seat_id, "auto_load": d.auto_load, "references": d.references, "created_at": d.created_at.to_rfc3339(), "updated_at": d.updated_at.to_rfc3339()})
                 }
-                _ => json!({"error": format!("not found: {id}")}),
+                // A typed not-found (not a success body carrying `error`) so the
+                // caller gets an actionable, self-correcting answer.
+                _ => {
+                    return Err(json!({
+                        "code": -32004,
+                        "kind": "not_found",
+                        "message": format!("document not found: {id}")
+                    }));
+                }
             }
         }
         "add_document" => {
@@ -3815,6 +3835,127 @@ fn pagination_followup_instruction(pagination: &Value) -> Option<String> {
     })
 }
 
+/// Argument names that carry an object id, most specific first. Used to recover
+/// the id a caller actually sent when a lookup misses.
+const ID_ARGUMENTS: &[&str] = &[
+    "document_id",
+    "task_id",
+    "project_id",
+    "focus_id",
+    "reminder_id",
+    "event_id",
+    "response_id",
+    "new_document_id",
+];
+
+/// Tools whose id argument names a task. Only used to prefer task ids in the
+/// suggestion list — never to hide a real document with the same id.
+fn task_scoped_id_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "get_task"
+            | "update_task"
+            | "delete_task"
+            | "activate_task"
+            | "start_task"
+            | "report_task"
+            | "cancel_task"
+            | "task_message"
+            | "list_task_events"
+    )
+}
+
+/// Upper bound on the ids scanned when building a suggestion list. The vault is
+/// a few thousand notes; the scan is bounded so a miss cannot become an
+/// expensive call.
+const DID_YOU_MEAN_SCAN_LIMIT: usize = 2000;
+
+/// Make a `not_found` answer self-correcting.
+///
+/// The failure mode this closes: an agent reads `{"task_id": …, "name": …}`,
+/// later rebuilds the id from the human *name* (or retypes it with homoglyphs),
+/// and gets a bare "not found" — so it guesses again until its client gives up
+/// and declares SLC unreachable. Here the answer always echoes the exact id the
+/// caller sent, plus the closest ids that actually exist, and never leaks an id
+/// the seat cannot read.
+async fn enrich_not_found(
+    engine: &SlcEngine,
+    seat_id: &str,
+    tool: &str,
+    args: &Value,
+    mut error: Value,
+) -> Value {
+    if error.get("kind").and_then(Value::as_str) != Some("not_found") {
+        return error;
+    }
+    let Some(requested) = ID_ARGUMENTS
+        .iter()
+        .find_map(|argument| args.get(*argument).and_then(Value::as_str))
+        .filter(|id| !id.is_empty())
+    else {
+        return error;
+    };
+    // Only ids the seat may already see can become suggestions (public docs or
+    // its own); `visible_to` is the same filter list_documents uses.
+    let filter = DocFilter {
+        visible_to: Some(seat_id.to_string()),
+        ..Default::default()
+    };
+    let docs = match engine
+        .store()
+        .kb_find(
+            &filter,
+            &DocSort::by_updated(SortDir::Desc),
+            DID_YOU_MEAN_SCAN_LIMIT,
+        )
+        .await
+    {
+        Ok(docs) => docs,
+        // A suggestion list is a courtesy: a failed scan must not replace the
+        // original, accurate error.
+        Err(scan_error) => {
+            tracing::debug!("did-you-mean scan failed: {scan_error}");
+            return error;
+        }
+    };
+    let mut ids: Vec<String> = docs.iter().map(|doc| doc.document_id.clone()).collect();
+    if task_scoped_id_tool(tool) {
+        let tasks: Vec<String> = docs
+            .iter()
+            .filter(|doc| doc.category == DocumentCategory::Task)
+            .map(|doc| doc.document_id.clone())
+            .collect();
+        if !tasks.is_empty() {
+            ids = tasks;
+        }
+    }
+    let suggestions =
+        slc_core::idmatch::did_you_mean(requested, &ids, slc_core::idmatch::DID_YOU_MEAN_LIMIT);
+
+    // (b) The id the caller sent is always echoed back verbatim, even when no
+    // suggestion exists, so a truncated or homoglyph id is visible as such.
+    let mut message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if !message.contains(requested) {
+        message = format!("{message} (переданный id: {requested})");
+    }
+    if !suggestions.is_empty() {
+        // (b) The stored id is returned exactly as it is persisted — never a
+        // re-derived or re-truncated form.
+        message.push_str(&format!(
+            "\nВозможно, вы имели в виду существующий id: {}",
+            suggestions.join(", ")
+        ));
+    }
+    error["requested_id"] = json!(requested);
+    error["did_you_mean"] = json!(suggestions);
+    error["message"] = json!(message);
+    error
+}
+
 fn json_err(e: slc_core::SlcError) -> Value {
     use slc_core::SlcError;
     let (code, kind) = match &e {
@@ -3865,7 +4006,11 @@ fn ru_error_text(tool: &str, kind: &str, message: &str) -> String {
             "Не найдено ({tool}): {message}\n\
              Действие: проверьте идентификатор — для задач get_task/list_tasks, для документов \
              get_document/list_documents. Если объект существует под другим id, передавайте \
-             фактический id."
+             фактический id.\n\
+             Правило id: id — это непрозрачный ключ. Копируйте его БАЙТ-В-БАЙТ из ответа \
+             list/get и не восстанавливайте из человеческого имени: слаг мог быть усечён, \
+             а имя — транслитерировано или переписано похожими буквами, поэтому \
+             реконструкция по имени попадает в другой id."
         ),
         "invalid_input" if message.contains("workflow") || message.contains("append-only") => {
             format!(
@@ -4892,6 +5037,153 @@ mod seat_filter_tests {
         // A generic error without a kind stays JSON-RPC (not converted).
         let generic = json!({"code": -32602, "message": "bad arguments"});
         assert!(generic.get("kind").is_none());
+    }
+
+    /// The 2026-09-15 incident: an executor rebuilt a task id from the human
+    /// name, the lookup missed, and the client's breaker read the retries as
+    /// "SLC unreachable" and blocked every write. Long ids must survive the
+    /// round trip, and a rebuilt id must answer with the exact stored bytes.
+    #[tokio::test]
+    async fn long_ids_round_trip_and_a_rebuilt_id_answers_with_the_exact_stored_id() {
+        let engine = swarm_engine().await;
+        // 52 characters: longer than the old 48-char slug cap that started it.
+        let name = "diag_disposable_contactor_roy1_probe_20260915t042530";
+        let created = tool_json(
+            &engine,
+            "seat-contactor",
+            "create_task",
+            json!({"name": name}),
+        )
+        .await;
+        let stored = created["task_id"].as_str().expect("task_id").to_string();
+        assert_eq!(
+            stored, name,
+            "the id must be the whole slug, not a truncated prefix"
+        );
+
+        // get_task returns the exact stored id, byte-for-byte.
+        let fetched = tool_json(
+            &engine,
+            "seat-contactor",
+            "get_task",
+            json!({"task_id": stored.clone()}),
+        )
+        .await;
+        assert_eq!(fetched["task"]["task_id"], stored.as_str());
+
+        // list_tasks returns the same exact id (never a shortened form).
+        let listed = tool_json(
+            &engine,
+            "seat-manager",
+            "list_tasks",
+            json!({"target_seat": "seat-contactor"}),
+        )
+        .await;
+        let listed_ids: Vec<&str> = listed["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .filter_map(|task| task["task_id"].as_str())
+            .collect();
+        assert!(listed_ids.contains(&stored.as_str()), "{listed_ids:?}");
+
+        // The caller's rebuilt id: homoglyphs plus the old truncation.
+        let rebuilt = "diag_disposаble_cоntactоr_roy1_probe_20260915t04";
+        assert_ne!(rebuilt, stored);
+        let args = json!({"task_id": rebuilt});
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let error = call_tool(
+            &engine,
+            "seat-contactor",
+            "update_task",
+            &args,
+            &events,
+            tool_policy(),
+        )
+        .await
+        .expect_err("a rebuilt id must not resolve");
+        assert_eq!(error["kind"], "not_found");
+
+        let error = enrich_not_found(&engine, "seat-contactor", "update_task", &args, error).await;
+        // The exact bytes the caller sent are echoed, and the exact stored id
+        // is offered as the way out.
+        assert_eq!(error["requested_id"], rebuilt);
+        assert_eq!(error["did_you_mean"], json!([stored.as_str()]));
+
+        let rendered = tool_error_result("update_task", &error);
+        assert_eq!(rendered["isError"], true);
+        let text = rendered["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(rebuilt), "{text}");
+        assert!(text.contains(&stored), "{text}");
+        assert!(text.contains("БАЙТ-В-БАЙТ"), "{text}");
+
+        // A genuinely unknown id gets the rule but no invented suggestion —
+        // the list is a hint, never a guess.
+        let args = json!({"task_id": "no_such_id_at_all_zzz"});
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let error = call_tool(
+            &engine,
+            "seat-contactor",
+            "update_task",
+            &args,
+            &events,
+            tool_policy(),
+        )
+        .await
+        .expect_err("unknown ids must not resolve");
+        let error = enrich_not_found(&engine, "seat-contactor", "update_task", &args, error).await;
+        assert_eq!(error["requested_id"], "no_such_id_at_all_zzz");
+        assert_eq!(error["did_you_mean"], json!([]));
+    }
+
+    /// A not-found for a document id answers the same way as a task id.
+    #[tokio::test]
+    async fn missing_document_id_is_a_typed_not_found_with_the_exact_stored_id() {
+        let engine = swarm_engine().await;
+        let long_id = "docs_custom_marker_for_the_id_losslessness_regression_20260915t042530";
+        tool_json(
+            &engine,
+            "seat-contactor",
+            "add_document",
+            json!({"document_id": long_id, "category": "custom", "content": "marker"}),
+        )
+        .await;
+
+        let fetched = tool_json(
+            &engine,
+            "seat-contactor",
+            "get_document",
+            json!({"document_id": long_id}),
+        )
+        .await;
+        assert_eq!(fetched["document_id"], long_id);
+
+        // A truncated request echoes back as a typed not_found and lists the
+        // exact stored id.
+        let truncated: String = long_id.chars().take(48).collect();
+        let truncated = truncated.as_str();
+        let args = json!({"document_id": truncated});
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let error = call_tool(
+            &engine,
+            "seat-contactor",
+            "get_document",
+            &args,
+            &events,
+            tool_policy(),
+        )
+        .await
+        .expect_err("a truncated id must not resolve");
+        assert_eq!(error["kind"], "not_found");
+        assert_eq!(error["message"], format!("document not found: {truncated}"));
+
+        let error = enrich_not_found(&engine, "seat-contactor", "get_document", &args, error).await;
+        assert_eq!(error["did_you_mean"], json!([long_id]));
+        let text = tool_error_result("get_document", &error)["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains(long_id), "{text}");
     }
 
     /// Engine helper — the manager swarm over the contactor/analyst.
