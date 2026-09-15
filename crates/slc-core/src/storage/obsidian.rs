@@ -1476,6 +1476,28 @@ impl StorageBackend for ObsidianVaultStore {
             index.insert(new_id.to_string(), e);
             true
         };
+        if renamed {
+            // The note carries the id in its frontmatter (`render_doc`), so the
+            // file move alone leaves `id: <old>` inside the note: the next index
+            // rebuild — a restart, the engine's `refresh`, any other service
+            // sharing the vault — would re-register the OLD id and resolve it to
+            // a path that no longer exists. Rewrite the moved note under its new
+            // id; the rename stays a move, not an edit (version/updated_at are
+            // carried over untouched).
+            let entry = self.index.lock().unwrap().get(new_id).cloned();
+            if let Some(mut entry) = entry {
+                // The moved file is named after the new id, never after the
+                // previous entry's file name.
+                entry.file_name = None;
+                let mut doc = self.read_note(&entry)?;
+                doc.document_id = new_id.to_string();
+                let path = self
+                    .root
+                    .join(sanitize_folder(&entry.folder)?)
+                    .join(format!("{}.md", safe_file_name(new_id)));
+                self.atomic_write(&path, render_doc(&doc)?.as_bytes())?;
+            }
+        }
         self.persist_index()?;
         self.git_commit();
         Ok(renamed)
@@ -1999,6 +2021,18 @@ mod tests {
         git(root, &["rev-list", "--count", "HEAD"])
             .parse()
             .expect("rev-list count")
+    }
+
+    /// A plain public KB document in the vault root.
+    fn doc_for(id: &str) -> Document {
+        Document::new(
+            id,
+            DocumentCategory::Documentation,
+            format!("body of {id}"),
+            DocMeta::default(),
+            vec![],
+            None,
+        )
     }
 
     /// A long id must survive the filesystem, the note frontmatter, and an
@@ -2637,6 +2671,97 @@ mod tests {
         assert!(ignored.lines().any(|line| line == "core"));
         assert_eq!(ignored.matches("/.slc/index.json").count(), 1);
         assert_eq!(ignored.matches("/.slc/embeddings.json").count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `refresh` has a default body (a no-op) in the trait, so a delegation that
+    /// forgets to forward it turns the multi-process sync into a silent no-op:
+    /// the engine's periodic `SLC_VAULT_REFRESH_SECS` loop and `SlcEngine::refresh`
+    /// both go through `Arc<dyn StorageBackend>`. Two stores on one vault are
+    /// exactly the deployment this exists for (the MCP service and the web UI
+    /// share the vault; files are the source of truth).
+    #[tokio::test]
+    async fn multi_process_refresh_survives_the_dyn_delegation_the_engine_uses() {
+        let root = tmp_vault("refresh-dyn-delegation");
+        let store = std::sync::Arc::new(ObsidianVaultStore::open(&root, false).unwrap());
+        // The exact handle shape `SlcEngine` stores.
+        let dynamic: std::sync::Arc<dyn StorageBackend> = store.clone();
+
+        // Another service sharing the vault writes a note.
+        let other = ObsidianVaultStore::open(&root, false).unwrap();
+        other.kb_insert(&doc_for("refresh-foreign")).await.unwrap();
+        assert!(
+            dynamic.kb_get("refresh-foreign").await.unwrap().is_none(),
+            "the stale index must not see the foreign write before the resync"
+        );
+
+        dynamic.refresh().await.unwrap();
+
+        assert!(
+            dynamic.kb_get("refresh-foreign").await.unwrap().is_some(),
+            "refresh must re-read the shared vault through Arc<dyn StorageBackend>"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The storage-level rename must stay the atomic index/file move: the
+    /// default body is `kb_get` + `kb_insert` + `kb_purge`, which rewrites the
+    /// note, bumps `version`/`updated_at` (so a rename shows up as an edit in
+    /// every `by_updated` listing) and is not atomic.
+    ///
+    /// The moved note's frontmatter id is part of the same contract: the vault
+    /// files are the source of truth, so a note left with `id: <old>` is
+    /// re-registered under the old id (and resolved to a path that no longer
+    /// exists) by the next index rebuild.
+    #[tokio::test]
+    async fn rename_through_the_dyn_delegation_does_not_rewrite_the_note() {
+        let root = tmp_vault("rename-dyn-delegation");
+        let store = std::sync::Arc::new(ObsidianVaultStore::open(&root, false).unwrap());
+        let dynamic: std::sync::Arc<dyn StorageBackend> = store.clone();
+
+        let before = doc_for("rename-source");
+        dynamic.kb_insert(&before).await.unwrap();
+
+        assert!(
+            dynamic
+                .kb_rename("rename-source", "rename-target")
+                .await
+                .unwrap()
+        );
+
+        let after = dynamic
+            .kb_get("rename-target")
+            .await
+            .unwrap()
+            .expect("the note must exist under the new id");
+        assert_eq!(
+            after.document_id, "rename-target",
+            "the moved note must carry its new id in the frontmatter"
+        );
+        assert_eq!(
+            after.version, before.version,
+            "an atomic rename must not bump the document version"
+        );
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "an atomic rename must not make the document look freshly edited"
+        );
+        assert!(dynamic.kb_get("rename-source").await.unwrap().is_none());
+        assert!(
+            !root.join("rename-source.md").exists(),
+            "the old note file must be gone after the rename"
+        );
+
+        // A rescan (restart / the engine's periodic refresh / another service)
+        // must still resolve the document under its new id.
+        let rescan = ObsidianVaultStore::open(&root, false).unwrap();
+        assert!(
+            rescan.kb_get("rename-target").await.unwrap().is_some(),
+            "the rename must survive an index rebuild"
+        );
+        assert!(rescan.kb_get("rename-source").await.unwrap().is_none());
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }
