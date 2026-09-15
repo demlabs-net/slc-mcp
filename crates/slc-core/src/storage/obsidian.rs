@@ -43,6 +43,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GIT_INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const GIT_COMMIT_DEBOUNCE: Duration = Duration::from_secs(5);
+/// Poll interval while a shutdown flush waits for the coalesced snapshot
+/// worker. Only the shutdown path pays for it.
+const FLUSH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const GIT_MAINTENANCE_CHECK_INTERVAL: u64 = 16;
 const GIT_MAINTENANCE_LOOSE_OBJECT_LIMIT: u64 = 1024;
 const GIT_MAINTENANCE_LOOSE_KIB_LIMIT: u64 = 128 * 1024;
@@ -204,6 +207,28 @@ pub enum VaultPush {
     /// `git push` ran and succeeded.
     Pushed,
     /// `git push` ran and failed (stderr kept for the debug line).
+    Failed(String),
+}
+
+/// How a shutdown-time flush of the coalesced snapshot ended. Reported so the
+/// shutdown path can log a truthful outcome instead of guessing, and so tests
+/// can tell "nothing was pending" from "the worker finished it for us".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaultFlush {
+    /// Auto-commit is off, or no write was pending: nothing to flush.
+    Idle,
+    /// The coalesced worker was still busy when the bound elapsed. The flush
+    /// deliberately starts no second snapshot — the in-flight worker owns the
+    /// repository. Whatever it snapshots on its own is complete; the wait was
+    /// simply shorter than its debounce.
+    WorkerBusy,
+    /// The worker was still running, but finished its own pass inside the
+    /// bound; the pending writes are in the repository.
+    DrainedByWorker,
+    /// The flush owned the dirty flag and ran the final snapshot itself.
+    Committed(VaultPush),
+    /// The snapshot task itself failed to run (the Git process could not be
+    /// started at all, not a Git failure — that is reported by [`VaultPush`]).
     Failed(String),
 }
 
@@ -1118,6 +1143,47 @@ impl ObsidianVaultStore {
             }
         });
     }
+
+    /// Flush a pending vault snapshot before the process exits — bounded.
+    ///
+    /// At shutdown the coalesced worker may be inside `git add -A`/`git commit`
+    /// or still in its debounce sleep. Killing the process on top of it is what
+    /// leaves orphan loose objects and quarantined `index.lock` files in the
+    /// vault, so this waits for the worker instead of racing it:
+    ///
+    /// - no worker running → take the dirty flag and run the final snapshot
+    ///   synchronously ([`VaultFlush::Committed`]);
+    /// - worker running → wait up to `wait` for its own pass to finish, which
+    ///   covers every write marked dirty so far ([`VaultFlush::DrainedByWorker`]);
+    /// - worker still running at the deadline → start nothing
+    ///   ([`VaultFlush::WorkerBusy`]): a second `git add -A` next to a live one
+    ///   would fight over `index.lock`.
+    pub async fn flush_pending_commit(&self, wait: Duration) -> VaultFlush {
+        if !self.auto_git_commit {
+            return VaultFlush::Idle;
+        }
+        if self.git_commit_worker_active.load(Ordering::Acquire) {
+            let deadline = tokio::time::Instant::now() + wait;
+            while self.git_commit_worker_active.load(Ordering::Acquire) {
+                if tokio::time::Instant::now() >= deadline {
+                    return VaultFlush::WorkerBusy;
+                }
+                tokio::time::sleep(FLUSH_POLL_INTERVAL).await;
+            }
+            return VaultFlush::DrainedByWorker;
+        }
+        // No worker: the flush owns the repository. Clearing the flag first
+        // means a write arriving now re-arms the worker for a normal pass.
+        if !self.git_commit_dirty.swap(false, Ordering::AcqRel) {
+            return VaultFlush::Idle;
+        }
+        let root = self.root.clone();
+        let author = self.git_author.clone();
+        match tokio::task::spawn_blocking(move || run_vault_git_commit(&root, &author)).await {
+            Ok(push) => VaultFlush::Committed(push),
+            Err(error) => VaultFlush::Failed(error.to_string()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1795,6 +1861,35 @@ impl StorageBackend for ObsidianVaultStore {
     async fn close(&self) -> SlcResult<()> {
         Ok(())
     }
+
+    /// See [`ObsidianVaultStore::flush_pending_commit`]: the shutdown path must
+    /// not exit on top of the coalesced Git worker (that is what leaves orphan
+    /// objects in the vault), but it must also never hang — the bound is
+    /// honoured and the outcome is logged for the operator.
+    async fn flush_pending(&self, wait: Duration) -> SlcResult<()> {
+        match self.flush_pending_commit(wait).await {
+            VaultFlush::Idle => Ok(()),
+            VaultFlush::Committed(push) => {
+                tracing::info!("vault flush: pending snapshot committed ({push:?})");
+                Ok(())
+            }
+            VaultFlush::DrainedByWorker => {
+                tracing::info!("vault flush: coalesced worker finished the pending snapshot");
+                Ok(())
+            }
+            VaultFlush::WorkerBusy => {
+                tracing::warn!(
+                    "vault flush: coalesced snapshot worker still running after {wait:?}; \
+                     leaving the in-flight snapshot to finish"
+                );
+                Ok(())
+            }
+            VaultFlush::Failed(error) => {
+                tracing::warn!("vault flush failed: {error}");
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2301,6 +2396,161 @@ mod tests {
 
         assert!(!finish_git_commit_worker(&dirty, &worker_active));
         assert!(!worker_active.load(Ordering::Acquire));
+    }
+
+    /// The shutdown defect: the server was SIGKILLed while a vault snapshot was
+    /// still pending, which is what leaves orphan objects in `.git`. A pending
+    /// write that the coalesced worker has not picked up yet must be committed
+    /// by the flush itself — synchronously, before the process exits.
+    #[tokio::test]
+    async fn shutdown_flush_commits_a_snapshot_the_worker_has_not_started() {
+        let root = git_vault("flush-owns-flag");
+        let store = ObsidianVaultStore::open(&root, true).unwrap();
+        // The state the shutdown path must resolve: a write is pending, no
+        // worker is running. (Set directly instead of through the write path:
+        // after a real write the worker is always active immediately, which is
+        // the other test below.)
+        std::fs::write(root.join("marker.md"), "pending\n").unwrap();
+        store.git_commit_dirty.store(true, Ordering::Release);
+        assert!(!store.git_commit_worker_active.load(Ordering::Acquire));
+
+        let outcome = store.flush_pending_commit(Duration::from_secs(10)).await;
+        assert_eq!(
+            outcome,
+            VaultFlush::Committed(VaultPush::SkippedNoRemote),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            commit_count(&root),
+            1,
+            "the pending write must reach the repository before exit"
+        );
+        assert_eq!(
+            git(&root, &["status", "--porcelain"]),
+            "",
+            "no uncommitted work may be left behind"
+        );
+        assert!(
+            !root.join(".git/index.lock").exists(),
+            "the flush may not leave a lock behind"
+        );
+
+        // Nothing is pending any more: a second flush is idle and must not
+        // manufacture an empty commit.
+        let again = store.flush_pending_commit(Duration::from_millis(50)).await;
+        assert_eq!(again, VaultFlush::Idle, "{again:?}");
+        assert_eq!(commit_count(&root), 1);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A shutdown that lands inside the coalesced worker's debounce window must
+    /// wait for that worker, not start a second `git add -A` beside it: two Git
+    /// writers fighting over `index.lock` is exactly how the residue appears.
+    #[tokio::test]
+    async fn shutdown_flush_waits_for_the_coalesced_worker_instead_of_racing_it() {
+        let root = git_vault("flush-worker");
+        std::fs::write(root.join("marker.md"), "initial\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "initial"]);
+        assert_eq!(commit_count(&root), 1);
+
+        let store = ObsidianVaultStore::open(&root, true).unwrap();
+        let doc = Document::new(
+            "flush-doc",
+            DocumentCategory::Documentation,
+            "body written just before the shutdown signal",
+            DocMeta::default(),
+            vec![],
+            None,
+        );
+        store.kb_insert(&doc).await.unwrap();
+        assert!(
+            store.git_commit_worker_active.load(Ordering::Acquire),
+            "a store write must arm the coalesced worker"
+        );
+        assert_eq!(
+            commit_count(&root),
+            1,
+            "the snapshot is deferred by the debounce, so it is still pending"
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = store.flush_pending_commit(Duration::from_secs(30)).await;
+        assert!(
+            started.elapsed() >= GIT_COMMIT_DEBOUNCE,
+            "the flush must wait for the worker's own pass, not cut it short: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(outcome, VaultFlush::DrainedByWorker, "{outcome:?}");
+        assert_eq!(
+            commit_count(&root),
+            2,
+            "the write that was pending at shutdown is in the repository"
+        );
+        assert_eq!(git(&root, &["status", "--porcelain"]), "");
+        assert!(
+            git(&root, &["ls-tree", "-r", "--name-only", "HEAD"]).contains("flush-doc"),
+            "the document itself must be in the committed snapshot"
+        );
+        assert!(!root.join(".git/index.lock").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The engine never holds the concrete store — it holds
+    /// `Arc<dyn StorageBackend>` — and `flush_pending` has a default body. A
+    /// delegation impl that forgets to forward it turns the shutdown flush into
+    /// a silent no-op: the process then exits with the pending write still
+    /// uncommitted, which is exactly what the 2026-09-15 smoke test on the real
+    /// binary showed (checked here through the same trait object).
+    #[tokio::test]
+    async fn shutdown_flush_survives_the_dyn_delegation_the_engine_uses() {
+        let root = git_vault("flush-dyn-delegation");
+        let store = std::sync::Arc::new(ObsidianVaultStore::open(&root, true).unwrap());
+        // The exact handle shape `SlcEngine` stores.
+        let dynamic: std::sync::Arc<dyn StorageBackend> = store.clone();
+
+        std::fs::write(root.join("marker.md"), "pending\n").unwrap();
+        store.git_commit_dirty.store(true, Ordering::Release);
+
+        dynamic
+            .flush_pending(Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            commit_count(&root),
+            1,
+            "the flush must reach the vault through Arc<dyn StorageBackend>"
+        );
+        assert_eq!(git(&root, &["status", "--porcelain"]), "");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A writer that never finishes must not turn the shutdown into a hang: the
+    /// flush returns at its deadline and reports that the worker owns the
+    /// repository.
+    #[tokio::test]
+    async fn shutdown_flush_is_bounded_when_the_worker_never_finishes() {
+        let root = git_vault("flush-bounded");
+        let store = ObsidianVaultStore::open(&root, true).unwrap();
+        // A worker that is stuck (a hung `git add -A` on a huge vault).
+        store
+            .git_commit_worker_active
+            .store(true, Ordering::Release);
+
+        let bound = Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let outcome = store.flush_pending_commit(bound).await;
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, VaultFlush::WorkerBusy, "{outcome:?}");
+        assert!(
+            elapsed >= bound && elapsed < bound + Duration::from_secs(5),
+            "the flush must honour its bound: {elapsed:?}"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

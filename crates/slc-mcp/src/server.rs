@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use slc_core::{
     DocFilter, DocMeta, DocSort, Document, DocumentCategory, SlcEngine, SortDir, TaskListScope,
 };
+use std::future::IntoFuture;
 use std::sync::Arc;
 
 use crate::{auth, webui};
@@ -169,18 +170,156 @@ pub async fn run(
         )
         .fallback(webui::static_files::handler)
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
-        .with_state(state);
+        // Cloned, not moved: the shutdown path below needs the engine handle
+        // after the router has been handed to the server.
+        .with_state(state.clone());
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!(
         "SLC MCP listening on http://{addr}/mcp (SSE: /sse → /messages; web UI: /api, /)"
     );
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    tracing::info!("SLC MCP stopped gracefully");
-    Ok(())
+    // Shutdown must be deterministic and bounded: systemd answers a stuck
+    // stop with a SIGKILL, and a SIGKILL in the middle of a vault snapshot is
+    // what leaves orphan git objects in the vault. The signal only arms the
+    // drain; the drain itself is bounded below (in-flight requests keep a
+    // short grace window, long-lived SSE streams do not get to hold the
+    // process forever).
+    let grace = env_duration("SLC_SHUTDOWN_GRACE_SECS", DEFAULT_SHUTDOWN_GRACE);
+    let (shutdown_armed, arm_drain) = tokio::sync::oneshot::channel::<()>();
+    // `WithGracefulShutdown` is a builder, not a future: `.into_future()` is
+    // what the previous `.await` on it desugared to. It runs as a task so the
+    // accept loop can be stopped from the outside (abort) instead of relying on
+    // dropping the future mid-await.
+    let serve = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = arm_drain.await;
+        })
+        .into_future();
+    let drained = await_bounded_shutdown(
+        tokio::spawn(serve),
+        shutdown_signal(),
+        grace,
+        shutdown_armed,
+    )
+    .await?;
+    if drained {
+        tracing::info!("SLC MCP stopped gracefully");
+    } else {
+        tracing::warn!(
+            grace_secs = grace.as_secs(),
+            "graceful shutdown window elapsed — abandoned SSE/idle connections were dropped"
+        );
+    }
+    // Return normally from an async `main` and the tokio runtime teardown waits
+    // for outstanding `spawn_blocking` tasks (the vault Git snapshot), which the
+    // repo already documents as a permanent hang (see `Cmd::ReindexEmbeddings`).
+    // The snapshot is flushed under a bound; then the process exits explicitly.
+    let flush = env_duration("SLC_SHUTDOWN_FLUSH_SECS", DEFAULT_SHUTDOWN_FLUSH);
+    match tokio::time::timeout(flush, state.engine.flush_pending(flush)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!("vault flush error: {error}"),
+        Err(_) => tracing::warn!(
+            flush_secs = flush.as_secs(),
+            "vault flush exceeded its bound; exiting anyway"
+        ),
+    }
+    exit_without_runtime_teardown()
+}
+
+/// How long a graceful shutdown may spend draining open connections before they
+/// are dropped. Overridable with `SLC_SHUTDOWN_GRACE_SECS`; must stay well below
+/// the unit's `TimeoutStopSec`.
+const DEFAULT_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bound for the final vault snapshot flush. Overridable with
+/// `SLC_SHUTDOWN_FLUSH_SECS`.
+const DEFAULT_SHUTDOWN_FLUSH: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Read a seconds-valued override from the environment, falling back to
+/// `default` for an absent, unparsable or zero value (a zero bound would make
+/// the shutdown path meaningless).
+fn env_duration(name: &str, default: std::time::Duration) -> std::time::Duration {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => std::time::Duration::from_secs(secs),
+            _ => {
+                tracing::warn!("{name}={raw:?} is not a positive number of seconds; using default");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+/// Run the server task until it finishes, but arm its graceful shutdown from
+/// `signal` and bound the drain with `grace`. Returns `true` when the server
+/// drained inside the bound, `false` when the bound elapsed and the accept loop
+/// was aborted instead.
+///
+/// Why a bound is needed: [`axum::serve`]'s `with_graceful_shutdown` waits for
+/// *every* connection to finish, and an SSE stream (`/sse`, `/mcp` GET,
+/// `/api/events`) never finishes on its own — a client that stays connected (or
+/// disappears without a clean FIN) kept the process alive until systemd
+/// escalated to SIGKILL (`stop-sigterm timed out. Killing.`), and that SIGKILL
+/// is what tears a vault snapshot in half. In-flight requests still get the
+/// whole `grace` window; only what is still open at the deadline is abandoned.
+///
+/// The remaining connections are not dropped by this function: axum spawns one
+/// task per connection and owns it, so the shutdown path relies on the process
+/// exiting right after (see [`exit_without_runtime_teardown`]) to close them.
+/// Aborting the server task is what stops new connections from being accepted.
+///
+/// `arm` is the sender half of the trigger handed to `with_graceful_shutdown`;
+/// it is fired only after the signal is observed.
+async fn await_bounded_shutdown<F>(
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+    signal: F,
+    grace: std::time::Duration,
+    arm: tokio::sync::oneshot::Sender<()>,
+) -> anyhow::Result<bool>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let mut server = server;
+    tokio::select! {
+        // A server that stops on its own never reaches the drain below.
+        result = &mut server => {
+            join_result(result)?;
+            return Ok(true);
+        }
+        () = signal => {}
+    }
+    let _ = arm.send(());
+    match tokio::time::timeout(grace, &mut server).await {
+        Ok(result) => {
+            join_result(result)?;
+            Ok(true)
+        }
+        Err(_) => {
+            server.abort();
+            Ok(false)
+        }
+    }
+}
+
+/// Turn a finished server task into a result: a panic in the accept loop is an
+/// error, not a silent `Ok`.
+fn join_result(result: Result<std::io::Result<()>, tokio::task::JoinError>) -> anyhow::Result<()> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(anyhow::Error::from(error)),
+        Err(error) => Err(anyhow::anyhow!("server task failed: {error}")),
+    }
+}
+
+/// Leave the process without the runtime teardown described above. stdout is
+/// flushed first: `exit()` skips the buffered stdio flush, and log lines were
+/// observed missing from a redirected journal after the same pattern in
+/// `Cmd::ReindexEmbeddings`.
+fn exit_without_runtime_teardown() -> ! {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    std::process::exit(0);
 }
 
 /// Wait for Ctrl-C or SIGTERM (docker stop) — clean shutdown so SSE clients
@@ -5894,5 +6033,155 @@ mod seat_filter_tests {
         )
         .await;
         assert_eq!(owner_deleted["success"], true);
+    }
+}
+
+/// Shutdown-path regression tests: the roy1 deploy on 2026-09-15 showed systemd
+/// escalating from SIGTERM to SIGKILL (`stop-sigterm timed out. Killing.`) after
+/// `TimeoutStopSec=1m30s`, with the SIGKILL landing while the vault snapshot was
+/// still running. These tests pin the bounded drain that replaced the unbounded
+/// `with_graceful_shutdown(...).await`.
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use futures::StreamExt as _;
+    use std::net::SocketAddr;
+    use std::time::{Duration, Instant};
+
+    type ServeTask = tokio::task::JoinHandle<std::io::Result<()>>;
+
+    /// A route shaped like `/sse`: one event up front (the real endpoint also
+    /// sends `endpoint` first — hyper only flushes the response head once the
+    /// body has produced something), then a body that never ends on its own.
+    /// The client therefore holds an established, live connection open.
+    async fn endless_stream() -> axum::response::Response {
+        let opening = futures::stream::once(async {
+            Ok::<Event, std::convert::Infallible>(
+                Event::default().event("endpoint").data("/messages"),
+            )
+        });
+        Sse::new(opening.chain(futures::stream::pending())).into_response()
+    }
+
+    /// A real axum server on an ephemeral port, plus the trigger that arms its
+    /// graceful shutdown — the same wiring `run` uses (including the spawn).
+    async fn spawn_test_server() -> (SocketAddr, tokio::sync::oneshot::Sender<()>, ServeTask) {
+        let app = Router::new().route("/sse", get(endless_stream));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (arm, armed) = tokio::sync::oneshot::channel::<()>();
+        let serve = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = armed.await;
+            })
+            .into_future();
+        (addr, arm, tokio::spawn(serve))
+    }
+
+    /// The shutdown defect in one test: with an established SSE stream open, the
+    /// drain must still finish inside its bound (it used to wait forever, so
+    /// systemd SIGKILLed the process mid-snapshot). Bounds on the client calls
+    /// turn a regression into a failure message instead of a hanging suite.
+    #[tokio::test]
+    async fn shutdown_with_an_open_sse_stream_is_bounded() {
+        let (addr, arm, server) = spawn_test_server().await;
+        // The client opens the stream and keeps it open.
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            reqwest::Client::new()
+                .get(format!("http://{addr}/sse"))
+                .send(),
+        )
+        .await
+        .expect("the SSE response head must arrive")
+        .expect("SSE connect");
+        assert_eq!(response.status(), 200, "the stream must be established");
+        let mut body = response.bytes_stream();
+        let first = tokio::time::timeout(Duration::from_secs(10), body.next())
+            .await
+            .expect("the opening SSE event must arrive")
+            .expect("the stream must yield an event")
+            .expect("the stream must not fail");
+        assert!(
+            String::from_utf8_lossy(&first).contains("endpoint"),
+            "the live stream must be the one under test"
+        );
+
+        let grace = Duration::from_millis(300);
+        let started = Instant::now();
+        let drained = tokio::time::timeout(
+            Duration::from_secs(30),
+            await_bounded_shutdown(server, std::future::ready(()), grace, arm),
+        )
+        .await
+        .expect("the bounded drain must return on its own")
+        .expect("the drain must not fail");
+        let elapsed = started.elapsed();
+
+        assert!(
+            !drained,
+            "a held-open SSE stream cannot drain, so the bound must be reported as exceeded"
+        );
+        assert!(
+            elapsed >= grace,
+            "the drain must get its full grace window: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the drain must be bounded instead of waiting for the stream: {elapsed:?}"
+        );
+
+        // The accept loop is gone (the process exits right after in `run`), so
+        // no new connection is served: the abandoned stream cannot be revived.
+        let refused = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match tokio::net::TcpStream::connect(addr).await {
+                    Err(_) => break,
+                    Ok(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await;
+        assert!(
+            refused.is_ok(),
+            "the listener must stop accepting once the bound elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_open_connections_stays_graceful() {
+        let (_addr, arm, server) = spawn_test_server().await;
+        let started = Instant::now();
+        let drained =
+            await_bounded_shutdown(server, std::future::ready(()), Duration::from_secs(10), arm)
+                .await
+                .expect("bounded shutdown");
+        assert!(
+            drained,
+            "an idle server must drain gracefully — the bound is not the normal path"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an idle drain must not wait for the bound: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A zero/invalid override must not be able to disable the bound.
+    #[test]
+    fn shutdown_durations_reject_zero_and_garbage() {
+        let fallback = Duration::from_secs(7);
+        // SAFETY: single-threaded test process for this variable (no other test
+        // reads it), and the previous value is restored below.
+        unsafe { std::env::set_var("SLC_TEST_SHUTDOWN_SECS", "0") };
+        assert_eq!(env_duration("SLC_TEST_SHUTDOWN_SECS", fallback), fallback);
+        unsafe { std::env::set_var("SLC_TEST_SHUTDOWN_SECS", "soon") };
+        assert_eq!(env_duration("SLC_TEST_SHUTDOWN_SECS", fallback), fallback);
+        unsafe { std::env::set_var("SLC_TEST_SHUTDOWN_SECS", " 42 ") };
+        assert_eq!(
+            env_duration("SLC_TEST_SHUTDOWN_SECS", fallback),
+            Duration::from_secs(42)
+        );
+        unsafe { std::env::remove_var("SLC_TEST_SHUTDOWN_SECS") };
     }
 }

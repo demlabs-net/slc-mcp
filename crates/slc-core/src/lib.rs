@@ -537,6 +537,14 @@ impl SlcEngine {
         self.store.as_ref()
     }
 
+    /// Flush deferred persistence (the coalesced vault Git snapshot) before the
+    /// process exits, bounded by `wait`. Called by the server's shutdown path —
+    /// see [`StorageBackend::flush_pending`] for why exiting on top of the
+    /// snapshot worker is unsafe.
+    pub async fn flush_pending(&self, wait: std::time::Duration) -> SlcResult<()> {
+        self.store.flush_pending(wait).await
+    }
+
     /// Intelligent compression of a text via the reasoning LLM: keep the key
     /// facts within `max_chars` (the size of the compressed text for the LLM
     /// prompt, not the context budget). Seat-aware: sampling inference

@@ -245,6 +245,20 @@ pub trait StorageBackend: Send + Sync {
         Ok(())
     }
 
+    /// Flush deferred persistence before the process exits.
+    ///
+    /// The vault backend coalesces its Git snapshots into one detached worker
+    /// (the write path must never block on Git), so a snapshot can still be in
+    /// flight at shutdown. A process that exits on top of that worker cuts the
+    /// commit and leaves orphan objects behind in `.git`, so the shutdown path
+    /// asks for a bounded flush instead of just dropping the runtime. The
+    /// default is a no-op: backends without deferred persistence have nothing
+    /// to flush. `wait` bounds the work — implementations must return even
+    /// when the pending snapshot cannot be drained in time.
+    async fn flush_pending(&self, _wait: std::time::Duration) -> SlcResult<()> {
+        Ok(())
+    }
+
     async fn health_check(&self) -> bool;
     async fn close(&self) -> SlcResult<()>;
 }
@@ -412,6 +426,14 @@ impl StorageBackend for Arc<dyn StorageBackend> {
     async fn health_check(&self) -> bool {
         self.as_ref().health_check().await
     }
+
+    /// Must be delegated explicitly: this method has a default body, so an
+    /// implementation that forgets it turns the engine's shutdown flush into a
+    /// silent no-op (the engine only ever holds `Arc<dyn StorageBackend>`).
+    async fn flush_pending(&self, wait: std::time::Duration) -> SlcResult<()> {
+        self.as_ref().flush_pending(wait).await
+    }
+
     async fn close(&self) -> SlcResult<()> {
         self.as_ref().close().await
     }
