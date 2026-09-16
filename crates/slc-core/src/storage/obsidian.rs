@@ -1704,6 +1704,33 @@ impl StorageBackend for ObsidianVaultStore {
         Ok(())
     }
 
+    /// One map mutation + ONE `embeddings.json` rewrite for the whole batch.
+    ///
+    /// `persist_embeddings` re-serializes the complete in-memory map, so the
+    /// default body (delete + insert per document) rewrites the file 2N times
+    /// for a batch of N — quadratic. On a vault whose map is ~80 MB that turns a
+    /// stale-embedding refresh into a process that burns one core for hours
+    /// without ever finishing (the CLI `search` / `reindex-embeddings` path).
+    async fn replace_embeddings(
+        &self,
+        replacements: &[(String, EmbeddingRecord)],
+    ) -> SlcResult<()> {
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut map = self.embeddings.lock().unwrap();
+            for (document_id, record) in replacements {
+                // `insert`, not `entry().or_default().push()`: replacing drops
+                // the previous chunks and keeps exactly the record handed in.
+                map.insert(document_id.clone(), vec![record.clone()]);
+            }
+        }
+        self.persist_embeddings()?;
+        self.git_commit();
+        Ok(())
+    }
+
     // ── seats ───────────────────────────────────────────────────
 
     async fn insert_seat(&self, seat: &Seat) -> SlcResult<()> {

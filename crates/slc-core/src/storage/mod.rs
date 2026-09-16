@@ -239,6 +239,24 @@ pub trait StorageBackend: Send + Sync {
     ) -> SlcResult<Vec<EmbeddingRecord>>;
     async fn delete_embeddings(&self, document_id: &str) -> SlcResult<()>;
 
+    /// Replace the embedding chunks of several documents in ONE backend write
+    /// (each document's chunk list becomes exactly the record handed in — the
+    /// delete + insert pair of `reembed_documents`).
+    ///
+    /// Default body: a per-document `delete_embeddings` + `insert_embeddings`
+    /// pair. Backends that persist their whole embedding map on every call must
+    /// override this: a bulk re-embed of N documents would otherwise rewrite
+    /// the map 2N times (quadratic — see the stale-embedding refresh in
+    /// `reembed_documents`, which is the difference between a bounded sweep and
+    /// a process that never finishes on a multi-thousand-document vault).
+    async fn replace_embeddings(&self, replacements: &[(String, EmbeddingRecord)]) -> SlcResult<()> {
+        for (document_id, record) in replacements {
+            self.delete_embeddings(document_id).await?;
+            self.insert_embeddings(std::slice::from_ref(record)).await?;
+        }
+        Ok(())
+    }
+
     // ── Seats ───────────────────────────────────────────────────
     async fn insert_seat(&self, seat: &Seat) -> SlcResult<()>;
     async fn get_seat(&self, seat_id: &str) -> SlcResult<Option<Seat>>;
@@ -425,6 +443,12 @@ impl StorageBackend for Arc<dyn StorageBackend> {
     }
     async fn delete_embeddings(&self, document_id: &str) -> SlcResult<()> {
         self.as_ref().delete_embeddings(document_id).await
+    }
+    /// Must be delegated explicitly (default body): without the forward a bulk
+    /// embedding refresh degrades to the default delete + insert pair per
+    /// document and the vault backend rewrites its whole embedding map 2N times.
+    async fn replace_embeddings(&self, replacements: &[(String, EmbeddingRecord)]) -> SlcResult<()> {
+        self.as_ref().replace_embeddings(replacements).await
     }
 
     async fn insert_seat(&self, seat: &Seat) -> SlcResult<()> {
@@ -730,8 +754,9 @@ mod compatibility_tests {
 /// delegating impl compiles (and behaves) as if the backend's override did not
 /// exist, and the engine never sees the difference — it only ever holds
 /// `Arc<dyn StorageBackend>`. `flush_pending` (commit c591c45), `kb_replace_many`,
-/// `kb_rename` and `refresh` all shipped in exactly that state; the defaults are
-/// valid implementations, just the wrong ones, so no existing test failed.
+/// `kb_rename`, `refresh` and `replace_embeddings` all shipped in exactly that
+/// state; the defaults are valid implementations, just the wrong ones, so no
+/// existing test failed.
 ///
 /// These tests therefore (a) build the store handle exactly the way production
 /// does — `Arc<dyn StorageBackend>` — and (b) drive it through the real caller
@@ -768,6 +793,13 @@ mod delegation_tests {
         kb_replace: AtomicUsize,
         kb_insert: AtomicUsize,
         kb_purge: AtomicUsize,
+        /// Batched embedding writes (`replace_embeddings` override).
+        replace_embeddings: AtomicUsize,
+        /// Document count per batch: one entry per chunk.
+        replace_embeddings_batches: Mutex<Vec<usize>>,
+        /// The default body's per-document tell-tale pair.
+        delete_embeddings: AtomicUsize,
+        insert_embeddings: AtomicUsize,
     }
 
     fn bump(field: &AtomicUsize) {
@@ -911,6 +943,7 @@ mod delegation_tests {
             self.inner.episodic_purge(document_id).await
         }
         async fn insert_embeddings(&self, records: &[EmbeddingRecord]) -> SlcResult<()> {
+            bump(&self.reached.insert_embeddings);
             self.inner.insert_embeddings(records).await
         }
         async fn get_embedding(&self, document_id: &str) -> SlcResult<Option<Vec<f32>>> {
@@ -927,7 +960,21 @@ mod delegation_tests {
             self.inner.all_embeddings(scope, seat_id).await
         }
         async fn delete_embeddings(&self, document_id: &str) -> SlcResult<()> {
+            bump(&self.reached.delete_embeddings);
             self.inner.delete_embeddings(document_id).await
+        }
+        /// Counted override of a default-bodied method.
+        async fn replace_embeddings(
+            &self,
+            replacements: &[(String, EmbeddingRecord)],
+        ) -> SlcResult<()> {
+            bump(&self.reached.replace_embeddings);
+            self.reached
+                .replace_embeddings_batches
+                .lock()
+                .unwrap()
+                .push(replacements.len());
+            self.inner.replace_embeddings(replacements).await
         }
         async fn insert_seat(&self, seat: &Seat) -> SlcResult<()> {
             self.inner.insert_seat(seat).await
@@ -1056,6 +1103,23 @@ mod delegation_tests {
             .kb_find_metadata_unbounded(&DocFilter::default(), &DocSort::default())
             .await
             .unwrap();
+        dynamic
+            .replace_embeddings(&[(
+                "dyn-emb".to_string(),
+                EmbeddingRecord {
+                    document_id: "dyn-emb".into(),
+                    chunk_index: 0,
+                    chunk_total: 1,
+                    embedding: vec![0.5, 0.25],
+                    embedding_model: "test".into(),
+                    embedding_dimension: 2,
+                    generated_at: Utc::now(),
+                    scope: EmbeddingScope::Public,
+                    seat_id: None,
+                },
+            )])
+            .await
+            .unwrap();
 
         assert_eq!(
             count(&reached.kb_replace_many),
@@ -1094,6 +1158,72 @@ mod delegation_tests {
         );
         assert_eq!(count(&reached.kb_find_unbounded), 1);
         assert_eq!(count(&reached.kb_find_metadata_unbounded), 1);
+        assert_eq!(
+            count(&reached.replace_embeddings),
+            1,
+            "replace_embeddings must reach the backend's batched override through Arc"
+        );
+        assert_eq!(
+            *reached.replace_embeddings_batches.lock().unwrap(),
+            vec![1],
+            "the batch must arrive as ONE call"
+        );
+        assert_eq!(
+            count(&reached.delete_embeddings) + count(&reached.insert_embeddings),
+            0,
+            "the default replace body (delete + insert per document) must not run"
+        );
+    }
+
+    /// Regression: the stale-embedding refresh (`reembed_documents`, driven by
+    /// the CLI `search` and `reindex-embeddings`) replaced each document with a
+    /// `delete_embeddings` + `insert_embeddings` pair. The vault backend
+    /// re-serializes its ENTIRE embedding map in both calls, so a bulk refresh
+    /// rewrote an ~80 MB `embeddings.json` 2N times — quadratic, and on the
+    /// roy1 vault (10 313 documents) the process burned one core indefinitely
+    /// without finishing. One write per chunk, no per-document pair.
+    #[tokio::test]
+    async fn reembed_documents_writes_one_batch_per_chunk() {
+        let (backend, reached) = RecordingBackend::new();
+        let ids: Vec<String> = (0..40).map(|i| format!("bulk-{i:02}")).collect();
+        for id in &ids {
+            backend.inner.kb_insert(&doc(id, vec![])).await.unwrap();
+        }
+        let docs: Vec<Document> = ids.iter().map(|id| doc(id, vec![])).collect();
+
+        // The exact handle shape `SlcEngine` stores.
+        let dynamic: Arc<dyn StorageBackend> = backend.clone();
+        let done = crate::reembed_documents(&*dynamic, &CpuHashLlm, &docs).await;
+
+        assert_eq!(done, 40, "every document in both chunks must be rebuilt");
+        assert_eq!(
+            count(&reached.replace_embeddings),
+            2,
+            "one batch write per chunk of 32 (32 + 8)"
+        );
+        assert_eq!(
+            *reached.replace_embeddings_batches.lock().unwrap(),
+            vec![32, 8],
+            "the chunk sizes must arrive in the batch"
+        );
+        assert_eq!(
+            count(&reached.delete_embeddings),
+            0,
+            "no per-document delete may run under the batch path"
+        );
+        assert_eq!(
+            count(&reached.insert_embeddings),
+            0,
+            "no per-document insert may run under the batch path"
+        );
+        // The embeddings really landed (replace = old chunks dropped, one kept).
+        for id in &ids {
+            assert_eq!(
+                dynamic.get_all_chunks(id).await.unwrap().len(),
+                1,
+                "{id}: exactly the rebuilt record must remain"
+            );
+        }
     }
 
     /// The engine's own caller paths — the construction production uses

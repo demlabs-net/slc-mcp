@@ -67,9 +67,10 @@ pub enum StorageKind {
 }
 
 /// Rebuild document embeddings IN BATCHES: one forward pass per chunk
-/// (of 32 documents) instead of sequential calls. Best-effort — a model
-/// error (e.g. still loading) skips the whole chunk, the next run retries.
-/// Returns the number of successfully rebuilt documents.
+/// (of 32 documents) instead of sequential calls, and one `replace_embeddings`
+/// write per chunk instead of a delete + insert pair per document.
+/// Best-effort — a model error (e.g. still loading) skips the whole chunk, the
+/// next run retries. Returns the number of successfully rebuilt documents.
 pub async fn reembed_documents(
     store: &dyn StorageBackend,
     llm: &dyn LlmClient,
@@ -89,6 +90,7 @@ pub async fn reembed_documents(
                 continue; // model not ready — the next run will retry
             }
         };
+        let mut replaced: Vec<(String, model::EmbeddingRecord)> = Vec::with_capacity(chunk.len());
         for (doc, emb) in chunk.iter().zip(embs) {
             let (scope, seat_id) = match &doc.seat_id {
                 Some(s) => (model::EmbeddingScope::Private, Some(s.clone())),
@@ -105,11 +107,16 @@ pub async fn reembed_documents(
                 scope,
                 seat_id,
             };
-            if store.delete_embeddings(&doc.document_id).await.is_ok()
-                && store.insert_embeddings(&[rec]).await.is_ok()
-            {
-                done += 1;
-            }
+            replaced.push((doc.document_id.clone(), rec));
+        }
+        // ONE backend write per chunk. Writing document by document costs the
+        // vault backend a full `embeddings.json` re-serialization per
+        // delete + insert pair (2N rewrites for N documents) — quadratic, and
+        // on the roy1 vault (~80 MB map, ~10k documents) the stale-embedding
+        // refresh never finished while burning a core.
+        match store.replace_embeddings(&replaced).await {
+            Ok(()) => done += replaced.len(),
+            Err(e) => tracing::debug!("reembed: chunk write skipped: {e}"),
         }
     }
     done
