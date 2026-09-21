@@ -24,7 +24,7 @@
 //! KB and episodic live in separate folder trees (history never gets
 //! embedded/searched), mirroring the [`StorageBackend`] split.
 
-use super::{DocFilter, DocSort, MetaPatch, SortDir, StorageBackend};
+use super::{DocFilter, DocSort, KbMetadataProjection, MetaPatch, SortDir, StorageBackend};
 use crate::error::{SlcError, SlcResult};
 use crate::model::{
     Document, DocumentCategory, EmbeddingRecord, EmbeddingScope, PersistedTimer, Seat, SeatStatus,
@@ -43,12 +43,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GIT_INDEX_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const GIT_COMMIT_DEBOUNCE: Duration = Duration::from_secs(5);
+/// Poll interval while a shutdown flush waits for the coalesced snapshot
+/// worker. Only the shutdown path pays for it.
+const FLUSH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const GIT_MAINTENANCE_CHECK_INTERVAL: u64 = 16;
 const GIT_MAINTENANCE_LOOSE_OBJECT_LIMIT: u64 = 1024;
 const GIT_MAINTENANCE_LOOSE_KIB_LIMIT: u64 = 128 * 1024;
 const DERIVED_SIDECAR_IGNORE_BLOCK: &str = "# SLC derived caches (rebuilt locally; do not version)\n/.slc/index.json\n/.slc/embeddings.json\n";
 static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static GIT_COMMITS_SINCE_START: AtomicU64 = AtomicU64::new(0);
+/// Emit the "no remote" explanation at most once per process. Without this the
+/// skip would be reported on every commit — the same noise the skip removes.
+static GIT_PUSH_SKIPPED_NO_REMOTE_LOGGED: AtomicBool = AtomicBool::new(false);
 // Git's automatic maintenance can intentionally detach a `git` child after
 // commits. It is then reparented to the SLC container's PID 1, which has no
 // generic child reaper, leaving an exited maintenance process as a zombie.
@@ -189,10 +195,71 @@ fn ensure_derived_sidecars_ignored(root: &Path) -> std::io::Result<()> {
     atomic_replace(&root.join(".git/slc-write-tmp"), &path, updated.as_bytes())
 }
 
+/// What the post-commit push actually did. Reported so operators and tests can
+/// see the outcome directly instead of parsing logs; the coalesced worker
+/// ignores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaultPush {
+    /// The vault has no remote: no `git push` process was started at all.
+    SkippedNoRemote,
+    /// The commit itself failed, so there was nothing to push.
+    NoCommit,
+    /// `git push` ran and succeeded.
+    Pushed,
+    /// `git push` ran and failed (stderr kept for the debug line).
+    Failed(String),
+}
+
+/// How a shutdown-time flush of the coalesced snapshot ended. Reported so the
+/// shutdown path can log a truthful outcome instead of guessing, and so tests
+/// can tell "nothing was pending" from "the worker finished it for us".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaultFlush {
+    /// Auto-commit is off, or no write was pending: nothing to flush.
+    Idle,
+    /// The coalesced worker was still busy when the bound elapsed. The flush
+    /// deliberately starts no second snapshot — the in-flight worker owns the
+    /// repository. Whatever it snapshots on its own is complete; the wait was
+    /// simply shorter than its debounce.
+    WorkerBusy,
+    /// The worker was still running, but finished its own pass inside the
+    /// bound; the pending writes are in the repository.
+    DrainedByWorker,
+    /// The flush owned the dirty flag and ran the final snapshot itself.
+    Committed(VaultPush),
+    /// The snapshot task itself failed to run (the Git process could not be
+    /// started at all, not a Git failure — that is reported by [`VaultPush`]).
+    Failed(String),
+}
+
+/// Whether the vault has any Git remote configured.
+///
+/// Asking Git (instead of parsing `.git/config`) stays correct for every config
+/// shape: `origin`, other remote names, `url.<base>.insteadOf` rewrites, and a
+/// worktree whose config lives elsewhere. It is a purely local read — no
+/// network, no credentials, no terminal prompt.
+fn vault_remote_configured(root: &Path) -> bool {
+    match std::process::Command::new("git")
+        .args(GIT_NO_BACKGROUND_MAINTENANCE)
+        .arg("remote")
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+        }
+        // Not a repository (or Git refused): there is nothing to push to. The
+        // commit path reports the failure that actually matters.
+        Ok(_) => false,
+        Err(_) => false,
+    }
+}
+
 /// Run one coalesced Git snapshot for the vault. This is intentionally invoked
 /// only by the coalesced worker below: the storage write path must never queue
 /// one Git process per document or seat update.
-fn run_vault_git_commit(root: &Path, author: &str) {
+fn run_vault_git_commit(root: &Path, author: &str) -> VaultPush {
     let author_name = author
         .split('<')
         .next()
@@ -252,30 +319,21 @@ fn run_vault_git_commit(root: &Path, author: &str) {
             // metadata. Avoid manufacturing empty commits when the vault
             // representation did not actually change.
             match run(vec!["diff", "--cached", "--quiet"]) {
-                Ok(diff) if diff.status.success() => return,
+                Ok(diff) if diff.status.success() => return VaultPush::NoCommit,
                 Ok(diff) if diff.status.code() == Some(1) => {}
                 Ok(diff) => {
                     failed(&diff);
-                    return;
+                    return VaultPush::NoCommit;
                 }
                 Err(error) => {
                     tracing::warn!("vault git diff error: {error}");
-                    return;
+                    return VaultPush::NoCommit;
                 }
             }
             let commit = run(vec!["commit", "-m", "slc: vault update"]);
             match &commit {
                 Ok(commit) if commit.status.success() => {
-                    // Push the vault to its upstream (best-effort) — configured
-                    // remote only, silent otherwise.
-                    if let Ok(push) = run(vec!["push", "-q"]) {
-                        if !push.status.success() {
-                            tracing::debug!(
-                                "vault push: {}",
-                                String::from_utf8_lossy(&push.stderr).trim()
-                            );
-                        }
-                    }
+                    let outcome = push_vault(root, &run);
                     let committed = GIT_COMMITS_SINCE_START.fetch_add(1, Ordering::Relaxed) + 1;
                     if committed == 1 || committed % GIT_MAINTENANCE_CHECK_INTERVAL == 0 {
                         match run(vec!["count-objects", "-v"]) {
@@ -308,13 +366,59 @@ fn run_vault_git_commit(root: &Path, author: &str) {
                             }
                         }
                     }
+                    outcome
                 }
-                Ok(commit) => failed(commit),
-                Err(error) => tracing::warn!("vault git commit error: {error}"),
+                Ok(commit) => {
+                    failed(commit);
+                    VaultPush::NoCommit
+                }
+                Err(error) => {
+                    tracing::warn!("vault git commit error: {error}");
+                    VaultPush::NoCommit
+                }
             }
         }
-        Ok(out) => failed(&out),
-        Err(error) => tracing::warn!("vault git add error: {error}"),
+        Ok(out) => {
+            failed(&out);
+            VaultPush::NoCommit
+        }
+        Err(error) => {
+            tracing::warn!("vault git add error: {error}");
+            VaultPush::NoCommit
+        }
+    }
+}
+
+/// Push a committed snapshot, but only when the vault actually has a remote.
+///
+/// A vault with no remote (the normal state of a local swarm vault) has no
+/// upstream: running `git push` there cannot succeed, so every auto-commit paid
+/// for a failing process plus a journal line. That constant stream buried the
+/// diagnostics that mattered, so the no-remote case is now not attempted at all
+/// and reported at most once per process, at debug level.
+fn push_vault(
+    root: &Path,
+    run: &impl Fn(Vec<&str>) -> std::io::Result<std::process::Output>,
+) -> VaultPush {
+    if !vault_remote_configured(root) {
+        if !GIT_PUSH_SKIPPED_NO_REMOTE_LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::debug!(
+                "vault git: no remote configured — vault push is skipped (vault is committed locally)"
+            );
+        }
+        return VaultPush::SkippedNoRemote;
+    }
+    match run(vec!["push", "-q"]) {
+        Ok(push) if push.status.success() => VaultPush::Pushed,
+        Ok(push) => {
+            let stderr = String::from_utf8_lossy(&push.stderr).trim().to_string();
+            tracing::debug!("vault push: {stderr}");
+            VaultPush::Failed(stderr)
+        }
+        Err(error) => {
+            tracing::debug!("vault push error: {error}");
+            VaultPush::Failed(error.to_string())
+        }
     }
 }
 
@@ -396,6 +500,10 @@ pub struct IndexEntry {
     pub doc_type: Option<String>,
     #[serde(default)]
     pub extra_strings: BTreeMap<String, String>,
+    /// Full free-form metadata projection. The sidecar is rebuildable and this
+    /// avoids reopening every Markdown body for metadata-only workflow scans.
+    #[serde(default)]
+    pub metadata_extra: Map<String, Value>,
     pub archived: Option<bool>,
     pub consolidated: Option<bool>,
     pub compression_batch_id: Option<String>,
@@ -432,6 +540,7 @@ impl IndexEntry {
                     value.as_str().map(|value| (key.clone(), value.to_string()))
                 })
                 .collect(),
+            metadata_extra: doc.metadata.extra.clone(),
             archived: doc.metadata.archived,
             consolidated: doc.metadata.consolidated,
             compression_batch_id: doc.metadata.compression_batch_id.clone(),
@@ -682,6 +791,11 @@ impl ObsidianVaultStore {
                                     })
                                     .collect()
                             })
+                            .unwrap_or_default(),
+                        metadata_extra: meta
+                            .get("metadata")
+                            .and_then(Value::as_object)
+                            .cloned()
                             .unwrap_or_default(),
                         archived: meta
                             .get("metadata")
@@ -961,13 +1075,14 @@ impl ObsidianVaultStore {
         })
     }
 
-    /// Collect matching entries (KB or episodic by table) sorted + limited.
-    fn select(
+    /// Collect matching entries (KB or episodic by table), sort them, and
+    /// optionally apply a caller-visible bound.
+    fn select_with_limit(
         &self,
         table: Table,
         filter: &DocFilter,
         sort: &DocSort,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Vec<IndexEntry> {
         let index = self.index.lock().unwrap();
         let mut out: Vec<&IndexEntry> = index
@@ -994,8 +1109,29 @@ impl ObsidianVaultStore {
                 SortDir::Desc => ord.reverse(),
             }
         });
-        out.truncate(limit.min(out.len()));
+        if let Some(limit) = limit {
+            out.truncate(limit.min(out.len()));
+        }
         out.into_iter().cloned().collect()
+    }
+
+    fn select(
+        &self,
+        table: Table,
+        filter: &DocFilter,
+        sort: &DocSort,
+        limit: usize,
+    ) -> Vec<IndexEntry> {
+        self.select_with_limit(table, filter, sort, Some(limit))
+    }
+
+    fn select_unbounded(
+        &self,
+        table: Table,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> Vec<IndexEntry> {
+        self.select_with_limit(table, filter, sort, None)
     }
 
     /// Fire-and-forget, coalesced vault commit. The write path must NEVER
@@ -1025,7 +1161,9 @@ impl ObsidianVaultStore {
                 let worker_root = root.clone();
                 let worker_author = author.clone();
                 if let Err(error) = tokio::task::spawn_blocking(move || {
-                    run_vault_git_commit(&worker_root, &worker_author);
+                    // The outcome is reported through logs and the `VaultPush`
+                    // enum; the coalesced worker has no caller to return to.
+                    let _ = run_vault_git_commit(&worker_root, &worker_author);
                 })
                 .await
                 {
@@ -1036,6 +1174,47 @@ impl ObsidianVaultStore {
                 }
             }
         });
+    }
+
+    /// Flush a pending vault snapshot before the process exits — bounded.
+    ///
+    /// At shutdown the coalesced worker may be inside `git add -A`/`git commit`
+    /// or still in its debounce sleep. Killing the process on top of it is what
+    /// leaves orphan loose objects and quarantined `index.lock` files in the
+    /// vault, so this waits for the worker instead of racing it:
+    ///
+    /// - no worker running → take the dirty flag and run the final snapshot
+    ///   synchronously ([`VaultFlush::Committed`]);
+    /// - worker running → wait up to `wait` for its own pass to finish, which
+    ///   covers every write marked dirty so far ([`VaultFlush::DrainedByWorker`]);
+    /// - worker still running at the deadline → start nothing
+    ///   ([`VaultFlush::WorkerBusy`]): a second `git add -A` next to a live one
+    ///   would fight over `index.lock`.
+    pub async fn flush_pending_commit(&self, wait: Duration) -> VaultFlush {
+        if !self.auto_git_commit {
+            return VaultFlush::Idle;
+        }
+        if self.git_commit_worker_active.load(Ordering::Acquire) {
+            let deadline = tokio::time::Instant::now() + wait;
+            while self.git_commit_worker_active.load(Ordering::Acquire) {
+                if tokio::time::Instant::now() >= deadline {
+                    return VaultFlush::WorkerBusy;
+                }
+                tokio::time::sleep(FLUSH_POLL_INTERVAL).await;
+            }
+            return VaultFlush::DrainedByWorker;
+        }
+        // No worker: the flush owns the repository. Clearing the flag first
+        // means a write arriving now re-arms the worker for a normal pass.
+        if !self.git_commit_dirty.swap(false, Ordering::AcqRel) {
+            return VaultFlush::Idle;
+        }
+        let root = self.root.clone();
+        let author = self.git_author.clone();
+        match tokio::task::spawn_blocking(move || run_vault_git_commit(&root, &author)).await {
+            Ok(push) => VaultFlush::Committed(push),
+            Err(error) => VaultFlush::Failed(error.to_string()),
+        }
     }
 }
 
@@ -1166,6 +1345,38 @@ impl StorageBackend for ObsidianVaultStore {
         Ok(out)
     }
 
+    async fn kb_find_unbounded(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> SlcResult<Vec<Document>> {
+        let entries = self.select_unbounded(Table::Kb, filter, sort);
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            out.push(self.read_note(&entry)?);
+        }
+        Ok(out)
+    }
+
+    async fn kb_find_metadata_unbounded(
+        &self,
+        filter: &DocFilter,
+        sort: &DocSort,
+    ) -> SlcResult<Vec<KbMetadataProjection>> {
+        Ok(self
+            .select_unbounded(Table::Kb, filter, sort)
+            .into_iter()
+            .filter_map(|entry| {
+                DocumentCategory::parse(&entry.category).map(|category| KbMetadataProjection {
+                    document_id: entry.id,
+                    category,
+                    seat_id: entry.seat_id,
+                    metadata_extra: entry.metadata_extra,
+                })
+            })
+            .collect())
+    }
+
     async fn kb_count(&self, filter: &DocFilter) -> SlcResult<u64> {
         Ok(self
             .select(Table::Kb, filter, &DocSort::default(), usize::MAX)
@@ -1265,6 +1476,28 @@ impl StorageBackend for ObsidianVaultStore {
             index.insert(new_id.to_string(), e);
             true
         };
+        if renamed {
+            // The note carries the id in its frontmatter (`render_doc`), so the
+            // file move alone leaves `id: <old>` inside the note: the next index
+            // rebuild — a restart, the engine's `refresh`, any other service
+            // sharing the vault — would re-register the OLD id and resolve it to
+            // a path that no longer exists. Rewrite the moved note under its new
+            // id; the rename stays a move, not an edit (version/updated_at are
+            // carried over untouched).
+            let entry = self.index.lock().unwrap().get(new_id).cloned();
+            if let Some(mut entry) = entry {
+                // The moved file is named after the new id, never after the
+                // previous entry's file name.
+                entry.file_name = None;
+                let mut doc = self.read_note(&entry)?;
+                doc.document_id = new_id.to_string();
+                let path = self
+                    .root
+                    .join(sanitize_folder(&entry.folder)?)
+                    .join(format!("{}.md", safe_file_name(new_id)));
+                self.atomic_write(&path, render_doc(&doc)?.as_bytes())?;
+            }
+        }
         self.persist_index()?;
         self.git_commit();
         Ok(renamed)
@@ -1466,6 +1699,33 @@ impl StorageBackend for ObsidianVaultStore {
 
     async fn delete_embeddings(&self, document_id: &str) -> SlcResult<()> {
         self.embeddings.lock().unwrap().remove(document_id);
+        self.persist_embeddings()?;
+        self.git_commit();
+        Ok(())
+    }
+
+    /// One map mutation + ONE `embeddings.json` rewrite for the whole batch.
+    ///
+    /// `persist_embeddings` re-serializes the complete in-memory map, so the
+    /// default body (delete + insert per document) rewrites the file 2N times
+    /// for a batch of N — quadratic. On a vault whose map is ~80 MB that turns a
+    /// stale-embedding refresh into a process that burns one core for hours
+    /// without ever finishing (the CLI `search` / `reindex-embeddings` path).
+    async fn replace_embeddings(
+        &self,
+        replacements: &[(String, EmbeddingRecord)],
+    ) -> SlcResult<()> {
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut map = self.embeddings.lock().unwrap();
+            for (document_id, record) in replacements {
+                // `insert`, not `entry().or_default().push()`: replacing drops
+                // the previous chunks and keeps exactly the record handed in.
+                map.insert(document_id.clone(), vec![record.clone()]);
+            }
+        }
         self.persist_embeddings()?;
         self.git_commit();
         Ok(())
@@ -1714,6 +1974,35 @@ impl StorageBackend for ObsidianVaultStore {
     async fn close(&self) -> SlcResult<()> {
         Ok(())
     }
+
+    /// See [`ObsidianVaultStore::flush_pending_commit`]: the shutdown path must
+    /// not exit on top of the coalesced Git worker (that is what leaves orphan
+    /// objects in the vault), but it must also never hang — the bound is
+    /// honoured and the outcome is logged for the operator.
+    async fn flush_pending(&self, wait: Duration) -> SlcResult<()> {
+        match self.flush_pending_commit(wait).await {
+            VaultFlush::Idle => Ok(()),
+            VaultFlush::Committed(push) => {
+                tracing::info!("vault flush: pending snapshot committed ({push:?})");
+                Ok(())
+            }
+            VaultFlush::DrainedByWorker => {
+                tracing::info!("vault flush: coalesced worker finished the pending snapshot");
+                Ok(())
+            }
+            VaultFlush::WorkerBusy => {
+                tracing::warn!(
+                    "vault flush: coalesced snapshot worker still running after {wait:?}; \
+                     leaving the in-flight snapshot to finish"
+                );
+                Ok(())
+            }
+            VaultFlush::Failed(error) => {
+                tracing::warn!("vault flush failed: {error}");
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1724,6 +2013,192 @@ mod tests {
 
     fn tmp_vault(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("slc-test-{tag}-{}", uuid::Uuid::new_v4().simple()))
+    }
+
+    /// Run git in `dir`, asserting success, and return stdout. Vault snapshots
+    /// are a Git feature, so a missing/broken Git must fail loudly here instead
+    /// of silently skipping the behaviour under test.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git must be available for vault git tests");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A vault repository with a deterministic committer identity (the snapshot
+    /// worker sets author/committer only for the author fields).
+    fn git_vault(tag: &str) -> PathBuf {
+        let root = tmp_vault(tag);
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.name", "SLC Test"]);
+        git(&root, &["config", "user.email", "slc-test@localhost"]);
+        root
+    }
+
+    fn commit_count(root: &Path) -> usize {
+        git(root, &["rev-list", "--count", "HEAD"])
+            .parse()
+            .expect("rev-list count")
+    }
+
+    /// A plain public KB document in the vault root.
+    fn doc_for(id: &str) -> Document {
+        Document::new(
+            id,
+            DocumentCategory::Documentation,
+            format!("body of {id}"),
+            DocMeta::default(),
+            vec![],
+            None,
+        )
+    }
+
+    /// A long id must survive the filesystem, the note frontmatter, and an
+    /// index rebuild: the stored id stays byte-identical, and the truncated
+    /// prefix a caller might reconstruct is not silently accepted as a key.
+    #[tokio::test]
+    async fn long_ids_survive_the_vault_filesystem_and_a_rescan() {
+        let root = tmp_vault("long-id");
+        let store = ObsidianVaultStore::open(&root, false).unwrap();
+        let long_id = "diag_disposable_contactor_roy1_probe_20260915t042530";
+        assert!(long_id.chars().count() > 48);
+        let doc = Document::with_folder(
+            long_id,
+            DocumentCategory::Task,
+            Some("tasks".into()),
+            "marker body",
+            DocMeta::default(),
+            vec![],
+            Some("seat-contactor".into()),
+        );
+        store.kb_insert(&doc).await.unwrap();
+        // The note file keeps the whole id (no truncated stem).
+        assert!(root.join("tasks").join(format!("{long_id}.md")).exists());
+
+        // Fresh open = index rebuilt from disk: the exact id still resolves.
+        let reopened = ObsidianVaultStore::open(&root, false).unwrap();
+        let loaded = reopened
+            .kb_get(long_id)
+            .await
+            .unwrap()
+            .expect("the exact stored id must resolve");
+        assert_eq!(loaded.document_id, long_id);
+        let visible = reopened
+            .kb_find(
+                &DocFilter::visible_to("seat-contactor"),
+                &DocSort::by_updated(SortDir::Desc),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible[0].document_id, long_id);
+
+        // The 48-char prefix is a different key: a truncated request misses
+        // instead of silently resolving to some other note.
+        let prefix: String = long_id.chars().take(48).collect();
+        assert!(reopened.kb_get(&prefix).await.unwrap().is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn vault_remote_configured_only_when_a_remote_exists() {
+        let root = git_vault("remote-detect");
+        assert!(
+            !vault_remote_configured(&root),
+            "a fresh vault has no remote"
+        );
+        let upstream = tmp_vault("remote-detect-upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git(&upstream, &["init", "-q", "--bare"]);
+        git(
+            &root,
+            &["remote", "add", "origin", upstream.to_str().unwrap()],
+        );
+        assert!(
+            vault_remote_configured(&root),
+            "a configured remote must be detected"
+        );
+        // A non-repository directory is not a push target either.
+        let plain = tmp_vault("remote-detect-plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!vault_remote_configured(&plain));
+        for path in [root, upstream, plain] {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    /// The defect: an unconditional `git push -q` failed on every auto-commit in
+    /// a vault with no remote. The snapshot must still commit, and must not run
+    /// a push process at all.
+    #[test]
+    fn vault_commit_skips_push_and_stays_quiet_when_no_remote_is_configured() {
+        let root = git_vault("push-no-remote");
+        std::fs::write(root.join("marker.md"), "first\n").unwrap();
+
+        let first = run_vault_git_commit(&root, "SLC Test <slc-test@localhost>");
+        assert_eq!(first, VaultPush::SkippedNoRemote, "{first:?}");
+        assert_eq!(commit_count(&root), 1, "the vault must still auto-commit");
+        assert_eq!(git(&root, &["remote"]), "", "no remote is configured");
+
+        // Every later snapshot takes the same quiet path — no failed push, no
+        // new journal line, HEAD advances.
+        std::fs::write(root.join("marker.md"), "second\n").unwrap();
+        let second = run_vault_git_commit(&root, "SLC Test <slc-test@localhost>");
+        assert_eq!(second, VaultPush::SkippedNoRemote, "{second:?}");
+        assert_eq!(commit_count(&root), 2, "HEAD must advance per snapshot");
+
+        // An unchanged vault manufactures no commit at all.
+        let third = run_vault_git_commit(&root, "SLC Test <slc-test@localhost>");
+        assert_eq!(third, VaultPush::NoCommit, "{third:?}");
+        assert_eq!(commit_count(&root), 2);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The same code path must still push when a remote exists — the fix may not
+    /// silently disable vault backup.
+    #[test]
+    fn vault_commit_pushes_to_a_configured_remote() {
+        let root = git_vault("push-remote");
+        let upstream = tmp_vault("push-remote-upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git(&upstream, &["init", "-q", "--bare"]);
+
+        std::fs::write(root.join("marker.md"), "initial\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "initial"]);
+        git(
+            &root,
+            &["remote", "add", "origin", upstream.to_str().unwrap()],
+        );
+        git(&root, &["push", "-q", "-u", "origin", "HEAD"]);
+
+        std::fs::write(root.join("marker.md"), "snapshot\n").unwrap();
+        let outcome = run_vault_git_commit(&root, "SLC Test <slc-test@localhost>");
+        assert_eq!(outcome, VaultPush::Pushed, "{outcome:?}");
+
+        // Proof that the push really happened: the upstream now carries the
+        // snapshot commit the worker created.
+        let upstream_subject = git(&upstream, &["log", "-1", "--format=%s"]);
+        assert_eq!(upstream_subject, "slc: vault update");
+        assert_eq!(
+            git(&root, &["rev-parse", "HEAD"]),
+            git(&upstream, &["rev-parse", "HEAD"])
+        );
+
+        for path in [root, upstream] {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 
     #[tokio::test]
@@ -2048,6 +2523,161 @@ mod tests {
         assert!(!worker_active.load(Ordering::Acquire));
     }
 
+    /// The shutdown defect: the server was SIGKILLed while a vault snapshot was
+    /// still pending, which is what leaves orphan objects in `.git`. A pending
+    /// write that the coalesced worker has not picked up yet must be committed
+    /// by the flush itself — synchronously, before the process exits.
+    #[tokio::test]
+    async fn shutdown_flush_commits_a_snapshot_the_worker_has_not_started() {
+        let root = git_vault("flush-owns-flag");
+        let store = ObsidianVaultStore::open(&root, true).unwrap();
+        // The state the shutdown path must resolve: a write is pending, no
+        // worker is running. (Set directly instead of through the write path:
+        // after a real write the worker is always active immediately, which is
+        // the other test below.)
+        std::fs::write(root.join("marker.md"), "pending\n").unwrap();
+        store.git_commit_dirty.store(true, Ordering::Release);
+        assert!(!store.git_commit_worker_active.load(Ordering::Acquire));
+
+        let outcome = store.flush_pending_commit(Duration::from_secs(10)).await;
+        assert_eq!(
+            outcome,
+            VaultFlush::Committed(VaultPush::SkippedNoRemote),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            commit_count(&root),
+            1,
+            "the pending write must reach the repository before exit"
+        );
+        assert_eq!(
+            git(&root, &["status", "--porcelain"]),
+            "",
+            "no uncommitted work may be left behind"
+        );
+        assert!(
+            !root.join(".git/index.lock").exists(),
+            "the flush may not leave a lock behind"
+        );
+
+        // Nothing is pending any more: a second flush is idle and must not
+        // manufacture an empty commit.
+        let again = store.flush_pending_commit(Duration::from_millis(50)).await;
+        assert_eq!(again, VaultFlush::Idle, "{again:?}");
+        assert_eq!(commit_count(&root), 1);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A shutdown that lands inside the coalesced worker's debounce window must
+    /// wait for that worker, not start a second `git add -A` beside it: two Git
+    /// writers fighting over `index.lock` is exactly how the residue appears.
+    #[tokio::test]
+    async fn shutdown_flush_waits_for_the_coalesced_worker_instead_of_racing_it() {
+        let root = git_vault("flush-worker");
+        std::fs::write(root.join("marker.md"), "initial\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "initial"]);
+        assert_eq!(commit_count(&root), 1);
+
+        let store = ObsidianVaultStore::open(&root, true).unwrap();
+        let doc = Document::new(
+            "flush-doc",
+            DocumentCategory::Documentation,
+            "body written just before the shutdown signal",
+            DocMeta::default(),
+            vec![],
+            None,
+        );
+        store.kb_insert(&doc).await.unwrap();
+        assert!(
+            store.git_commit_worker_active.load(Ordering::Acquire),
+            "a store write must arm the coalesced worker"
+        );
+        assert_eq!(
+            commit_count(&root),
+            1,
+            "the snapshot is deferred by the debounce, so it is still pending"
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = store.flush_pending_commit(Duration::from_secs(30)).await;
+        assert!(
+            started.elapsed() >= GIT_COMMIT_DEBOUNCE,
+            "the flush must wait for the worker's own pass, not cut it short: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(outcome, VaultFlush::DrainedByWorker, "{outcome:?}");
+        assert_eq!(
+            commit_count(&root),
+            2,
+            "the write that was pending at shutdown is in the repository"
+        );
+        assert_eq!(git(&root, &["status", "--porcelain"]), "");
+        assert!(
+            git(&root, &["ls-tree", "-r", "--name-only", "HEAD"]).contains("flush-doc"),
+            "the document itself must be in the committed snapshot"
+        );
+        assert!(!root.join(".git/index.lock").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The engine never holds the concrete store — it holds
+    /// `Arc<dyn StorageBackend>` — and `flush_pending` has a default body. A
+    /// delegation impl that forgets to forward it turns the shutdown flush into
+    /// a silent no-op: the process then exits with the pending write still
+    /// uncommitted, which is exactly what the 2026-09-15 smoke test on the real
+    /// binary showed (checked here through the same trait object).
+    #[tokio::test]
+    async fn shutdown_flush_survives_the_dyn_delegation_the_engine_uses() {
+        let root = git_vault("flush-dyn-delegation");
+        let store = std::sync::Arc::new(ObsidianVaultStore::open(&root, true).unwrap());
+        // The exact handle shape `SlcEngine` stores.
+        let dynamic: std::sync::Arc<dyn StorageBackend> = store.clone();
+
+        std::fs::write(root.join("marker.md"), "pending\n").unwrap();
+        store.git_commit_dirty.store(true, Ordering::Release);
+
+        dynamic
+            .flush_pending(Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            commit_count(&root),
+            1,
+            "the flush must reach the vault through Arc<dyn StorageBackend>"
+        );
+        assert_eq!(git(&root, &["status", "--porcelain"]), "");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A writer that never finishes must not turn the shutdown into a hang: the
+    /// flush returns at its deadline and reports that the worker owns the
+    /// repository.
+    #[tokio::test]
+    async fn shutdown_flush_is_bounded_when_the_worker_never_finishes() {
+        let root = git_vault("flush-bounded");
+        let store = ObsidianVaultStore::open(&root, true).unwrap();
+        // A worker that is stuck (a hung `git add -A` on a huge vault).
+        store
+            .git_commit_worker_active
+            .store(true, Ordering::Release);
+
+        let bound = Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let outcome = store.flush_pending_commit(bound).await;
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, VaultFlush::WorkerBusy, "{outcome:?}");
+        assert!(
+            elapsed >= bound && elapsed < bound + Duration::from_secs(5),
+            "the flush must honour its bound: {elapsed:?}"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn parses_git_loose_object_summary_for_maintenance_thresholds() {
         let summary = "count: 2148\nsize: 574904\nin-pack: 2891\nsize-pack: 160460\n";
@@ -2068,6 +2698,97 @@ mod tests {
         assert!(ignored.lines().any(|line| line == "core"));
         assert_eq!(ignored.matches("/.slc/index.json").count(), 1);
         assert_eq!(ignored.matches("/.slc/embeddings.json").count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `refresh` has a default body (a no-op) in the trait, so a delegation that
+    /// forgets to forward it turns the multi-process sync into a silent no-op:
+    /// the engine's periodic `SLC_VAULT_REFRESH_SECS` loop and `SlcEngine::refresh`
+    /// both go through `Arc<dyn StorageBackend>`. Two stores on one vault are
+    /// exactly the deployment this exists for (the MCP service and the web UI
+    /// share the vault; files are the source of truth).
+    #[tokio::test]
+    async fn multi_process_refresh_survives_the_dyn_delegation_the_engine_uses() {
+        let root = tmp_vault("refresh-dyn-delegation");
+        let store = std::sync::Arc::new(ObsidianVaultStore::open(&root, false).unwrap());
+        // The exact handle shape `SlcEngine` stores.
+        let dynamic: std::sync::Arc<dyn StorageBackend> = store.clone();
+
+        // Another service sharing the vault writes a note.
+        let other = ObsidianVaultStore::open(&root, false).unwrap();
+        other.kb_insert(&doc_for("refresh-foreign")).await.unwrap();
+        assert!(
+            dynamic.kb_get("refresh-foreign").await.unwrap().is_none(),
+            "the stale index must not see the foreign write before the resync"
+        );
+
+        dynamic.refresh().await.unwrap();
+
+        assert!(
+            dynamic.kb_get("refresh-foreign").await.unwrap().is_some(),
+            "refresh must re-read the shared vault through Arc<dyn StorageBackend>"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The storage-level rename must stay the atomic index/file move: the
+    /// default body is `kb_get` + `kb_insert` + `kb_purge`, which rewrites the
+    /// note, bumps `version`/`updated_at` (so a rename shows up as an edit in
+    /// every `by_updated` listing) and is not atomic.
+    ///
+    /// The moved note's frontmatter id is part of the same contract: the vault
+    /// files are the source of truth, so a note left with `id: <old>` is
+    /// re-registered under the old id (and resolved to a path that no longer
+    /// exists) by the next index rebuild.
+    #[tokio::test]
+    async fn rename_through_the_dyn_delegation_does_not_rewrite_the_note() {
+        let root = tmp_vault("rename-dyn-delegation");
+        let store = std::sync::Arc::new(ObsidianVaultStore::open(&root, false).unwrap());
+        let dynamic: std::sync::Arc<dyn StorageBackend> = store.clone();
+
+        let before = doc_for("rename-source");
+        dynamic.kb_insert(&before).await.unwrap();
+
+        assert!(
+            dynamic
+                .kb_rename("rename-source", "rename-target")
+                .await
+                .unwrap()
+        );
+
+        let after = dynamic
+            .kb_get("rename-target")
+            .await
+            .unwrap()
+            .expect("the note must exist under the new id");
+        assert_eq!(
+            after.document_id, "rename-target",
+            "the moved note must carry its new id in the frontmatter"
+        );
+        assert_eq!(
+            after.version, before.version,
+            "an atomic rename must not bump the document version"
+        );
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "an atomic rename must not make the document look freshly edited"
+        );
+        assert!(dynamic.kb_get("rename-source").await.unwrap().is_none());
+        assert!(
+            !root.join("rename-source.md").exists(),
+            "the old note file must be gone after the rename"
+        );
+
+        // A rescan (restart / the engine's periodic refresh / another service)
+        // must still resolve the document under its new id.
+        let rescan = ObsidianVaultStore::open(&root, false).unwrap();
+        assert!(
+            rescan.kb_get("rename-target").await.unwrap().is_some(),
+            "the rename must survive an index rebuild"
+        );
+        assert!(rescan.kb_get("rename-source").await.unwrap().is_none());
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }

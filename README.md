@@ -129,6 +129,60 @@ Copy `.env.example` to `.env`. Key variables:
 
 Endpoints (Streamable HTTP, MCP `2025-03-26`):
 
+Every assignee has a durable FIFO with capacity one. A new assignment is
+`ready` only when it owns the lane; later work remains `queued`. `start_task`
+rejects queued work, and every progress or terminal report requires the task
+to be running, so a queued task cannot close past the FIFO head. A terminal
+report releases the lane; `reconcile_task_queue` then promotes the oldest
+queued task and repairs interrupted projection writes or duplicate `ready`
+reservations. A non-running `ready` reservation that is not the oldest item is
+demoted and the true head is restored. Multiple actual `running` writers remain
+a hard error because choosing one automatically would be unsafe. Backend filtering happens before
+the 5000-item per-assignee safety bound, preventing unrelated or old terminal
+tasks from truncating a role queue silently. The queue is per agent profile,
+independently of how many global parallel slots its inference backend exposes.
+Assignment idempotency remains replayable after terminal tasks leave the
+runnable FIFO. Assignment responses expose additive machine fields:
+`invocation_outcome` is `created`, `replayed`, or
+`portfolio_identity_conflict`; `replayed`, `portfolio_identity_conflict`,
+`existing_task_id`, `next_attempt`, `fresh_transition`, and `delivery_needed`
+support branch-free schedulers. A pure replay returns the original task but
+emits no queue snapshot, delivery, wake, or SSE notification. If replay-time
+recovery newly creates the task's missing `ready` reservation,
+`fresh_transition=true` and `delivery_needed=true` permit exactly that recovered
+wake/SSE; the stable ready event id keeps transport delivery idempotent. A
+manager portfolio root collision remains a successful conflict outcome with the
+existing task and next historical attempt, not a transport-worthy error;
+reusing an idempotency key with a different fingerprint remains an error.
+Portfolio identity and index scans use the storage backend's explicit unbounded
+metadata-projection query, so all historical roots beyond the 5000-item
+runnable-queue bound are considered without loading task bodies.
+
+`task_message` similarly returns `replayed=false` only when it appends a new
+event. Exact replay returns the original event with `replayed=true` and no
+stale delivery, wake recommendation, or SSE notification; fingerprint mismatch
+remains an error. `cancel_task` lets the issuer, assignee, or global coordinator
+remove queued/ready work without starting it; cancelling a reserved head also
+promotes the next FIFO item. It deliberately rejects a running task: SLC does
+not own the executor process and therefore cannot safely release that lane.
+The assignee must submit the terminal report; after a crashed run is confirmed
+idle, send the assignee a durable `task_message` for that same task and dispatch
+its returned delivery rather than creating a parallel replacement. The
+recovery run reports the already-running task without calling `start_task`
+again. Only the assignee may call `report_task`, so a global coordinator cannot
+accidentally close a writer that is still running. At that report boundary,
+manager-owned `leads_mass_redesign` roots whose terminal result is consumed as
+immutable downstream identity must include non-empty
+`metadata.artifact_revision`: BUILD `completed`, TEST `completed`/`failed`, and
+DEPLOY `failed`. The check runs before the event append and is intentionally
+limited to those portfolio transitions; generic tasks, unrelated terminal
+states, and historical events remain backward-compatible. Exact idempotent
+replay is resolved before new-report validation so a historical event can repair
+an interrupted projection/index write without being rejected by the newer
+contract; a changed fingerprint is still rejected. Report metadata is a JSON
+object at the engine boundary: omitting it means an empty object, while explicit
+`null`, scalar, and array values are typed invalid input.
+
 | Endpoint | Purpose |
 |---|---|
 | `POST /mcp` | JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`, …) |
