@@ -412,8 +412,31 @@ async fn mcp(
     }
 
     let initialize = is_initialize_request(&req);
-    let response = mcp_request(State(state), headers, Json(req)).await;
-    let mut response = response.into_response();
+    let sse_only = accepts_sse_only(&headers);
+    let (status, Json(body)) = mcp_request(State(state), headers, Json(req)).await;
+    if sse_only && status.is_success() {
+        // Strict Streamable-HTTP clients that asked for `text/event-stream`
+        // only are waiting for a terminal SSE event, not for a JSON body.
+        // Answer with a one-event `message` stream and close it: answering
+        // plain JSON leaves such clients reporting
+        // "tool call ended without a terminal event".
+        let data = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
+        let stream = async_stream::stream! {
+            yield Ok::<_, std::convert::Infallible>(
+                Event::default().event("message").data(data),
+            );
+        };
+        let mut response = Sse::new(stream).into_response();
+        if initialize {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            response.headers_mut().insert(
+                HeaderName::from_static("mcp-session-id"),
+                HeaderValue::from_str(&session_id).expect("UUID is a valid header value"),
+            );
+        }
+        return response;
+    }
+    let mut response = (status, Json(body)).into_response();
     if initialize && response.status().is_success() {
         // Streamable HTTP clients only open their long-lived GET channel for
         // server-initiated requests after the initialization response assigns
@@ -428,6 +451,21 @@ async fn mcp(
         );
     }
     response
+}
+
+/// True when the client explicitly accepts SSE output only (`text/event-stream`
+/// without `application/json` or `*/*`), i.e. it expects a terminal SSE event
+/// rather than an inline JSON body.
+fn accepts_sse_only(headers: &axum::http::HeaderMap) -> bool {
+    let Some(accept) = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    accept.contains("text/event-stream")
+        && !accept.contains("application/json")
+        && !accept.contains("*/*")
 }
 
 /// SLC keeps no transport session state, so termination is an idempotent
