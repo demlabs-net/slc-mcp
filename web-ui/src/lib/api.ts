@@ -28,7 +28,7 @@ export function getAccessToken(): string | null {
   return accessToken;
 }
 
-async function req<T = any>(method: string, path: string, body?: any, retried = false): Promise<T> {
+async function req<T = any>(path: string, method: string = 'GET', body?: any, retried = false): Promise<T> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'X-Seat-ID': getSeat(),
@@ -45,7 +45,7 @@ async function req<T = any>(method: string, path: string, body?: any, retried = 
       refreshPromise = import('./auth').then(m => m.refreshTokens()).finally(() => { refreshPromise = null; });
     }
     const ok = await refreshPromise;
-    if (ok) return req(method, path, body, true);
+    if (ok) return req(path, method, body, true);
   }
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
