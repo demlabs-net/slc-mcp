@@ -212,6 +212,9 @@ pub struct SlcConfig {
     pub task_assign_acl: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Text-only principals cannot claim visual acceptance in task reports.
     pub text_only_principals: std::collections::HashSet<String>,
+    /// Principals whose running tasks may be stopped by the operator stop
+    /// controller (`SLC_STOPPABLE_PRINCIPALS`). Empty = none.
+    pub stoppable_principals: std::collections::HashSet<String>,
     /// Operator-owned maintenance fence, keyed by exact seat ID (`*` holds all).
     pub workflow_hold_seats: std::collections::HashSet<String>,
     /// Optional operator incident generation. Old/unstamped tasks cannot start.
@@ -281,6 +284,7 @@ impl Default for SlcConfig {
             principal_policy_documents: roles::parse_principal_policy_documents_env(),
             task_assign_acl: roles::parse_task_assign_acl_env(),
             text_only_principals: roles::parse_text_only_principals_env(),
+            stoppable_principals: roles::parse_stoppable_principals_env(),
             workflow_generation: std::env::var("SLC_WORKFLOW_GENERATION")
                 .ok()
                 .map(|value| value.trim().to_string())

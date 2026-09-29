@@ -598,7 +598,8 @@ async fn operator_finalize_task_stop(
         .await
     {
         Ok(done) => {
-            if let Some(assignee) = done.task.assignee.as_deref()
+            if !done.superseded
+                && let Some(assignee) = done.task.assignee.as_deref()
                 && let Some(target_seat) = engine.workflow_seat(assignee)
             {
                 let _ = state.events.send(json!({
@@ -628,6 +629,7 @@ async fn operator_finalize_task_stop(
                 });
             Json(json!({
                 "success": true,
+                "superseded": done.superseded,
                 "task": done.task,
                 "event": done.event,
                 "request": done.request,
@@ -639,7 +641,7 @@ async fn operator_finalize_task_stop(
                     done.task.issuer.as_deref(),
                     &done.task.task_id,
                     Some(&done.event.event_id),
-                    "cancelled",
+                    if done.superseded { "report" } else { "cancelled" },
                 ),
             }))
             .into_response()
@@ -1154,7 +1156,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "cancel_task",
-            "description": "Cancel a workflow task. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task; never rebuild it from a human name. A not-found answer echoes the exact id you sent plus the closest existing ids. The issuer, assignee, or global coordinator may cancel. QUEUED/READY task: cancelled immediately; the event is appended, a ready reservation is released and the next FIFO item promoted (only next_delivery may wake it). RUNNING (IN_WORK) task: it is NOT cancelled immediately and the lane is NOT released — the response has stop_requested=true and a durable stop request is recorded. The operator stop controller then stops the assignee's executor, verifies it is gone, marks the task CANCELLED and wakes the next FIFO head by itself (usually within a minute). Do not report/start a replacement for that task meanwhile; poll get_task until status is CANCELLED. Repeating the call for the same running task is a harmless replay.",
+            "description": "Cancel a workflow task. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task; never rebuild it from a human name. A not-found answer echoes the exact id you sent plus the closest existing ids. The issuer, assignee, or global coordinator may cancel. QUEUED/READY task: cancelled immediately; the event is appended, a ready reservation is released and the next FIFO item promoted (only next_delivery may wake it). RUNNING (IN_WORK) task: only the global coordinator (manager) may request it, and only for roles served by the operator stop controller. It is NOT cancelled immediately and the lane is NOT released — the response has stop_requested=true and a durable stop request is recorded. The operator stop controller then restarts the assignee's whole executor (all of that role's current runs are interrupted), verifies it was down, closes the task and wakes the next FIFO head by itself (usually 1–3 minutes). The final status is CANCELLED, or the assignee's own report if it finished before the stop took effect. Do not report/start a replacement meanwhile; poll get_task until the status is final (not IN_WORK); list_task_events shows the stop milestones. Repeating the call is a harmless replay; stop_completed=true means the stop is already finished.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string","minLength":1},
                 "reason": {"type":"string","minLength":1},
@@ -2959,20 +2961,32 @@ async fn call_tool(
                     event,
                     request,
                     replayed,
-                } => json!({
-                    "success": true,
-                    "stop_requested": true,
-                    "replayed": replayed,
-                    "task": task,
-                    "event": event,
-                    "stop_request": request,
-                    "delivery": Value::Null,
-                    "wake_recommended": false,
-                    "next_ready_task": Value::Null,
-                    "next_wake_recommended": false,
-                    "next_delivery": Value::Null,
-                    "note": "The task is running, so it was NOT cancelled yet. A durable stop request was recorded; the operator stop controller stops the executor, verifies it is gone, marks the task CANCELLED and wakes the next FIFO head. Poll get_task / list_task_events; do not start a replacement meanwhile.",
-                }),
+                } => {
+                    let stop_finished = matches!(request.state.as_str(), "completed" | "abandoned");
+                    let note = if stop_finished {
+                        format!(
+                            "The stop request is finished: the task is now {}. Nothing else to do.",
+                            task.status
+                        )
+                    } else {
+                        "The task is running, so it was NOT cancelled yet. A durable stop request was recorded; the operator stop controller stops the executor, verifies it is gone and closes the task (CANCELLED, or the assignee's own report if it finished first), then wakes the next FIFO head. Poll get_task until the status is final (not IN_WORK); do not start a replacement meanwhile.".to_string()
+                    };
+                    json!({
+                        "success": true,
+                        "stop_requested": true,
+                        "stop_completed": stop_finished,
+                        "replayed": replayed,
+                        "task": task,
+                        "event": event,
+                        "stop_request": request,
+                        "delivery": Value::Null,
+                        "wake_recommended": false,
+                        "next_ready_task": Value::Null,
+                        "next_wake_recommended": false,
+                        "next_delivery": Value::Null,
+                        "note": note,
+                    })
+                }
                 slc_core::workflow::TaskCancelOutcome::Cancelled {
                     task,
                     event,
@@ -6171,6 +6185,7 @@ mod seat_filter_tests {
             ("analyst".into(), "seat-analyst".into()),
         ]);
         config.task_assign_acl = HashMap::from([("manager".into(), HashSet::from(["*".into()]))]);
+        config.stoppable_principals = HashSet::from(["contactor".into()]);
         let engine = SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config);
         engine.ensure_seat("seat-outsider").await.unwrap();
         engine
