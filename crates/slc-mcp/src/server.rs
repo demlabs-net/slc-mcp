@@ -77,6 +77,20 @@ pub async fn run(
         .route("/sse", get(sse_endpoint))
         .route("/messages", post(messages))
         .route("/health", get(health))
+        // Operator stop controller only (SLC_OPERATOR_STOP_TOKEN); never part
+        // of the agent MCP surface.
+        .route(
+            "/internal/operator/task-stops",
+            get(operator_list_task_stops),
+        )
+        .route(
+            "/internal/operator/task-stops/claim",
+            post(operator_claim_task_stop),
+        )
+        .route(
+            "/internal/operator/task-stops/finalize",
+            post(operator_finalize_task_stop),
+        )
         // ── Web UI (REST + SPA, same process) ──
         .route("/api/health", get(webui::api::health))
         .route("/api/stats", get(webui::api::stats))
@@ -469,6 +483,168 @@ async fn messages(
         }
     } else {
         (status, Json(body)).into_response()
+    }
+}
+
+/// Minimum length of the operator stop credential; shorter values disable the
+/// endpoints instead of weakening them.
+const OPERATOR_STOP_TOKEN_MIN_LEN: usize = 32;
+
+/// Authorize an operator stop-controller request. The credential lives only in
+/// the host service environment (`SLC_OPERATOR_STOP_TOKEN`); agent seats never
+/// see it, so a seat header alone can never reach these endpoints. A missing
+/// or short token disables them (503) rather than leaving them open.
+fn operator_stop_authorized(
+    headers: &axum::http::HeaderMap,
+) -> Result<(), Box<axum::response::Response>> {
+    operator_stop_authorized_with(
+        headers,
+        &std::env::var("SLC_OPERATOR_STOP_TOKEN").unwrap_or_default(),
+    )
+}
+
+fn operator_stop_authorized_with(
+    headers: &axum::http::HeaderMap,
+    expected: &str,
+) -> Result<(), Box<axum::response::Response>> {
+    let expected = expected.trim();
+    if expected.len() < OPERATOR_STOP_TOKEN_MIN_LEN {
+        return Err(Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"success": false, "error": "operator stop endpoints are disabled (SLC_OPERATOR_STOP_TOKEN is not configured)"})),
+            )
+                .into_response(),
+        ));
+    }
+    let provided = bearer_from_request(headers).unwrap_or_default();
+    use sha2::Digest as _;
+    let matches =
+        sha2::Sha256::digest(provided.as_bytes()) == sha2::Sha256::digest(expected.as_bytes());
+    if !matches {
+        return Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"success": false, "error": "invalid operator stop credential"})),
+            )
+                .into_response(),
+        ));
+    }
+    Ok(())
+}
+
+fn operator_error(error: slc_core::SlcError) -> axum::response::Response {
+    let status = match &error {
+        slc_core::SlcError::NotFound(_) => StatusCode::NOT_FOUND,
+        slc_core::SlcError::InvalidInput(_) | slc_core::SlcError::PermissionDenied(_) => {
+            StatusCode::CONFLICT
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(json!({"success": false, "error": error.to_string()})),
+    )
+        .into_response()
+}
+
+async fn operator_list_task_stops(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if let Err(response) = operator_stop_authorized(&headers) {
+        return *response;
+    }
+    match state.engine.workflow_list_task_stop_requests().await {
+        Ok(requests) => Json(json!({"success": true, "requests": requests})).into_response(),
+        Err(error) => operator_error(error),
+    }
+}
+
+async fn operator_claim_task_stop(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    if let Err(response) = operator_stop_authorized(&headers) {
+        return *response;
+    }
+    let task_id = body.get("task_id").and_then(Value::as_str).unwrap_or("");
+    let claim_id = body.get("claim_id").and_then(Value::as_str).unwrap_or("");
+    match state
+        .engine
+        .workflow_claim_task_stop(task_id, claim_id)
+        .await
+    {
+        Ok(request) => Json(json!({"success": true, "request": request})).into_response(),
+        Err(error) => operator_error(error),
+    }
+}
+
+async fn operator_finalize_task_stop(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    if let Err(response) = operator_stop_authorized(&headers) {
+        return *response;
+    }
+    let task_id = body.get("task_id").and_then(Value::as_str).unwrap_or("");
+    let claim_id = body.get("claim_id").and_then(Value::as_str).unwrap_or("");
+    let evidence = body.get("evidence").cloned().unwrap_or(Value::Null);
+    let engine = &state.engine;
+    match engine
+        .workflow_finalize_task_stop(task_id, claim_id, evidence)
+        .await
+    {
+        Ok(done) => {
+            if let Some(assignee) = done.task.assignee.as_deref()
+                && let Some(target_seat) = engine.workflow_seat(assignee)
+            {
+                let _ = state.events.send(json!({
+                    "type": "task_cancelled",
+                    "seat_id": target_seat,
+                    "task_id": done.task.task_id,
+                    "event_id": done.event.event_id,
+                    "actor": done.event.actor,
+                }));
+            }
+            let next_delivery = done
+                .next_ready_task
+                .as_ref()
+                .filter(|next| {
+                    next.assignee
+                        .as_deref()
+                        .is_some_and(|p| !engine.workflow_principal_held(p))
+                })
+                .map(|next| {
+                    workflow_delivery_if_released(
+                        engine,
+                        next.assignee.as_deref(),
+                        &next.task_id,
+                        next.queue_ready_event_id.as_deref(),
+                        "ready",
+                    )
+                });
+            Json(json!({
+                "success": true,
+                "task": done.task,
+                "event": done.event,
+                "request": done.request,
+                "next_ready_task": done.next_ready_task,
+                "next_wake_recommended": next_delivery.is_some(),
+                "next_delivery": next_delivery,
+                "issuer_delivery": workflow_delivery_if_released(
+                    engine,
+                    done.task.issuer.as_deref(),
+                    &done.task.task_id,
+                    Some(&done.event.event_id),
+                    "cancelled",
+                ),
+            }))
+            .into_response()
+        }
+        Err(error) => operator_error(error),
     }
 }
 
@@ -978,7 +1154,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "cancel_task",
-            "description": "Cancel a queued or ready workflow task without starting it. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task; never rebuild it from a human name. A not-found answer echoes the exact id you sent plus the closest existing ids. The issuer, assignee, or global coordinator may cancel. A running task cannot be cancelled here because SLC does not control the executor process; the assignee must report it, or the transport must first be stopped and the same task recovered. Cancellation appends an immutable SLC event, releases a ready reservation, and promotes the next FIFO item when necessary. The cancellation itself does not request a new agent run; only next_delivery may wake a newly promoted head.",
+            "description": "Cancel a workflow task. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task; never rebuild it from a human name. A not-found answer echoes the exact id you sent plus the closest existing ids. The issuer, assignee, or global coordinator may cancel. QUEUED/READY task: cancelled immediately; the event is appended, a ready reservation is released and the next FIFO item promoted (only next_delivery may wake it). RUNNING (IN_WORK) task: it is NOT cancelled immediately and the lane is NOT released — the response has stop_requested=true and a durable stop request is recorded. The operator stop controller then stops the assignee's executor, verifies it is gone, marks the task CANCELLED and wakes the next FIFO head by itself (usually within a minute). Do not report/start a replacement for that task meanwhile; poll get_task until status is CANCELLED. Repeating the call for the same running task is a harmless replay.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string","minLength":1},
                 "reason": {"type":"string","minLength":1},
@@ -2764,54 +2940,90 @@ async fn call_tool(
             let reason = args.get("reason").and_then(Value::as_str).unwrap_or("");
             let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
             let idempotency_key = args.get("idempotency_key").and_then(Value::as_str);
-            let (task, event, next_ready_task) = engine
-                .workflow_cancel_task(seat_id, task_id, reason, metadata, idempotency_key)
+            let outcome = engine
+                .workflow_cancel_task_with_outcome(
+                    seat_id,
+                    task_id,
+                    reason,
+                    metadata,
+                    idempotency_key,
+                )
                 .await
                 .map_err(json_err)?;
-            if let Some(assignee) = task.assignee.as_deref()
-                && let Some(target_seat) = engine.workflow_seat(assignee)
-            {
-                let _ = events.send(json!({
-                    "type": "task_cancelled",
-                    "seat_id": target_seat,
-                    "task_id": task.task_id,
-                    "event_id": event.event_id,
-                    "actor": event.actor,
-                }));
+            match outcome {
+                // A running task keeps its lane: nothing is released or woken
+                // here. The operator stop controller finalizes it after the
+                // executor is proven gone.
+                slc_core::workflow::TaskCancelOutcome::StopRequested {
+                    task,
+                    event,
+                    request,
+                    replayed,
+                } => json!({
+                    "success": true,
+                    "stop_requested": true,
+                    "replayed": replayed,
+                    "task": task,
+                    "event": event,
+                    "stop_request": request,
+                    "delivery": Value::Null,
+                    "wake_recommended": false,
+                    "next_ready_task": Value::Null,
+                    "next_wake_recommended": false,
+                    "next_delivery": Value::Null,
+                    "note": "The task is running, so it was NOT cancelled yet. A durable stop request was recorded; the operator stop controller stops the executor, verifies it is gone, marks the task CANCELLED and wakes the next FIFO head. Poll get_task / list_task_events; do not start a replacement meanwhile.",
+                }),
+                slc_core::workflow::TaskCancelOutcome::Cancelled {
+                    task,
+                    event,
+                    next_ready_task,
+                } => {
+                    if let Some(assignee) = task.assignee.as_deref()
+                        && let Some(target_seat) = engine.workflow_seat(assignee)
+                    {
+                        let _ = events.send(json!({
+                            "type": "task_cancelled",
+                            "seat_id": target_seat,
+                            "task_id": task.task_id,
+                            "event_id": event.event_id,
+                            "actor": event.actor,
+                        }));
+                    }
+                    let next_delivery = next_ready_task
+                        .as_ref()
+                        .filter(|next| {
+                            next.assignee
+                                .as_deref()
+                                .is_some_and(|p| !engine.workflow_principal_held(p))
+                        })
+                        .map(|next| {
+                            workflow_delivery_if_released(
+                                engine,
+                                next.assignee.as_deref(),
+                                &next.task_id,
+                                next.queue_ready_event_id.as_deref(),
+                                "ready",
+                            )
+                        });
+                    let next_wake_recommended = next_delivery.is_some();
+                    json!({
+                        "success": true,
+                        "task": task,
+                        "event": event,
+                        "delivery": workflow_delivery_if_released(
+                            engine,
+                            event.recipient.as_deref(),
+                            &task.task_id,
+                            Some(&event.event_id),
+                            "cancelled",
+                        ),
+                        "wake_recommended": false,
+                        "next_ready_task": next_ready_task,
+                        "next_wake_recommended": next_wake_recommended,
+                        "next_delivery": next_delivery,
+                    })
+                }
             }
-            let next_delivery = next_ready_task
-                .as_ref()
-                .filter(|next| {
-                    next.assignee
-                        .as_deref()
-                        .is_some_and(|p| !engine.workflow_principal_held(p))
-                })
-                .map(|next| {
-                    workflow_delivery_if_released(
-                        engine,
-                        next.assignee.as_deref(),
-                        &next.task_id,
-                        next.queue_ready_event_id.as_deref(),
-                        "ready",
-                    )
-                });
-            let next_wake_recommended = next_delivery.is_some();
-            json!({
-                "success": true,
-                "task": task,
-                "event": event,
-                "delivery": workflow_delivery_if_released(
-                    engine,
-                    event.recipient.as_deref(),
-                    &task.task_id,
-                    Some(&event.event_id),
-                    "cancelled",
-                ),
-                "wake_recommended": false,
-                "next_ready_task": next_ready_task,
-                "next_wake_recommended": next_wake_recommended,
-                "next_delivery": next_delivery,
-            })
         }
         "task_message" => {
             let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
@@ -5860,6 +6072,85 @@ mod seat_filter_tests {
             .unwrap()
             .to_string();
         assert!(text.contains(long_id), "{text}");
+    }
+
+    #[test]
+    fn operator_stop_credential_is_required_and_disabled_when_unset() {
+        let token = "operator-stop-token-0123456789abcdef";
+        let mut headers = axum::http::HeaderMap::new();
+        // Unset or short token: endpoints are disabled, not open.
+        let disabled = operator_stop_authorized_with(&headers, "").unwrap_err();
+        assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let short = operator_stop_authorized_with(&headers, "short").unwrap_err();
+        assert_eq!(short.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // A seat header is never a credential here.
+        headers.insert("x-seat-id", HeaderValue::from_static("manager"));
+        let missing = operator_stop_authorized_with(&headers, token).unwrap_err();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-token-0123456789abcdefghij"),
+        );
+        let wrong = operator_stop_authorized_with(&headers, token).unwrap_err();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        assert!(operator_stop_authorized_with(&headers, token).is_ok());
+    }
+
+    /// MCP surface: cancelling a running task answers stop_requested and never
+    /// hands out a wake; the operator finalize then releases the lane.
+    #[tokio::test]
+    async fn cancel_running_task_over_mcp_is_a_stop_request() {
+        let engine = swarm_engine().await;
+        let first = tool_json(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            json!({"assignee":"contactor","name":"Stuck","idempotency_key":"mcp-stop-a"}),
+        )
+        .await;
+        let first_id = first["task"]["task_id"].as_str().unwrap().to_string();
+        let second = tool_json(
+            &engine,
+            "seat-manager",
+            "assign_task",
+            json!({"assignee":"contactor","name":"Next","idempotency_key":"mcp-stop-b"}),
+        )
+        .await;
+        let second_id = second["task"]["task_id"].as_str().unwrap().to_string();
+        tool_json(
+            &engine,
+            "seat-contactor",
+            "start_task",
+            json!({"task_id":first_id,"idempotency_key":"mcp-stop-start"}),
+        )
+        .await;
+
+        let cancelled = tool_json(
+            &engine,
+            "seat-manager",
+            "cancel_task",
+            json!({"task_id":first_id,"reason":"stuck","idempotency_key":"mcp-stop-cancel"}),
+        )
+        .await;
+        assert_eq!(cancelled["stop_requested"], true);
+        assert_eq!(cancelled["wake_recommended"], false);
+        assert!(cancelled["next_delivery"].is_null());
+        assert_eq!(cancelled["task"]["status"], "IN_WORK");
+
+        engine
+            .workflow_claim_task_stop(&first_id, "mcp-claim")
+            .await
+            .unwrap();
+        let done = engine
+            .workflow_finalize_task_stop(&first_id, "mcp-claim", json!({"stopped": true}))
+            .await
+            .unwrap();
+        assert_eq!(done.task.status, "CANCELLED");
+        assert_eq!(done.next_ready_task.unwrap().task_id, second_id);
     }
 
     /// Engine helper — the manager swarm over the contactor/analyst.

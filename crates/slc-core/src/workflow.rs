@@ -23,7 +23,13 @@ use uuid::Uuid;
 const TASK_EVENTS: &str = "task_events_v1";
 const TASK_EVENT_IDEMPOTENCY: &str = "task_event_idempotency_v1";
 const TASK_ASSIGN_IDEMPOTENCY: &str = "task_assign_idempotency_v1";
+/// Operator-owned stop requests for running tasks, keyed by task id.
+const TASK_STOP_REQUESTS: &str = "task_stop_requests_v1";
 const MAX_ASSIGNEE_QUEUE_DEPTH: usize = 5_000;
+const STOP_STATE_REQUESTED: &str = "requested";
+const STOP_STATE_CLAIMED: &str = "claimed";
+const STOP_STATE_COMPLETED: &str = "completed";
+const STOP_STATE_ABANDONED: &str = "abandoned";
 const LEADS_PORTFOLIO_PROJECT: &str = "leads_mass_redesign";
 
 pub const QUEUE_STATE_QUEUED: &str = "queued";
@@ -61,6 +67,76 @@ impl TaskEventKind {
             Self::StatusChanged => "status_changed",
             Self::Transport => "transport",
             Self::Update => "update",
+        }
+    }
+}
+
+/// Durable request to stop the executor of a running task.
+///
+/// SLC cannot stop a Hermes run itself, and it must never release a running
+/// lane on a coordinator's word alone. The request is therefore only a durable
+/// intent: an operator-side stop controller claims it, stops the executor
+/// out-of-band, proves the executor is gone, and only then finalizes the task.
+/// While a request is `claimed` the assignee cannot report or start anything,
+/// so no second writer can appear during the stop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskStopRequest {
+    pub task_id: String,
+    pub assignee: String,
+    pub requested_by: String,
+    pub reason: String,
+    pub request_event_id: String,
+    /// `requested` -> `claimed` -> `completed`; `abandoned` when the task
+    /// reached a terminal status by other means before the stop was claimed.
+    pub state: String,
+    pub requested_at: String,
+    #[serde(default)]
+    pub claim_id: Option<String>,
+    #[serde(default)]
+    pub claimed_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub final_status: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<Value>,
+}
+
+/// Result of an operator stop finalization.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskStopFinalization {
+    pub task: TaskInfo,
+    pub event: TaskEvent,
+    pub request: TaskStopRequest,
+    pub next_ready_task: Option<TaskInfo>,
+}
+
+/// What `cancel_task` did: an immediate cancellation (queued/ready work), or a
+/// durable stop request for a running task whose lane stays reserved.
+#[derive(Debug, Clone)]
+pub enum TaskCancelOutcome {
+    Cancelled {
+        task: TaskInfo,
+        event: TaskEvent,
+        next_ready_task: Option<TaskInfo>,
+    },
+    StopRequested {
+        task: TaskInfo,
+        event: TaskEvent,
+        request: TaskStopRequest,
+        replayed: bool,
+    },
+}
+
+impl TaskCancelOutcome {
+    pub fn into_legacy(self) -> (TaskInfo, TaskEvent, Option<TaskInfo>) {
+        match self {
+            Self::Cancelled {
+                task,
+                event,
+                next_ready_task,
+            } => (task, event, next_ready_task),
+            Self::StopRequested { task, event, .. } => (task, event, None),
         }
     }
 }
@@ -1751,6 +1827,15 @@ impl SlcEngine {
         let task_id = task_id.as_str();
         let mut doc = self.workflow_task_document(seat_id, task_id).await?;
         self.require_workflow_generation(&doc)?;
+        // A claimed stop is tearing the executor down; a restarted run must not
+        // re-enter this task (nor replay a start) until the stop is finalized.
+        if let Some(stop) = self.task_stop_request(task_id).await?
+            && stop.state == STOP_STATE_CLAIMED
+        {
+            return Err(SlcError::PermissionDenied(format!(
+                "operator stop in progress for task {task_id}; it cannot be started"
+            )));
+        }
         let actor = self.workflow_principal(seat_id);
         if workflow_string(&doc, "assignee").as_deref() != Some(&actor) {
             return Err(SlcError::PermissionDenied(
@@ -2009,6 +2094,17 @@ impl SlcEngine {
                 "task must be started from the FIFO head before reporting".into(),
             ));
         }
+        // Once an operator stop controller has claimed the task, the executor is
+        // being stopped and its outcome is decided by the controller's proof, not
+        // by a late report from a run that may already be half torn down.
+        if let Some(stop) = self.task_stop_request(task_id).await?
+            && stop.state == STOP_STATE_CLAIMED
+        {
+            return Err(SlcError::PermissionDenied(format!(
+                "operator stop in progress for task {task_id} (claim {}); the executor is being stopped and cannot report",
+                stop.claim_id.as_deref().unwrap_or("?")
+            )));
+        }
         if status == STATUS_COMPLETED
             && self.config.text_only_principals.contains(&actor)
             && let Some(claim) = visual_claim(&summary)
@@ -2085,6 +2181,24 @@ impl SlcEngine {
         metadata: Value,
         idempotency_key: Option<&str>,
     ) -> SlcResult<(TaskInfo, TaskEvent, Option<TaskInfo>)> {
+        Ok(self
+            .workflow_cancel_task_with_outcome(seat_id, task_id, reason, metadata, idempotency_key)
+            .await?
+            .into_legacy())
+    }
+
+    /// Cancel a task. Queued/ready work is cancelled immediately. A running task
+    /// is never released here: the call records a durable stop request that an
+    /// operator stop controller executes (stop the executor, prove it is gone,
+    /// then finalize), so the lane stays reserved until the writer is proven dead.
+    pub async fn workflow_cancel_task_with_outcome(
+        &self,
+        seat_id: &str,
+        task_id: &str,
+        reason: &str,
+        metadata: Value,
+        idempotency_key: Option<&str>,
+    ) -> SlcResult<TaskCancelOutcome> {
         let _workflow_guard = self.workflow_lock.lock().await;
         let task_id = clean_required(task_id, "task_id", 500)?;
         let doc = self.workflow_task_document(seat_id, &task_id).await?;
@@ -2121,6 +2235,27 @@ impl SlcEngine {
         let current_status =
             workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
         if is_terminal_status(&current_status) {
+            // A cancel replayed after the operator stop controller already
+            // finalized the stop it requested: report that outcome, not an error.
+            if current_status == STATUS_CANCELLED
+                && let Some(stop) = self.task_stop_request(&task_id).await?
+                && stop.requested_by == actor
+                && stop.reason == reason
+            {
+                let event = self
+                    .store()
+                    .get_record(TASK_EVENTS, &stop.request_event_id)
+                    .await?
+                    .map(serde_json::from_value::<TaskEvent>)
+                    .transpose()?
+                    .ok_or_else(|| SlcError::Storage("stop request event is missing".into()))?;
+                return Ok(TaskCancelOutcome::StopRequested {
+                    task: doc_to_task(&doc),
+                    event,
+                    request: stop,
+                    replayed: true,
+                });
+            }
             if current_status != STATUS_CANCELLED
                 || workflow_string(&doc, "terminal_summary").as_deref() != Some(reason.as_str())
             {
@@ -2144,7 +2279,11 @@ impl SlcEngine {
                         .await?;
                 }
                 self.reconcile_task_queue_locked(&assignee).await?;
-                return Ok((repaired, event, None));
+                return Ok(TaskCancelOutcome::Cancelled {
+                    task: repaired,
+                    event,
+                    next_ready_task: None,
+                });
             }
             return Err(SlcError::InvalidInput(
                 "cancelled task already has a status event; retry only with the original idempotency_key"
@@ -2155,15 +2294,22 @@ impl SlcEngine {
         // SLC owns durable task state, not the transport/process lifecycle. A
         // coordinator cancelling a RUNNING projection cannot prove that the
         // corresponding Hermes run has stopped; releasing the lane here could
-        // promote a second writer while the first one is still editing. A
-        // live assignee must close its run with report_task. After a crashed
-        // transport is confirmed idle, wake that same assignee to recover and
-        // report the existing task instead of manufacturing a replacement.
+        // promote a second writer while the first one is still editing. The
+        // cancellation is therefore recorded as a durable stop request only.
+        // The lane stays reserved: the operator stop controller stops the
+        // executor out-of-band, verifies it is gone, and then finalizes.
         if effective_queue_state(&doc) == QUEUE_STATE_RUNNING {
-            return Err(SlcError::InvalidInput(
-                "running task cannot be cancelled because SLC does not control its executor; let the assignee report it, or stop the transport and recover the same task"
-                    .into(),
-            ));
+            return self
+                .record_task_stop_request(
+                    &task_id,
+                    &assignee,
+                    &actor,
+                    recipient,
+                    &reason,
+                    metadata,
+                    idempotency_key,
+                )
+                .await;
         }
 
         let released_lane = effective_queue_state(&doc) == QUEUE_STATE_READY;
@@ -2200,7 +2346,285 @@ impl SlcEngine {
         }
         let queue = self.reconcile_task_queue_locked(&assignee).await?;
         let next_ready = released_lane.then(|| queue.ready_task()).flatten();
-        Ok((task, event, next_ready))
+        Ok(TaskCancelOutcome::Cancelled {
+            task,
+            event,
+            next_ready_task: next_ready,
+        })
+    }
+
+    pub async fn task_stop_request(&self, task_id: &str) -> SlcResult<Option<TaskStopRequest>> {
+        self.store()
+            .get_record(TASK_STOP_REQUESTS, task_id)
+            .await?
+            .map(serde_json::from_value::<TaskStopRequest>)
+            .transpose()
+            .map_err(SlcError::from)
+    }
+
+    async fn put_task_stop_request(&self, request: &TaskStopRequest) -> SlcResult<()> {
+        self.store()
+            .put_record(
+                TASK_STOP_REQUESTS,
+                &request.task_id,
+                &serde_json::to_value(request)?,
+            )
+            .await
+    }
+
+    /// Record (or replay) the durable stop request for a running task. The
+    /// request never changes the task status or its lane reservation.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_task_stop_request(
+        &self,
+        task_id: &str,
+        assignee: &str,
+        actor: &str,
+        recipient: Option<&str>,
+        reason: &str,
+        metadata: Value,
+        idempotency_key: Option<&str>,
+    ) -> SlcResult<TaskCancelOutcome> {
+        if let Some(existing) = self.task_stop_request(task_id).await?
+            && existing.state != STOP_STATE_ABANDONED
+        {
+            let event = self
+                .store()
+                .get_record(TASK_EVENTS, &existing.request_event_id)
+                .await?
+                .map(serde_json::from_value::<TaskEvent>)
+                .transpose()?
+                .ok_or_else(|| SlcError::Storage("stop request event is missing".into()))?;
+            let doc = task_document(self.store().kb_get(task_id).await?, task_id)?;
+            return Ok(TaskCancelOutcome::StopRequested {
+                task: doc_to_task(&doc),
+                event,
+                request: existing,
+                replayed: true,
+            });
+        }
+        let request_metadata = json!({
+            "stop_request": true,
+            "reason_metadata": metadata,
+        });
+        let event = self
+            .append_task_event(
+                task_id,
+                TaskEventKind::Message,
+                actor,
+                recipient,
+                None,
+                &format!(
+                    "Operator stop requested for this running task: {reason}. The lane stays reserved until an operator stop controller stops the executor and finalizes the task as CANCELLED."
+                ),
+                request_metadata,
+                idempotency_key,
+            )
+            .await?;
+        self.touch_task_projection(task_id, &event, None, None)
+            .await?;
+        let request = TaskStopRequest {
+            task_id: task_id.to_string(),
+            assignee: assignee.to_string(),
+            requested_by: actor.to_string(),
+            reason: reason.to_string(),
+            request_event_id: event.event_id.clone(),
+            state: STOP_STATE_REQUESTED.to_string(),
+            requested_at: Utc::now().to_rfc3339(),
+            claim_id: None,
+            claimed_at: None,
+            completed_at: None,
+            final_status: None,
+            evidence: None,
+        };
+        self.put_task_stop_request(&request).await?;
+        let doc = task_document(self.store().kb_get(task_id).await?, task_id)?;
+        Ok(TaskCancelOutcome::StopRequested {
+            task: doc_to_task(&doc),
+            event,
+            request,
+            replayed: false,
+        })
+    }
+
+    /// Operator view: every stop request, oldest first. Requests whose task
+    /// already reached a terminal status by other means are marked `abandoned`
+    /// so a controller never stops an executor that is already working on the
+    /// next task.
+    pub async fn workflow_list_task_stop_requests(&self) -> SlcResult<Vec<TaskStopRequest>> {
+        let _workflow_guard = self.workflow_lock.lock().await;
+        let mut requests = Vec::new();
+        for (_, value) in self.store().list_records(TASK_STOP_REQUESTS).await? {
+            let Ok(mut request) = serde_json::from_value::<TaskStopRequest>(value) else {
+                continue;
+            };
+            if matches!(request.state.as_str(), STOP_STATE_REQUESTED)
+                && let Some(doc) = self.store().kb_get(&request.task_id).await?
+                && effective_queue_state(&doc) != QUEUE_STATE_RUNNING
+            {
+                request.state = STOP_STATE_ABANDONED.to_string();
+                request.completed_at = Some(Utc::now().to_rfc3339());
+                request.final_status = workflow_string(&doc, "status");
+                self.put_task_stop_request(&request).await?;
+            }
+            requests.push(request);
+        }
+        requests.sort_by(|left, right| left.requested_at.cmp(&right.requested_at));
+        Ok(requests)
+    }
+
+    /// Operator step 1: claim a stop request before touching the executor.
+    ///
+    /// The claim is the fence that makes the stop safe: from here on the
+    /// assignee can neither report nor start, and the lane stays reserved, so no
+    /// second writer can appear while the controller stops the process. The
+    /// claim is idempotent for the same `claim_id`.
+    pub async fn workflow_claim_task_stop(
+        &self,
+        task_id: &str,
+        claim_id: &str,
+    ) -> SlcResult<TaskStopRequest> {
+        let _workflow_guard = self.workflow_lock.lock().await;
+        let task_id = clean_required(task_id, "task_id", 500)?;
+        let claim_id = clean_required(claim_id, "claim_id", 200)?;
+        let mut request = self
+            .task_stop_request(&task_id)
+            .await?
+            .ok_or_else(|| SlcError::NotFound(format!("no stop request for task {task_id}")))?;
+        match request.state.as_str() {
+            STOP_STATE_REQUESTED => {}
+            STOP_STATE_CLAIMED if request.claim_id.as_deref() == Some(claim_id.as_str()) => {
+                return Ok(request);
+            }
+            STOP_STATE_CLAIMED => {
+                return Err(SlcError::InvalidInput(format!(
+                    "stop for task {task_id} is already claimed by {}",
+                    request.claim_id.as_deref().unwrap_or("?")
+                )));
+            }
+            other => {
+                return Err(SlcError::InvalidInput(format!(
+                    "stop request for task {task_id} is {other}; nothing to claim"
+                )));
+            }
+        }
+        let doc = task_document(self.store().kb_get(&task_id).await?, &task_id)?;
+        if effective_queue_state(&doc) != QUEUE_STATE_RUNNING {
+            request.state = STOP_STATE_ABANDONED.to_string();
+            request.completed_at = Some(Utc::now().to_rfc3339());
+            request.final_status = workflow_string(&doc, "status");
+            self.put_task_stop_request(&request).await?;
+            return Err(SlcError::InvalidInput(format!(
+                "task {task_id} is no longer running; its stop request was abandoned"
+            )));
+        }
+        request.state = STOP_STATE_CLAIMED.to_string();
+        request.claim_id = Some(claim_id);
+        request.claimed_at = Some(Utc::now().to_rfc3339());
+        self.put_task_stop_request(&request).await?;
+        Ok(request)
+    }
+
+    /// Operator step 3: finalize a claimed stop after the executor was stopped.
+    ///
+    /// `evidence` is the controller's record of how it proved the executor is
+    /// gone. SLC trusts it only because this entry point is reachable solely
+    /// with the operator stop credential (never through the agent MCP surface).
+    /// Idempotent for the same claim: a retry after a crash repairs the
+    /// projection and the lane without appending a second terminal event.
+    pub async fn workflow_finalize_task_stop(
+        &self,
+        task_id: &str,
+        claim_id: &str,
+        evidence: Value,
+    ) -> SlcResult<TaskStopFinalization> {
+        let _workflow_guard = self.workflow_lock.lock().await;
+        let task_id = clean_required(task_id, "task_id", 500)?;
+        let claim_id = clean_required(claim_id, "claim_id", 200)?;
+        if !evidence.is_object() {
+            return Err(SlcError::InvalidInput(
+                "evidence must be a JSON object describing how the executor stop was verified"
+                    .into(),
+            ));
+        }
+        let mut request = self
+            .task_stop_request(&task_id)
+            .await?
+            .ok_or_else(|| SlcError::NotFound(format!("no stop request for task {task_id}")))?;
+        if request.claim_id.as_deref() != Some(claim_id.as_str())
+            || !matches!(
+                request.state.as_str(),
+                STOP_STATE_CLAIMED | STOP_STATE_COMPLETED
+            )
+        {
+            return Err(SlcError::InvalidInput(format!(
+                "stop for task {task_id} is {} with claim {}; finalize only the claim you hold",
+                request.state,
+                request.claim_id.as_deref().unwrap_or("none")
+            )));
+        }
+        let doc = task_document(self.store().kb_get(&task_id).await?, &task_id)?;
+        let assignee = request.assignee.clone();
+        let summary = format!(
+            "Cancelled by operator stop: {}. The executor was stopped and verified gone before the lane was released.",
+            request.reason
+        );
+        let current_status =
+            workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
+        if is_terminal_status(&current_status) && current_status != STATUS_CANCELLED {
+            return Err(SlcError::InvalidInput(format!(
+                "task {task_id} already reached {current_status}; the stop cannot override it"
+            )));
+        }
+        let finalize_key = format!("operator-stop-finalize-v1:{task_id}:{claim_id}");
+        let event = self
+            .append_task_event(
+                &task_id,
+                TaskEventKind::StatusChanged,
+                "operator-stop",
+                Some(&assignee),
+                Some(STATUS_CANCELLED),
+                &summary,
+                json!({"stop_claim_id": claim_id, "stop_request_event_id": request.request_event_id}),
+                Some(&finalize_key),
+            )
+            .await?;
+        let mut task = self
+            .touch_task_projection(&task_id, &event, Some(STATUS_CANCELLED), Some(&summary))
+            .await?;
+        if task.status != STATUS_CANCELLED {
+            return Err(SlcError::Storage(format!(
+                "task projection did not apply the operator stop for {task_id}"
+            )));
+        }
+        task = self
+            .set_task_queue_projection(&task_id, QUEUE_STATE_TERMINAL, None)
+            .await?;
+        if let Some(assignee_seat) = self.workflow_seat(&assignee)
+            && let Some(seat) = self.seats.get_seat(&assignee_seat).await?
+            && seat.active_task_id.as_deref() == Some(task_id.as_str())
+        {
+            self.seats
+                .set_active_task(&assignee_seat, None, None)
+                .await?;
+        }
+        if request.state != STOP_STATE_COMPLETED {
+            request.state = STOP_STATE_COMPLETED.to_string();
+            request.completed_at = Some(Utc::now().to_rfc3339());
+            request.final_status = Some(STATUS_CANCELLED.to_string());
+            request.evidence = Some(evidence);
+            self.put_task_stop_request(&request).await?;
+        }
+        let next_ready_task = self
+            .reconcile_task_queue_locked(&assignee)
+            .await?
+            .ready_task();
+        Ok(TaskStopFinalization {
+            task,
+            event,
+            request,
+            next_ready_task,
+        })
     }
 
     pub async fn workflow_task_message(
@@ -4728,9 +5152,11 @@ mod tests {
                 .contains("only the assignee can report")
         );
 
+        // Cancelling a running task only records a stop request; it never
+        // releases the lane, whoever asks and however often.
         for actor in ["seat-senior", "seat-junior", "seat-manager"] {
-            let error = engine
-                .workflow_cancel_task(
+            let outcome = engine
+                .workflow_cancel_task_with_outcome(
                     actor,
                     &running.task_id,
                     "Do not release a live process",
@@ -4738,13 +5164,19 @@ mod tests {
                     Some(&format!("cancel-running-{actor}")),
                 )
                 .await
-                .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("running task cannot be cancelled")
-            );
+                .unwrap();
+            let TaskCancelOutcome::StopRequested { task, .. } = outcome else {
+                panic!("a running task must produce a stop request, not a cancellation");
+            };
+            assert_eq!(task.status, STATUS_ACTIVE);
         }
+        let stop = engine
+            .task_stop_request(&running.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stop.state, STOP_STATE_REQUESTED);
+        assert_eq!(stop.requested_by, "senior");
 
         let queue = engine
             .workflow_reconcile_task_queue("seat-senior", "junior")
@@ -4774,6 +5206,308 @@ mod tests {
                 .unwrap()
                 .task_id,
             running.task_id
+        );
+    }
+
+    async fn running_pair(engine: &SlcEngine, tag: &str) -> (TaskInfo, TaskInfo) {
+        let running = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Running writer",
+                "live",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some(&format!("{tag}-head")),
+            )
+            .await
+            .unwrap();
+        let queued = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Queued writer",
+                "next",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some(&format!("{tag}-tail")),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_start_task(
+                "seat-junior",
+                &running.task_id,
+                "live",
+                Some(&format!("{tag}-start")),
+            )
+            .await
+            .unwrap();
+        (running, queued)
+    }
+
+    /// Full operator stop: request -> claim -> (executor stopped) -> finalize.
+    /// The lane is released only by the finalize, which promotes the next head.
+    #[tokio::test]
+    async fn operator_stop_releases_the_lane_only_after_finalize() {
+        let engine = engine();
+        let (running, queued) = running_pair(&engine, "stop-full").await;
+        engine
+            .workflow_cancel_task_with_outcome(
+                "seat-manager",
+                &running.task_id,
+                "stuck",
+                json!({}),
+                Some("stop-full-cancel"),
+            )
+            .await
+            .unwrap();
+
+        let claimed = engine
+            .workflow_claim_task_stop(&running.task_id, "claim-1")
+            .await
+            .unwrap();
+        assert_eq!(claimed.state, STOP_STATE_CLAIMED);
+        // Same claim is idempotent; a different claimer is refused.
+        engine
+            .workflow_claim_task_stop(&running.task_id, "claim-1")
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .workflow_claim_task_stop(&running.task_id, "claim-2")
+                .await
+                .is_err()
+        );
+
+        // While claimed, the old executor can neither report nor re-start.
+        let report = engine
+            .workflow_report_task(
+                "seat-junior",
+                &running.task_id,
+                "completed",
+                "late report from a dying run",
+                json!({}),
+                Some("stop-full-late-report"),
+            )
+            .await
+            .unwrap_err();
+        assert!(report.to_string().contains("operator stop in progress"));
+        let restart = engine
+            .workflow_start_task(
+                "seat-junior",
+                &running.task_id,
+                "again",
+                Some("stop-full-start"),
+            )
+            .await
+            .unwrap_err();
+        assert!(restart.to_string().contains("operator stop in progress"));
+
+        // Still running and still holding the lane until finalize.
+        let queue = engine
+            .workflow_reconcile_task_queue("seat-senior", "junior")
+            .await
+            .unwrap();
+        assert_eq!(
+            queue.running_task_id.as_deref(),
+            Some(running.task_id.as_str())
+        );
+
+        // A wrong claim cannot finalize.
+        assert!(
+            engine
+                .workflow_finalize_task_stop(&running.task_id, "claim-2", json!({"verified": true}))
+                .await
+                .is_err()
+        );
+        let done = engine
+            .workflow_finalize_task_stop(
+                &running.task_id,
+                "claim-1",
+                json!({"container_stopped": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.task.status, STATUS_CANCELLED);
+        assert_eq!(done.request.state, STOP_STATE_COMPLETED);
+        assert_eq!(
+            done.next_ready_task
+                .as_ref()
+                .map(|task| task.task_id.as_str()),
+            Some(queued.task_id.as_str())
+        );
+        assert!(
+            engine
+                .task_get_active("seat-junior")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Finalize is idempotent: a retry appends nothing and changes nothing.
+        let events_before = engine
+            .workflow_task_events("seat-manager", &running.task_id, 500)
+            .await
+            .unwrap()
+            .len();
+        let again = engine
+            .workflow_finalize_task_stop(
+                &running.task_id,
+                "claim-1",
+                json!({"container_stopped": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.event.event_id, done.event.event_id);
+        assert_eq!(
+            engine
+                .workflow_task_events("seat-manager", &running.task_id, 500)
+                .await
+                .unwrap()
+                .len(),
+            events_before
+        );
+
+        // Replaying the original cancel reports the finished stop, not an error.
+        let replay = engine
+            .workflow_cancel_task_with_outcome(
+                "seat-manager",
+                &running.task_id,
+                "stuck",
+                json!({}),
+                Some("stop-full-cancel"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            replay,
+            TaskCancelOutcome::StopRequested { replayed: true, .. }
+        ));
+    }
+
+    /// If the executor finished on its own before the controller claimed the
+    /// stop, the request is abandoned: the controller must not stop a process
+    /// that may already be working on the next task.
+    #[tokio::test]
+    async fn stop_request_is_abandoned_when_the_task_finishes_first() {
+        let engine = engine();
+        let (running, _) = running_pair(&engine, "stop-race").await;
+        engine
+            .workflow_cancel_task_with_outcome(
+                "seat-manager",
+                &running.task_id,
+                "stuck",
+                json!({}),
+                Some("stop-race-cancel"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_report_task(
+                "seat-junior",
+                &running.task_id,
+                "completed",
+                "finished before the stop",
+                json!({}),
+                Some("stop-race-report"),
+            )
+            .await
+            .unwrap();
+        let claim = engine
+            .workflow_claim_task_stop(&running.task_id, "claim-late")
+            .await
+            .unwrap_err();
+        assert!(claim.to_string().contains("no longer running"));
+        let stop = engine
+            .task_stop_request(&running.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stop.state, STOP_STATE_ABANDONED);
+        assert_eq!(stop.final_status.as_deref(), Some(STATUS_COMPLETED));
+        let listed = engine.workflow_list_task_stop_requests().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, STOP_STATE_ABANDONED);
+    }
+
+    /// A crash between the terminal event and the queue projection is repaired
+    /// by retrying finalize with the same claim.
+    #[tokio::test]
+    async fn stop_finalize_retry_repairs_a_half_written_projection() {
+        let engine = engine();
+        let (running, queued) = running_pair(&engine, "stop-crash").await;
+        engine
+            .workflow_cancel_task_with_outcome(
+                "seat-manager",
+                &running.task_id,
+                "stuck",
+                json!({}),
+                Some("stop-crash-cancel"),
+            )
+            .await
+            .unwrap();
+        engine
+            .workflow_claim_task_stop(&running.task_id, "claim-c")
+            .await
+            .unwrap();
+        // Simulate the crash: the terminal event exists, nothing else was applied.
+        let _guard = engine.workflow_lock.lock().await;
+        engine
+            .append_task_event(
+                &running.task_id,
+                TaskEventKind::StatusChanged,
+                "operator-stop",
+                Some("junior"),
+                Some(STATUS_CANCELLED),
+                "Cancelled by operator stop: stuck. The executor was stopped and verified gone before the lane was released.",
+                json!({"stop_claim_id": "claim-c", "stop_request_event_id": engine.task_stop_request(&running.task_id).await.unwrap().unwrap().request_event_id}),
+                Some(&format!("operator-stop-finalize-v1:{}:claim-c", running.task_id)),
+            )
+            .await
+            .unwrap();
+        drop(_guard);
+        let done = engine
+            .workflow_finalize_task_stop(&running.task_id, "claim-c", json!({"ok": true}))
+            .await
+            .unwrap();
+        assert_eq!(done.task.status, STATUS_CANCELLED);
+        assert_eq!(done.task.queue_state.as_deref(), Some(QUEUE_STATE_TERMINAL));
+        assert_eq!(
+            done.next_ready_task.map(|task| task.task_id),
+            Some(queued.task_id)
+        );
+    }
+
+    /// Queued/ready cancellation keeps its immediate semantics.
+    #[tokio::test]
+    async fn queued_cancel_is_still_immediate() {
+        let engine = engine();
+        let (_, queued) = running_pair(&engine, "stop-queued").await;
+        let outcome = engine
+            .workflow_cancel_task_with_outcome(
+                "seat-manager",
+                &queued.task_id,
+                "not needed",
+                json!({}),
+                Some("stop-queued-cancel"),
+            )
+            .await
+            .unwrap();
+        let TaskCancelOutcome::Cancelled { task, .. } = outcome else {
+            panic!("queued work must be cancelled immediately");
+        };
+        assert_eq!(task.status, STATUS_CANCELLED);
+        assert!(
+            engine
+                .task_stop_request(&queued.task_id)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
