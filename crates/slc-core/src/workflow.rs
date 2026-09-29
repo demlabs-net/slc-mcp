@@ -2248,10 +2248,10 @@ impl SlcEngine {
         let current_status =
             workflow_string(&doc, "status").unwrap_or_else(|| STATUS_PENDING.to_string());
         if is_terminal_status(&current_status) {
-            // A cancel replayed after the operator stop controller already
-            // finalized the stop it requested: report that outcome, not an error.
-            if current_status == STATUS_CANCELLED
-                && let Some(stop) = self.task_stop_request(&task_id).await?
+            // A cancel replayed after the stop it requested was closed (CANCELLED
+            // by the controller, or the assignee's own earlier report kept):
+            // report that finished stop, not an error.
+            if let Some(stop) = self.task_stop_request(&task_id).await?
                 && stop.requested_by == actor
                 && stop.reason == reason
             {
@@ -5643,6 +5643,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claim.state, STOP_STATE_ABANDONED);
+        // Replaying the original cancel reports the finished stop, even though
+        // the task ended COMPLETED rather than CANCELLED.
+        let replay = engine
+            .workflow_cancel_task_with_outcome(
+                "seat-manager",
+                &running.task_id,
+                "stuck",
+                json!({}),
+                Some("stop-race-cancel"),
+            )
+            .await
+            .unwrap();
+        let TaskCancelOutcome::StopRequested { request, task, .. } = replay else {
+            panic!("replay must describe the finished stop");
+        };
+        assert_eq!(request.state, STOP_STATE_ABANDONED);
+        assert_eq!(task.status, STATUS_COMPLETED);
         let stop = engine
             .task_stop_request(&running.task_id)
             .await
