@@ -117,6 +117,8 @@ Copy `.env.example` to `.env`. Key variables:
 | `SLC_SEAT_TTL_SECONDS` | `86400` | Seat expiry; `0` = never |
 | `SLC_SEAT_ROLES` | — | Seat roles, e.g. `boss=operator` |
 | `SLC_SEAT_MANAGE_ACL` | — | Explicit cross-seat targets, e.g. `boss=worker|tester` |
+| `SLC_OPERATOR_STOP_TOKEN` | — | Bearer token (≥ 32 chars) of the operator stop controller; unset = operator endpoints answer 503 |
+| `SLC_STOPPABLE_PRINCIPALS` | — | Comma-separated roles whose running tasks the stop controller can stop; empty = running tasks cannot be cancelled |
 | `SLC_CONTEXT_LIMIT_TOKENS` | `100000` | Fallback token budget for `update_context` |
 | `SLC_PAGINATION_ENABLED` | `true` | Paginate oversized tool responses |
 | `SLC_PAGE_TOKEN_LIMIT` | `50000` | Approximate page size in tokens |
@@ -163,9 +165,22 @@ event. Exact replay returns the original event with `replayed=true` and no
 stale delivery, wake recommendation, or SSE notification; fingerprint mismatch
 remains an error. `cancel_task` lets the issuer, assignee, or global coordinator
 remove queued/ready work without starting it; cancelling a reserved head also
-promotes the next FIFO item. It deliberately rejects a running task: SLC does
-not own the executor process and therefore cannot safely release that lane.
-The assignee must submit the terminal report; after a crashed run is confirmed
+promotes the next FIFO item. A running task is different: SLC does not own the
+executor process, so cancelling it never releases the lane by itself. Only the
+global coordinator may ask, and only for a principal listed in
+`SLC_STOPPABLE_PRINCIPALS`; the call records a durable stop request and answers
+`stop_requested: true` (`stop_completed` once it is done). An operator stop
+controller (see [`deploy/roy1-task-stop`](deploy/roy1-task-stop/README.md))
+lists requests at `GET /internal/operator/task-stops` and claims one at
+`POST …/claim` — from then on the assignee can neither report nor start the
+task. It stops the executor out of band, verifies it is down, and calls
+`POST …/finalize`: the task becomes CANCELLED (or keeps the assignee's own
+report, answered as `superseded`), the lane is released and the next FIFO head
+promoted. These endpoints require `Authorization: Bearer
+$SLC_OPERATOR_STOP_TOKEN` and answer 503 while the token is unset or shorter
+than 32 characters. A claim older than 30 minutes may be taken over, so a lost
+controller cannot fence a lane forever. Without a controller for that role, the
+assignee must submit the terminal report; after a crashed run is confirmed
 idle, send the assignee a durable `task_message` for that same task and dispatch
 its returned delivery rather than creating a parallel replacement. The
 recovery run reports the already-running task without calling `start_task`

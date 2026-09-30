@@ -1,0 +1,11 @@
+[Unit]
+Description=Roy1: проверка запросов остановки running-задач каждые 30 секунд
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=30s
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
