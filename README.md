@@ -160,6 +160,65 @@ Portfolio identity and index scans use the storage backend's explicit unbounded
 metadata-projection query, so all historical roots beyond the 5000-item
 runnable-queue bound are considered without loading task bodies.
 
+Admission-first staging (not ready for live deployment): the separate
+`POST /internal/task-attempts/reserve` service endpoint remains hard-disabled
+(503 before reservation or ticket issuance) by a compile-time safety latch until
+safe pre-POST abort, authoritative bind, cross-process all-attempt terminal
+finalization, and mandatory protected ingress are proven end to end. There is no
+environment variable to override this latch. `SLC_PROTECTED_WORKFLOW_PRINCIPALS`
+(comma-separated exact assignees; no wildcard in the readiness profile map) is an
+explicit role policy: direct `start_task` and `report_task` are denied for these
+principals even before a first reservation, and after an aborted reservation.
+Ready events are still created for the protected FIFO head, but the MCP
+created/ready delivery envelope is suppressed for protected principals; it is
+not permission to start or dispatch generically. Any external observer of the
+queue must enforce the same mandatory protected-ingress policy. Default is empty; do not enable globally. Its intended contract requires
+`Authorization: Bearer $SLC_ATTEMPT_SERVICE_TOKEN` (at least 32 bytes), never
+`X-Seat-ID` or a manager token. Body requires `task_id`, `assignee`, `profile`
+(exact Hermes profile identifier; server config `SLC_ATTEMPT_PROFILE_MAP` JSON maps
+assignee→profile and must match), `queue_ready_event_id`, lowercase SHA-256
+`payload_sha256` of raw Hermes POST body bytes, and `transport_key` (the stable
+Hermes Idempotency-Key). SQLite alone persists immutable reservations with
+unique task/key and task/sequence constraints; Obsidian and Mongo refuse
+reservation. Return fields: `attempt_id`, `attempt_no`, `ticket`, `expires_at`.
+Ticket is `base64url-no-pad(JSON).base64url-no-pad(HMAC-SHA256(secret,
+"slc-attempt-v1." || ASCII(first_segment)))`; secret is the distinct
+`SLC_ATTEMPT_SIGNING_SECRET` (at least 32 bytes). Payload contains `v:1`,
+`aud:"Hermes workflow"`, attempt/task/assignee/profile/ready-event/digest/key,
+sequence and Unix-second issuance/expiry. Verify signature over the original
+segment bytes, not parsed/reformatted JSON. Hermes must hold the runner after
+202 until SLC has independently authenticated Hermes' authoritative
+`GET /v1/workflow-attempts/{attempt_id}` and durably bound `run_id` and Started;
+then poll `GET /internal/task-attempts/{attempt_id}/admission?run_id=...` with a
+separate `$SLC_ATTEMPT_VERIFY_TOKEN` before any tool execution. Readiness also
+requires SQLite plus every protected role in `SLC_ATTEMPT_PROFILE_MAP` (JSON
+assignee→safe profile identifier, exactly the protected-principal set), distinct
+32+ byte service/verify/signing secrets, authenticated bounded Hermes GET
+`/p/{profile}/v1/workflow-profile/readiness` (`HERMES_WORKFLOW_BASE_URL`,
+`HERMES_WORKFLOW_SERVICE_KEY`) and Swarm GET
+`/internal/task-transport/readiness/{role}` (`SWARM_TASK_BASE_URL`,
+`SWARM_TASK_SERVICE_TOKEN`). Both remote URLs require HTTPS or loopback HTTP;
+redirects are disabled. A profile-scoped Hermes base ends in `/p/{profile}/`;
+no fallback to root follows a scoped 404. Hermes must return matching `profile`
+and true `protected`, `workflow_admission_enabled`, `generic_runs_denied`;
+Swarm must return matching `profile` and true `protected`,
+`generic_dispatch_denied`, `ingress_ready`, `ledger_complete`. Swarm ingress
+readiness is local to Swarm, not conditional on SLC readiness (no circular probe).
+These remote gates are necessary but not sufficient: the local all-attempt abort
+fence/finalizer is not complete, so capability `admission_ready` remains false,
+`POST /internal/task-attempts/bind` returns 503, and admission returns
+`admitted:false` (503); **no bind/start or terminal finalization is enabled**.
+Tasks with outstanding (non-aborted) reservations reject ordinary seat start
+and report; tasks with *any* reservation history reject ordinary cancellation.
+An aborted reservation remains in the immutable attempt history; it is not
+authorization to cancel a ready protected head or finalize a running task.
+The staged `verify_all_task_attempts_stopped` enumerates durable reservations
+and checks exact Hermes identity and inactive terminal bound runs, but is not
+wired to production finalization: aborted/unbound attempts and pre-POST races
+require an authoritative abort fence and a trusted all-attempt protocol.
+Until Hermes verification, all-attempt terminal verification, and transactional
+binding are implemented, no caller should POST to Hermes using a reservation.
+
 `task_message` similarly returns `replayed=false` only when it appends a new
 event. Exact replay returns the original event with `replayed=true` and no
 stale delivery, wake recommendation, or SSE notification; fingerprint mismatch
@@ -184,7 +243,13 @@ assignee must submit the terminal report; after a crashed run is confirmed
 idle, send the assignee a durable `task_message` for that same task and dispatch
 its returned delivery rather than creating a parallel replacement. The
 recovery run reports the already-running task without calling `start_task`
-again. Only the assignee may call `report_task`, so a global coordinator cannot
+again. A protected principal (`SLC_PROTECTED_WORKFLOW_PRINCIPALS`) or a task
+with any admission-attempt history is held by the staged admission protocol
+above instead: cancellation answers `protected_attempt_finalization:
+"unavailable"`, and the staged legacy `finalize_cancel_task` exists but fails
+closed in production (`legacy_running_finalization: "verifier_not_configured"`)
+because its trusted verifier is unset. Only the assignee may call
+`report_task`, so a global coordinator cannot
 accidentally close a writer that is still running. At that report boundary,
 manager-owned `leads_mass_redesign` roots whose terminal result is consumed as
 immutable downstream identity must include non-empty

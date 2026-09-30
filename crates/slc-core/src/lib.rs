@@ -219,6 +219,10 @@ pub struct SlcConfig {
     pub workflow_hold_seats: std::collections::HashSet<String>,
     /// Optional operator incident generation. Old/unstamped tasks cannot start.
     pub workflow_generation: Option<String>,
+    /// Principals whose workflow starts require an authenticated, durable attempt
+    /// bind. This policy applies before the first reservation, including ready
+    /// tasks and direct MCP starts. Empty by default; `*` covers all principals.
+    pub protected_workflow_principals: std::collections::HashSet<String>,
 }
 
 impl SlcConfig {
@@ -289,6 +293,13 @@ impl Default for SlcConfig {
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            protected_workflow_principals: std::env::var("SLC_PROTECTED_WORKFLOW_PRINCIPALS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|principal| !principal.is_empty())
+                .map(String::from)
+                .collect(),
             workflow_hold_seats: std::env::var("SLC_WORKFLOW_HOLD_SEATS")
                 .unwrap_or_default()
                 .split(',')
@@ -397,6 +408,8 @@ pub struct SlcEngine {
     /// Serializes workflow projections with their event/idempotency writes.
     /// Storage backends do not expose a shared cross-record transaction API.
     workflow_lock: tokio::sync::Mutex<()>,
+    /// Optional trusted executor registry. Never sourced from MCP tool arguments.
+    run_termination_verifier: Option<std::sync::Arc<dyn workflow::RunTerminationVerifier>>,
     scheduler: tokio::sync::Mutex<Option<timer::TimerRegistry>>,
 }
 impl SlcEngine {
@@ -540,8 +553,18 @@ impl SlcEngine {
             consolidator,
             config,
             workflow_lock: tokio::sync::Mutex::new(()),
+            run_termination_verifier: None,
             scheduler: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Install a trusted executor verifier from server configuration, not a tool call.
+    pub fn with_run_termination_verifier(
+        mut self,
+        verifier: std::sync::Arc<dyn workflow::RunTerminationVerifier>,
+    ) -> Self {
+        self.run_termination_verifier = Some(verifier);
+        self
     }
 
     pub fn store(&self) -> &dyn StorageBackend {

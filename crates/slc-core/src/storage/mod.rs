@@ -249,7 +249,10 @@ pub trait StorageBackend: Send + Sync {
     /// the map 2N times (quadratic — see the stale-embedding refresh in
     /// `reembed_documents`, which is the difference between a bounded sweep and
     /// a process that never finishes on a multi-thousand-document vault).
-    async fn replace_embeddings(&self, replacements: &[(String, EmbeddingRecord)]) -> SlcResult<()> {
+    async fn replace_embeddings(
+        &self,
+        replacements: &[(String, EmbeddingRecord)],
+    ) -> SlcResult<()> {
         for (document_id, record) in replacements {
             self.delete_embeddings(document_id).await?;
             self.insert_embeddings(std::slice::from_ref(record)).await?;
@@ -288,6 +291,57 @@ pub trait StorageBackend: Send + Sync {
     async fn active_timers(&self, seat_id: Option<&str>) -> SlcResult<Vec<PersistedTimer>>;
     async fn set_timer_fired(&self, timer_id: &str, now: DateTime<Utc>) -> SlcResult<()>;
 
+    /// Atomic, immutable reservation for workflow attempt admission. Unsupported
+    /// backends MUST reject this operation; put_record is not an acceptable substitute.
+    async fn reserve_task_attempt(
+        &self,
+        _task_id: &str,
+        _transport_key: &str,
+        _reservation: &Value,
+    ) -> SlcResult<Value> {
+        Err(crate::error::SlcError::PermissionDenied(
+            "task attempt admission requires an atomic supported backend (SQLite)".into(),
+        ))
+    }
+    async fn get_task_attempt(&self, _attempt_id: &str) -> SlcResult<Option<Value>> {
+        Err(crate::error::SlcError::PermissionDenied(
+            "task attempt admission requires an atomic supported backend (SQLite)".into(),
+        ))
+    }
+    /// Bind a verified held run and append Started plus its task projection
+    /// in one SQLite transaction. Unsupported stores must never admit.
+    async fn bind_task_attempt(&self, _attempt_id: &str, _run_id: &str) -> SlcResult<Value> {
+        Err(crate::error::SlcError::PermissionDenied(
+            "atomic attempt binding requires SQLite".into(),
+        ))
+    }
+    /// Persist a verified Hermes no-run abort receipt atomically, rejecting any
+    /// intervening bind or reservation mutation. Never synthesize this from expiry.
+    async fn abort_task_attempt(
+        &self,
+        _attempt_id: &str,
+        _expected: &Value,
+        _receipt: &Value,
+    ) -> SlcResult<Value> {
+        Err(crate::error::SlcError::PermissionDenied(
+            "atomic attempt abort requires SQLite".into(),
+        ))
+    }
+    async fn list_task_attempts(&self, _task_id: &str) -> SlcResult<Vec<Value>> {
+        Err(crate::error::SlcError::PermissionDenied(
+            "attempt enumeration requires SQLite".into(),
+        ))
+    }
+    async fn has_task_attempt(&self, _task_id: &str) -> SlcResult<bool> {
+        Ok(false) // unsupported stores cannot create attempts in the first place
+    }
+    /// Whether ANY attempt ever existed for the task, aborted ones included:
+    /// an aborted reservation stays in the immutable history. Safe (false) for
+    /// stores that cannot hold attempts at all, so ordinary workflow calls on
+    /// such backends never fail on enumeration.
+    async fn has_task_attempt_history(&self, _task_id: &str) -> SlcResult<bool> {
+        Ok(false)
+    }
     /// Free-form JSON records (task/project extras, notifications, …).
     async fn put_record(&self, collection: &str, key: &str, value: &Value) -> SlcResult<()>;
     async fn get_record(&self, collection: &str, key: &str) -> SlcResult<Option<Value>>;
@@ -447,7 +501,10 @@ impl StorageBackend for Arc<dyn StorageBackend> {
     /// Must be delegated explicitly (default body): without the forward a bulk
     /// embedding refresh degrades to the default delete + insert pair per
     /// document and the vault backend rewrites its whole embedding map 2N times.
-    async fn replace_embeddings(&self, replacements: &[(String, EmbeddingRecord)]) -> SlcResult<()> {
+    async fn replace_embeddings(
+        &self,
+        replacements: &[(String, EmbeddingRecord)],
+    ) -> SlcResult<()> {
         self.as_ref().replace_embeddings(replacements).await
     }
 

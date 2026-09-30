@@ -91,6 +91,27 @@ pub async fn run(
             "/internal/operator/task-stops/finalize",
             post(operator_finalize_task_stop),
         )
+        // Staged admission-first protocol; the reserve/bind routes stay
+        // hard-disabled by the capability latch until the staged prerequisites
+        // in the README are proven end to end.
+        .route(
+            "/internal/task-attempts/capabilities",
+            get(attempt_capabilities),
+        )
+        .route("/internal/task-attempts/reserve", post(attempt_reserve))
+        .route("/internal/task-attempts/bind", post(attempt_bind))
+        .route(
+            "/internal/task-attempts/finalize-cancel",
+            post(attempt_finalize_cancel),
+        )
+        .route(
+            "/internal/task-attempts/{attempt_id}/abort",
+            post(attempt_abort),
+        )
+        .route(
+            "/internal/task-attempts/{attempt_id}/admission",
+            get(attempt_admission),
+        )
         // ── Web UI (REST + SPA, same process) ──
         .route("/api/health", get(webui::api::health))
         .route("/api/stats", get(webui::api::stats))
@@ -356,6 +377,704 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+// Hard-disabled until Hermes abort proof and protected ingress make all-attempt
+// terminal verification sufficient. This is deliberately not an env toggle.
+const ADMISSION_READY: bool = false;
+
+// The service and verifier credentials are independent of MCP seat tokens.
+// Missing configuration is always a denial; none of these endpoints authenticates
+// with X-Seat-ID or a manager principal.
+fn attempt_auth(headers: &axum::http::HeaderMap, variable: &str) -> bool {
+    let Ok(secret) = std::env::var(variable) else {
+        return false;
+    };
+    if secret.len() < 32 {
+        return false;
+    }
+    let Some(received) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts arbitrary key sizes");
+    mac.update(b"slc-service-auth-v1");
+    let expected = mac.finalize().into_bytes();
+    let mut actual = hmac::Hmac::<sha2::Sha256>::new_from_slice(received.as_bytes())
+        .expect("HMAC accepts arbitrary key sizes");
+    actual.update(b"slc-service-auth-v1");
+    actual.verify_slice(&expected).is_ok()
+}
+
+fn attempt_ticket(reservation: &Value) -> Option<String> {
+    use base64::Engine;
+    use hmac::Mac;
+    let secret = std::env::var("SLC_ATTEMPT_SIGNING_SECRET").ok()?;
+    if secret.len() < 32 {
+        return None;
+    }
+    // serde's struct serializer preserves this exact field order; neither
+    // whitespace nor object-map sorting is part of the signed wire format.
+    #[derive(serde::Serialize)]
+    struct Ticket<'a> {
+        v: u8,
+        aud: &'static str,
+        attempt_id: &'a str,
+        task_id: &'a str,
+        assignee: &'a str,
+        profile: &'a str,
+        queue_ready_event_id: &'a str,
+        payload_sha256: &'a str,
+        transport_key: &'a str,
+        attempt_no: u64,
+        issued_at: i64,
+        expires_at: i64,
+    }
+    let ticket = Ticket {
+        v: 1,
+        aud: "Hermes workflow",
+        attempt_id: reservation["attempt_id"].as_str()?,
+        task_id: reservation["task_id"].as_str()?,
+        assignee: reservation["assignee"].as_str()?,
+        profile: reservation["profile"].as_str()?,
+        queue_ready_event_id: reservation["queue_ready_event_id"].as_str()?,
+        payload_sha256: reservation["payload_sha256"].as_str()?,
+        transport_key: reservation["transport_key"].as_str()?,
+        attempt_no: reservation["attempt_no"].as_u64()?,
+        issued_at: reservation["issued_at"].as_i64()?,
+        expires_at: reservation["expires_at"].as_i64()?,
+    };
+    let payload = serde_json::to_vec(&ticket).ok()?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(b"slc-attempt-v1.");
+    mac.update(encoded.as_bytes());
+    let signature =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Some(format!("{encoded}.{signature}"))
+}
+
+fn protected_profile_map(engine: &SlcEngine) -> Option<std::collections::HashMap<String, String>> {
+    let map: std::collections::HashMap<String, String> =
+        serde_json::from_str(&std::env::var("SLC_ATTEMPT_PROFILE_MAP").ok()?).ok()?;
+    if map.is_empty()
+        || engine.config.protected_workflow_principals.is_empty()
+        || engine.config.protected_workflow_principals.contains("*")
+        || map.len() != engine.config.protected_workflow_principals.len()
+        || map.iter().any(|(role, profile)| {
+            !engine.workflow_principal_protected(role)
+                || engine.workflow_seat(role).is_none()
+                || profile.is_empty()
+                || profile.len() > 200
+                || !profile
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+    {
+        return None;
+    }
+    Some(map)
+}
+
+fn service_url(base: &str, path: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(base).ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !(url.scheme() == "https"
+            || (url.scheme() == "http"
+                && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"))))
+    {
+        return None;
+    }
+    let mut prefix = url.path().trim_end_matches('/').to_string();
+    prefix.push('/');
+    url.join(&format!("{prefix}{path}")).ok()
+}
+
+fn readiness_fields(value: &Value, profile: &str, fields: &[&str]) -> bool {
+    value.get("profile").and_then(Value::as_str) == Some(profile)
+        && fields
+            .iter()
+            .all(|field| value.get(*field).and_then(Value::as_bool) == Some(true))
+}
+
+// A bounded, authenticated remote probe is mandatory, but never sufficient:
+// the local all-attempt finalization/abort fence must first be proven complete.
+async fn protected_remote_readiness(engine: &SlcEngine) -> bool {
+    if engine.config.storage != slc_core::StorageKind::Sqlite {
+        return false;
+    }
+    let Some(profiles) = protected_profile_map(engine) else {
+        return false;
+    };
+    let Ok(hermes_base) = std::env::var("HERMES_WORKFLOW_BASE_URL") else {
+        return false;
+    };
+    let Ok(swarm_base) = std::env::var("SWARM_TASK_BASE_URL") else {
+        return false;
+    };
+    let Ok(hermes_key) = std::env::var("HERMES_WORKFLOW_SERVICE_KEY") else {
+        return false;
+    };
+    let Ok(swarm_key) = std::env::var("SWARM_TASK_SERVICE_TOKEN") else {
+        return false;
+    };
+    if hermes_key.len() < 32
+        || swarm_key.len() < 32
+        || std::env::var("SLC_ATTEMPT_SIGNING_SECRET").map_or(true, |secret| secret.len() < 32)
+        || std::env::var("SLC_ATTEMPT_SERVICE_TOKEN").map_or(true, |secret| secret.len() < 32)
+        || std::env::var("SLC_ATTEMPT_VERIFY_TOKEN").map_or(true, |secret| secret.len() < 32)
+    {
+        return false;
+    }
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return false;
+    };
+    for (role, profile) in profiles {
+        let Ok(parsed) = reqwest::Url::parse(&hermes_base) else {
+            return false;
+        };
+        if parsed.path().contains("/p/")
+            && !parsed
+                .path()
+                .trim_end_matches('/')
+                .ends_with(&format!("/p/{profile}"))
+        {
+            return false;
+        }
+        let prefix = if parsed.path().contains("/p/") {
+            String::new()
+        } else {
+            format!("p/{profile}/")
+        };
+        let Some(hermes) = service_url(
+            &hermes_base,
+            &format!("{prefix}v1/workflow-profile/readiness"),
+        ) else {
+            return false;
+        };
+        // Hermes serves profile routes through /p/<profile>/... when multiplexed.
+        // A single-profile base URL may already contain /p/<profile>/.
+        let Some(swarm) = service_url(
+            &swarm_base,
+            &format!("internal/task-transport/readiness/{role}"),
+        ) else {
+            return false;
+        };
+        let Ok(hermes_response) = client.get(hermes).bearer_auth(&hermes_key).send().await else {
+            return false;
+        };
+        if !hermes_response.status().is_success() {
+            return false;
+        }
+        let Ok(hermes_value) = hermes_response.json::<Value>().await else {
+            return false;
+        };
+        if !readiness_fields(
+            &hermes_value,
+            &profile,
+            &[
+                "protected",
+                "workflow_admission_enabled",
+                "generic_runs_denied",
+            ],
+        ) {
+            return false;
+        }
+        let Ok(swarm_response) = client.get(swarm).bearer_auth(&swarm_key).send().await else {
+            return false;
+        };
+        if !swarm_response.status().is_success() {
+            return false;
+        }
+        let Ok(swarm_value) = swarm_response.json::<Value>().await else {
+            return false;
+        };
+        if !readiness_fields(
+            &swarm_value,
+            &profile,
+            &[
+                "protected",
+                "generic_dispatch_denied",
+                "ingress_ready",
+                "ledger_complete",
+            ],
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+async fn admission_ready(engine: &SlcEngine) -> bool {
+    // No env override: this compile-time safety latch is removed only once
+    // cross-process all-attempt stop + pre-POST abort proof are implemented.
+    ADMISSION_READY && protected_remote_readiness(engine).await
+}
+
+async fn attempt_capabilities(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !attempt_auth(&headers, "SLC_ATTEMPT_VERIFY_TOKEN") {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(json!({"admission_ready":admission_ready(&state.engine).await})).into_response()
+}
+
+async fn attempt_reserve(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    if !attempt_auth(&headers, "SLC_ATTEMPT_SERVICE_TOKEN") {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !admission_ready(&state.engine).await {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(profiles) = protected_profile_map(&state.engine) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let fields = [
+        "task_id",
+        "assignee",
+        "profile",
+        "queue_ready_event_id",
+        "payload_sha256",
+        "transport_key",
+    ];
+    let [
+        Some(task_id),
+        Some(assignee),
+        Some(profile),
+        Some(event_id),
+        Some(digest),
+        Some(key),
+    ] = fields.map(|field| body.get(field).and_then(Value::as_str))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if profiles.get(assignee).map(String::as_str) != Some(profile) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match state.engine.workflow_reserve_attempt(task_id, assignee, profile, event_id, digest, key).await {
+        Ok(reservation) => match attempt_ticket(&reservation) {
+            Some(ticket) => (StatusCode::OK, Json(json!({"attempt_id":reservation["attempt_id"],
+                "attempt_no":reservation["attempt_no"], "expires_at":reservation["expires_at"],"ticket":ticket}))).into_response(),
+            None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
+        Err(error) => (StatusCode::CONFLICT, Json(json!({"error":error.to_string()}))).into_response(),
+    }
+}
+
+// Hermes is a separate trust domain. Verify its persisted registry over a
+// bounded authenticated request; never use a caller's asserted run/status.
+fn hermes_attempt_client(
+    attempt_id: &str,
+    profile: &str,
+) -> Result<(reqwest::Client, reqwest::Url, String), String> {
+    let base = std::env::var("HERMES_WORKFLOW_BASE_URL").map_err(|_| "Hermes base URL missing")?;
+    let key =
+        std::env::var("HERMES_WORKFLOW_SERVICE_KEY").map_err(|_| "Hermes service key missing")?;
+    if key.len() < 32
+        || attempt_id.is_empty()
+        || attempt_id.len() > 200
+        || !attempt_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("invalid Hermes registry configuration or attempt ID".into());
+    }
+    if profile.is_empty()
+        || !profile
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("invalid Hermes profile".into());
+    }
+    let parsed = reqwest::Url::parse(&base).map_err(|_| "invalid Hermes base URL")?;
+    let scoped = parsed.path().contains("/p/");
+    if scoped
+        && !parsed
+            .path()
+            .trim_end_matches('/')
+            .ends_with(&format!("/p/{profile}"))
+    {
+        return Err("Hermes profile-scoped URL does not match reservation".into());
+    }
+    let path = if scoped {
+        format!("v1/workflow-attempts/{attempt_id}")
+    } else {
+        format!("p/{profile}/v1/workflow-attempts/{attempt_id}")
+    };
+    let endpoint = service_url(&base, &path).ok_or("invalid Hermes registry endpoint")?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok((client, endpoint, key))
+}
+
+async fn hermes_attempt(attempt_id: &str, profile: &str) -> Result<Value, String> {
+    let (client, endpoint, key) = hermes_attempt_client(attempt_id, profile)?;
+    let response = client
+        .get(endpoint)
+        .bearer_auth(key)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(format!("Hermes registry returned {}", response.status()));
+    }
+    response.json::<Value>().await.map_err(|e| e.to_string())
+}
+
+fn hermes_abort_receipt<'a>(reservation: &Value, observed: &'a Value) -> Option<&'a str> {
+    if !hermes_tuple_fields_match(reservation, observed)
+        || observed.get("run_id") != Some(&Value::Null)
+        || observed["status"].as_str() != Some("aborted")
+        || observed["active"].as_bool() != Some(false)
+        || observed["aborted"].as_bool() != Some(true)
+    {
+        return None;
+    }
+    observed["abort_receipt"]
+        .as_str()
+        .filter(|receipt| !receipt.trim().is_empty() && receipt.len() <= 500)
+}
+
+// POST's response and a separate authenticated GET must agree on the
+// immutable receipt and all identity fields. Neither a caller's claim nor a
+// missing/expired reservation is ever evidence of a Hermes abort.
+async fn hermes_abort(reservation: &Value) -> Result<Value, String> {
+    let attempt_id = reservation["attempt_id"]
+        .as_str()
+        .ok_or("missing attempt id")?;
+    let ticket = attempt_ticket(reservation)
+        .ok_or("attempt signing secret missing or reservation corrupt")?;
+    let profile = reservation["profile"]
+        .as_str()
+        .ok_or("missing Hermes profile")?;
+    let (client, endpoint, key) = hermes_attempt_client(attempt_id, profile)?;
+    hermes_abort_with_client(reservation, &ticket, &client, endpoint, &key).await
+}
+
+async fn hermes_abort_with_client(
+    reservation: &Value,
+    ticket: &str,
+    client: &reqwest::Client,
+    endpoint: reqwest::Url,
+    key: &str,
+) -> Result<Value, String> {
+    let abort_url = reqwest::Url::parse(&format!("{endpoint}/abort"))
+        .map_err(|_| "invalid Hermes abort endpoint")?;
+    let response = client
+        .post(abort_url)
+        .bearer_auth(key)
+        .json(&json!({"ticket":ticket}))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(format!("Hermes abort returned {}", response.status()));
+    }
+    let posted: Value = response.json().await.map_err(|e| e.to_string())?;
+    let response = client
+        .get(endpoint)
+        .bearer_auth(key)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(format!("Hermes registry returned {}", response.status()));
+    }
+    let observed: Value = response.json().await.map_err(|e| e.to_string())?;
+    let post_receipt =
+        hermes_abort_receipt(reservation, &posted).ok_or("Hermes abort POST receipt invalid")?;
+    let get_receipt =
+        hermes_abort_receipt(reservation, &observed).ok_or("Hermes abort GET receipt invalid")?;
+    // The two endpoints may include different volatile/diagnostic fields.
+    // Match the durable proof and the reservation identity, not their entire JSON bodies.
+    if post_receipt != get_receipt {
+        return Err("Hermes abort receipts disagree".into());
+    }
+    Ok(observed)
+}
+
+fn hermes_tuple_fields_match(reservation: &Value, observed: &Value) -> bool {
+    for field in [
+        "attempt_id",
+        "task_id",
+        "assignee",
+        "profile",
+        "queue_ready_event_id",
+        "payload_sha256",
+        "transport_key",
+        "attempt_no",
+    ] {
+        if reservation.get(field).is_none() || reservation.get(field) != observed.get(field) {
+            return false;
+        }
+    }
+    true
+}
+
+fn hermes_exact_tuple(
+    reservation: &Value,
+    observed: &Value,
+    run_id: &str,
+    status: &str,
+    active: bool,
+) -> bool {
+    hermes_tuple_fields_match(reservation, observed)
+        && observed["run_id"].as_str() == Some(run_id)
+        && observed["status"].as_str() == Some(status)
+        && observed["active"].as_bool() == Some(active)
+}
+
+// The complete SQLite attempt set is the only source of identities; a caller
+// must never choose a single run as a shortcut. This check is only sufficient
+// once a durable Swarm fence has serialized every in-flight dispatch with the
+// snapshot AND remains in force through the SLC terminal transaction.
+#[allow(dead_code)] // staged behind the cross-service fence capability latch
+async fn verify_all_task_attempts_stopped(
+    engine: &SlcEngine,
+    task_id: &str,
+) -> Result<bool, String> {
+    let attempts = engine
+        .store()
+        .list_task_attempts(task_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if attempts.is_empty() {
+        return Ok(false);
+    }
+    let mut identities = std::collections::HashSet::new();
+    for reservation in attempts {
+        let id = reservation["attempt_id"]
+            .as_str()
+            .ok_or("corrupt attempt reservation")?;
+        if reservation["task_id"].as_str() != Some(task_id) || !identities.insert(id.to_string()) {
+            return Ok(false);
+        }
+        let profile = reservation["profile"]
+            .as_str()
+            .ok_or("missing Hermes profile")?;
+        let observed = hermes_attempt(id, profile).await?;
+        if !attempt_terminal_proof(&reservation, &observed) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn attempt_terminal_proof(reservation: &Value, observed: &Value) -> bool {
+    if !hermes_tuple_fields_match(reservation, observed) {
+        return false;
+    }
+    match (
+        reservation.get("bound_run_id"),
+        reservation.get("abort_receipt"),
+    ) {
+        (Some(Value::String(run_id)), None) if !run_id.is_empty() => {
+            reservation["start_event_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+                && hermes_exact_tuple(reservation, observed, run_id, "cancelled", false)
+        }
+        (None, Some(receipt)) if reservation.get("start_event_id").is_none() => {
+            hermes_abort_receipt(reservation, observed).is_some_and(|proof| {
+                receipt["abort_receipt"].as_str() == Some(proof)
+                    && receipt["status"].as_str() == Some("aborted")
+                    && receipt["run_id"].is_null()
+                    && receipt["active"].as_bool() == Some(false)
+                    && receipt["aborted"].as_bool() == Some(true)
+                    && hermes_tuple_fields_match(reservation, receipt)
+            })
+        }
+        _ => false,
+    }
+}
+
+// This is intentionally not backed by MCP seat credentials. An SLC SQLite
+// cancellation intent could fence future SLC reservations, and Hermes' durable
+// abort tombstone can fence an in-flight POST on *one Hermes registry*. Neither
+// proves all runs are stopped with the current cross-service protocol:
+//
+// * A task predating protected ingress has no immutable proof that generic
+//   (ticketless) runs were denied throughout its lifetime. A configured
+//   workflow_generation is not that proof: it may predate enforcement.
+// * Hermes readiness attests a profile name and current generic denial, but
+//   not the persistent registry/installation identity or denial epoch. If a
+//   gateway routes POST to installation B and the abort and GET to A, A can
+//   persist an aborted/null-run tombstone while B has an active run for the
+//   identical ticket. Neither the matching receipt nor SLC's complete local
+//   reservation list detects B. A signing-key rotation also makes historical
+//   reservations impossible to abort with the newly configured key.
+//
+// Therefore even a service token and a claimed all-attempt check cannot
+// release the FIFO lane. Keep 503 until those attestations and an atomic
+// SQLite intent/terminal transition are implemented and tested end-to-end.
+async fn attempt_finalize_cancel(
+    State(_state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(_body): Json<Value>,
+) -> axum::response::Response {
+    if !attempt_auth(&headers, "SLC_ATTEMPT_FINALIZE_TOKEN") {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"finalize_ready":false,
+        "error":"protected cancellation lacks historical generic-deny and single-registry/keyset proof; FIFO lane remains held"}))).into_response()
+}
+
+async fn attempt_abort(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(attempt_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if !attempt_auth(&headers, "SLC_ATTEMPT_SERVICE_TOKEN") {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if state.engine.config.storage != slc_core::StorageKind::Sqlite {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let reservation = match state.engine.store().get_task_attempt(&attempt_id).await {
+        Ok(Some(value)) => value,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if reservation["attempt_id"].as_str() != Some(attempt_id.as_str())
+        || reservation.get("bound_run_id").is_some()
+        || reservation.get("start_event_id").is_some()
+    {
+        return StatusCode::CONFLICT.into_response();
+    }
+    // An already-aborted reservation is still checked against Hermes on every
+    // replay. Never answer success solely from SLC's local projection.
+    let receipt = match hermes_abort(&reservation).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(attempt_id, %error, "workflow attempt abort unconfirmed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    match state.engine.store().abort_task_attempt(&attempt_id, &reservation, &receipt).await {
+        Ok(value) => (StatusCode::OK, Json(json!({"attempt_id":attempt_id,
+            "task_id":value["task_id"],"status":"aborted","abort_receipt":receipt["abort_receipt"]}))).into_response(),
+        Err(_) => StatusCode::CONFLICT.into_response(),
+    }
+}
+
+async fn attempt_bind(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    if !attempt_auth(&headers, "SLC_ATTEMPT_SERVICE_TOKEN") {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !admission_ready(&state.engine).await {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if state.engine.config.storage != slc_core::StorageKind::Sqlite {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let (Some(attempt_id), Some(run_id)) = (body["attempt_id"].as_str(), body["run_id"].as_str())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let reservation = match state.engine.store().get_task_attempt(attempt_id).await {
+        Ok(Some(value)) => value,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(profile) = reservation["profile"].as_str() else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let observed = match hermes_attempt(attempt_id, profile).await {
+        Ok(value) => value,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if !hermes_exact_tuple(&reservation, &observed, run_id, "held", true) {
+        return (StatusCode::CONFLICT, Json(json!({"admitted":false}))).into_response();
+    }
+    match state
+        .engine
+        .store()
+        .bind_task_attempt(attempt_id, run_id)
+        .await
+    {
+        Ok(value) => (
+            StatusCode::OK,
+            Json(json!({"admitted":true,"attempt_id":attempt_id,
+            "task_id":value["task_id"],"assignee":value["assignee"],"profile":value["profile"],
+            "start_event_id":value["start_event_id"],"run_id":run_id})),
+        )
+            .into_response(),
+        Err(_) => StatusCode::CONFLICT.into_response(),
+    }
+}
+
+async fn attempt_admission(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(attempt_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    if !attempt_auth(&headers, "SLC_ATTEMPT_VERIFY_TOKEN") {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !admission_ready(&state.engine).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"admitted":false})),
+        )
+            .into_response();
+    }
+    let Some(run_id) = query.get("run_id").filter(|id| !id.is_empty()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let reservation = match state.engine.store().get_task_attempt(&attempt_id).await {
+        Ok(Some(value)) => value,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if reservation["bound_run_id"].as_str() != Some(run_id.as_str())
+        || reservation["start_event_id"].as_str().is_none()
+    {
+        return (StatusCode::CONFLICT, Json(json!({"admitted":false}))).into_response();
+    }
+    let Some(profile) = reservation["profile"].as_str() else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let observed = match hermes_attempt(&attempt_id, profile).await {
+        Ok(value) => value,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if !hermes_exact_tuple(&reservation, &observed, run_id, "held", true) {
+        return (StatusCode::CONFLICT, Json(json!({"admitted":false}))).into_response();
+    }
+    match state.engine.store().get_record("task_events_v1", reservation["start_event_id"].as_str().unwrap()).await {
+        Ok(Some(event)) if event["task_id"] == reservation["task_id"] && event["kind"] == "started"
+            && event["metadata"]["run_id"] == *run_id =>
+            (StatusCode::OK, Json(json!({"admitted":true,"attempt_id":attempt_id,
+                "task_id":reservation["task_id"],"assignee":reservation["assignee"],
+                "start_event_id":reservation["start_event_id"],"run_id":run_id,"profile":reservation["profile"]}))).into_response(),
+        _ => (StatusCode::CONFLICT, Json(json!({"admitted":false}))).into_response(),
     }
 }
 
@@ -1156,13 +1875,24 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "cancel_task",
-            "description": "Cancel a workflow task. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task; never rebuild it from a human name. A not-found answer echoes the exact id you sent plus the closest existing ids. The issuer, assignee, or global coordinator may cancel. QUEUED/READY task: cancelled immediately; the event is appended, a ready reservation is released and the next FIFO item promoted (only next_delivery may wake it). RUNNING (IN_WORK) task: only the global coordinator (manager) may request it, and only for roles served by the operator stop controller. It is NOT cancelled immediately and the lane is NOT released — the response has stop_requested=true and a durable stop request is recorded. The operator stop controller then restarts the assignee's whole executor (all of that role's current runs are interrupted), verifies it was down, closes the task and wakes the next FIFO head by itself (usually 1–3 minutes). The final status is CANCELLED, or the assignee's own report if it finished before the stop took effect. Do not report/start a replacement meanwhile; poll get_task until the status is final (not IN_WORK); list_task_events shows the stop milestones. Repeating the call is a harmless replay; stop_completed=true means the stop is already finished.",
+            "description": "Cancel a workflow task. Id rule: pass task_id byte-for-byte as returned by list_tasks/get_task; never rebuild it from a human name. A not-found answer echoes the exact id you sent plus the closest existing ids. The issuer, assignee, or global coordinator may cancel. QUEUED/READY task: cancelled immediately; the event is appended, a ready reservation is released and the next FIFO item promoted (only next_delivery may wake it). RUNNING (IN_WORK) task: only the global coordinator (manager) may request it, and only for roles served by the operator stop controller. It is NOT cancelled immediately and the lane is NOT released — the response has stop_requested=true and a durable stop request is recorded. The operator stop controller then restarts the assignee's whole executor (all of that role's current runs are interrupted), verifies it was down, closes the task and wakes the next FIFO head by itself (usually 1–3 minutes). The final status is CANCELLED, or the assignee's own report if it finished before the stop took effect. Do not report/start a replacement meanwhile; poll get_task until the status is final (not IN_WORK); list_task_events shows the stop milestones. Repeating the call is a harmless replay; stop_completed=true means the stop is already finished. A protected principal (SLC_PROTECTED_WORKFLOW_PRINCIPALS) or a task with any admission-attempt history cannot be cancelled this way: the staged admission protocol holds its lane until trusted all-attempt verification exists.",
             "inputSchema": {"type":"object","properties":{
                 "task_id": {"type":"string","minLength":1},
                 "reason": {"type":"string","minLength":1},
                 "metadata": {"type":"object"},
                 "idempotency_key": {"type":"string","minLength":1,"maxLength":200}
             },"required":["task_id","reason","idempotency_key"]}
+        }),
+        json!({
+            "name": "finalize_cancel_task",
+            "description": "Legacy unreserved running-task finalizer (currently unavailable in production): requires the cancellation_requested event_id, matching SLC start_event_id, and a server-injected trusted verifier of the exact stopped run. The production verifier is None, so requests fail closed and FIFO stays held. Protected tasks with ANY reservation history, including all-aborted attempts, cannot use this single-run route: their finalization is unavailable until a trusted all-attempt verifier and abort fence exist. Manager-supplied run IDs or metadata are not proof. After independently stopping transport, the assignee may report a terminal outcome on the same running task; a terminal assignee report wins the race. Exact replay never issues a second wake.",
+            "inputSchema": {"type":"object","properties":{
+                "task_id":{"type":"string","minLength":1},
+                "request_event_id":{"type":"string","minLength":1},
+                "start_event_id":{"type":"string","minLength":1},
+                "run_id":{"type":"string","minLength":1},
+                "idempotency_key":{"type":"string","minLength":1,"maxLength":200}
+            },"required":["task_id","request_event_id","start_event_id","run_id","idempotency_key"]}
         }),
         json!({
             "name": "task_message",
@@ -2258,7 +2988,12 @@ fn workflow_delivery_if_released(
     event_id: Option<&str>,
     event_kind: &str,
 ) -> Value {
-    if recipient.is_none_or(|principal| engine.workflow_principal_held(principal)) {
+    if recipient.is_none_or(|principal| engine.workflow_principal_held(principal))
+        || (matches!(event_kind, "created" | "ready")
+            && recipient.is_some_and(|principal| engine.workflow_principal_protected(principal)))
+    {
+        // Protected heads are admitted only via the service reservation path;
+        // a generic MCP delivery would permit a transport to bypass it.
         return Value::Null;
     }
     workflow_delivery(recipient, task_id, event_id, event_kind)
@@ -3038,6 +3773,49 @@ async fn call_tool(
                     })
                 }
             }
+        }
+        "finalize_cancel_task" => {
+            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+            let request_event_id = args
+                .get("request_event_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let start_event_id = args
+                .get("start_event_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let run_id = args.get("run_id").and_then(Value::as_str).unwrap_or("");
+            let key = args.get("idempotency_key").and_then(Value::as_str);
+            let (task, event, next_ready_task) = engine
+                .workflow_finalize_cancel_task(
+                    seat_id,
+                    task_id,
+                    request_event_id,
+                    start_event_id,
+                    run_id,
+                    key,
+                )
+                .await
+                .map_err(json_err)?;
+            let next_delivery = next_ready_task
+                .as_ref()
+                .filter(|next| {
+                    next.assignee
+                        .as_deref()
+                        .is_some_and(|p| !engine.workflow_principal_held(p))
+                })
+                .map(|next| {
+                    workflow_delivery_if_released(
+                        engine,
+                        next.assignee.as_deref(),
+                        &next.task_id,
+                        next.queue_ready_event_id.as_deref(),
+                        "ready",
+                    )
+                });
+            json!({"success":true,"task":task,"event":event,
+                "next_ready_task":next_ready_task,"next_wake_recommended":next_delivery.is_some(),
+                "next_delivery":next_delivery,"wake_recommended":false})
         }
         "task_message" => {
             let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
@@ -4302,6 +5080,7 @@ fn task_scoped_id_tool(tool: &str) -> bool {
             | "start_task"
             | "report_task"
             | "cancel_task"
+            | "finalize_cancel_task"
             | "task_message"
             | "list_task_events"
     )
@@ -6529,6 +7308,58 @@ mod seat_filter_tests {
     }
 
     #[tokio::test]
+    async fn running_cancel_tool_requests_without_waking_or_releasing_fifo() {
+        let engine = swarm_engine().await;
+        let assigned = tool_json(&engine, "seat-manager", "assign_task",
+            json!({"assignee":"contactor","name":"Running cancellation","idempotency_key":"running-tool-assign"})).await;
+        let task_id = assigned["task"]["task_id"].as_str().unwrap();
+        tool_json(
+            &engine,
+            "seat-contactor",
+            "start_task",
+            json!({"task_id":task_id,"idempotency_key":"running-tool-start"}),
+        )
+        .await;
+        let queued = tool_json(&engine, "seat-manager", "assign_task",
+            json!({"assignee":"contactor","name":"Queued next","idempotency_key":"running-tool-queued"})).await;
+        let request = tool_json(&engine, "seat-manager", "cancel_task",
+            json!({"task_id":task_id,"reason":"Stop current run","idempotency_key":"running-tool-request"})).await;
+        assert_eq!(request["stop_requested"], true);
+        assert_eq!(request["stop_completed"], false);
+        assert_eq!(request["task"]["status"], "IN_WORK");
+        assert!(request["delivery"].is_null());
+        assert!(request["next_delivery"].is_null());
+        let repeat = tool_json(&engine, "seat-manager", "cancel_task",
+            json!({"task_id":task_id,"reason":"Stop current run","idempotency_key":"running-tool-request"})).await;
+        assert_eq!(repeat["replayed"], true);
+        assert_eq!(
+            repeat["stop_request"]["state"],
+            request["stop_request"]["state"]
+        );
+        let pending = tool_json(
+            &engine,
+            "seat-manager",
+            "get_task",
+            json!({"task_id":queued["task"]["task_id"]}),
+        )
+        .await;
+        assert_eq!(pending["task"]["queue_state"], "queued");
+        // An unclaimed stop request does not fence the assignee's own report: a
+        // run that finished in time keeps its outcome and promotes the queue.
+        let report = tool_json(&engine, "seat-contactor", "report_task",
+            json!({"task_id":task_id,"status":"blocked","summary":"Stopped externally; recovery run", "idempotency_key":"running-tool-recovery"})).await;
+        assert_eq!(report["task"]["status"], "BLOCKED");
+        let ready = tool_json(
+            &engine,
+            "seat-manager",
+            "get_task",
+            json!({"task_id":queued["task"]["task_id"]}),
+        )
+        .await;
+        assert_eq!(ready["task"]["queue_state"], "ready");
+    }
+
+    #[tokio::test]
     async fn mapped_hold_preserves_reports_without_execution_deliveries() {
         let mut engine = swarm_engine().await;
         let first = tool_json(
@@ -6883,6 +7714,325 @@ mod seat_filter_tests {
         )
         .await;
         assert_eq!(owner_deleted["success"], true);
+    }
+}
+
+#[cfg(test)]
+mod attempt_admission_tests {
+    use super::*;
+    use base64::Engine;
+    use hmac::Mac;
+
+    #[test]
+    fn ticket_has_fixed_scope_and_signed_original_segment() {
+        // SAFETY: no other test accesses this distinct variable.
+        unsafe {
+            std::env::set_var(
+                "SLC_ATTEMPT_SIGNING_SECRET",
+                "test-signing-secret-at-least-thirty-two-chars",
+            )
+        };
+        let record = json!({"attempt_id":"a", "task_id":"t", "assignee":"worker",
+            "profile":"https://hermes/worker", "queue_ready_event_id":"ready",
+            "payload_sha256":"f".repeat(64), "transport_key":"wake", "attempt_no":1,
+            "issued_at":10, "expires_at":310});
+        let ticket = attempt_ticket(&record).unwrap();
+        let (segment, signature) = ticket.split_once('.').unwrap();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(segment)
+            .unwrap();
+        let raw = String::from_utf8(bytes).unwrap();
+        assert!(raw.starts_with("{\"v\":1,\"aud\":\"Hermes workflow\",\"attempt_id\":\"a\""));
+        let payload: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(payload["payload_sha256"], "f".repeat(64));
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(
+            b"test-signing-secret-at-least-thirty-two-chars",
+        )
+        .unwrap();
+        mac.update(b"slc-attempt-v1.");
+        mac.update(segment.as_bytes());
+        mac.verify_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(signature)
+                .unwrap(),
+        )
+        .unwrap();
+        unsafe { std::env::remove_var("SLC_ATTEMPT_SIGNING_SECRET") };
+    }
+
+    #[test]
+    fn registry_tuple_rejects_unknown_pending_and_wrong_status() {
+        let reservation = json!({"attempt_id":"attempt-1","task_id":"task-1","assignee":"worker",
+            "profile":"worker","queue_ready_event_id":"ready-1","payload_sha256":"f".repeat(64),
+            "transport_key":"wake-1","attempt_no":1});
+        let mut observed = reservation.clone();
+        observed["run_id"] = json!("run-1");
+        observed["status"] = json!("held");
+        observed["active"] = json!(true);
+        assert!(hermes_exact_tuple(
+            &reservation,
+            &observed,
+            "run-1",
+            "held",
+            true
+        ));
+        observed["status"] = json!("pending");
+        assert!(!hermes_exact_tuple(
+            &reservation,
+            &observed,
+            "run-1",
+            "held",
+            true
+        ));
+        observed["status"] = json!("unknown");
+        assert!(!hermes_exact_tuple(
+            &reservation,
+            &observed,
+            "run-1",
+            "held",
+            true
+        ));
+        observed["status"] = json!("held");
+        observed["active"] = json!(false);
+        assert!(!hermes_exact_tuple(
+            &reservation,
+            &observed,
+            "run-1",
+            "held",
+            true
+        ));
+        observed["active"] = json!(true);
+        observed["payload_sha256"] = json!("0".repeat(64));
+        assert!(!hermes_exact_tuple(
+            &reservation,
+            &observed,
+            "run-1",
+            "held",
+            true
+        ));
+        assert!(
+            !ADMISSION_READY,
+            "Hermes abort/fence and ingress contracts are not ready"
+        );
+    }
+
+    #[test]
+    fn aborted_receipt_requires_exact_tuple_and_durable_no_run_proof() {
+        let reservation = json!({"attempt_id":"a1","task_id":"task-1","assignee":"worker",
+            "profile":"worker","queue_ready_event_id":"ready-1","payload_sha256":"f".repeat(64),
+            "transport_key":"wake-1","attempt_no":1,"expires_at":1});
+        let mut observed = reservation.clone();
+        observed["status"] = json!("aborted");
+        observed["active"] = json!(false);
+        observed["run_id"] = Value::Null;
+        observed["aborted"] = json!(true);
+        observed["abort_receipt"] = json!("persisted-proof");
+        assert_eq!(
+            hermes_abort_receipt(&reservation, &observed),
+            Some("persisted-proof")
+        );
+        for (field, replacement) in [
+            ("attempt_no", json!(2)),
+            ("profile", json!("other")),
+            ("run_id", json!("run-1")),
+            ("active", json!(true)),
+            ("status", json!("unknown")),
+            ("aborted", json!(false)),
+            ("abort_receipt", json!("")),
+        ] {
+            let mut altered = observed.clone();
+            altered[field] = replacement;
+            assert!(
+                hermes_abort_receipt(&reservation, &altered).is_none(),
+                "{field}"
+            );
+        }
+        let mut absent = observed;
+        absent.as_object_mut().unwrap().remove("run_id");
+        assert!(hermes_abort_receipt(&reservation, &absent).is_none());
+    }
+
+    #[test]
+    fn protected_finalize_requires_every_exact_terminal_attempt() {
+        let mut reservation = json!({"attempt_id":"a1","task_id":"task-1","assignee":"worker",
+            "profile":"worker","queue_ready_event_id":"ready-1","payload_sha256":"f".repeat(64),
+            "transport_key":"wake-1","attempt_no":1,"bound_run_id":"run-1",
+            "start_event_id":"attempt_started_a1"});
+        let mut observed = reservation.clone();
+        observed["run_id"] = json!("run-1");
+        observed["status"] = json!("cancelled");
+        observed["active"] = json!(false);
+        assert!(attempt_terminal_proof(&reservation, &observed));
+        for (field, value) in [
+            ("status", json!("completed")),
+            ("status", json!("failed")),
+            ("status", json!("held")),
+            ("active", json!(true)),
+            ("run_id", json!("run-2")),
+            ("profile", json!("other")),
+        ] {
+            let mut changed = observed.clone();
+            changed[field] = value;
+            assert!(!attempt_terminal_proof(&reservation, &changed), "{field}");
+        }
+        reservation
+            .as_object_mut()
+            .unwrap()
+            .remove("start_event_id");
+        assert!(!attempt_terminal_proof(&reservation, &observed));
+        reservation.as_object_mut().unwrap().remove("bound_run_id");
+        reservation["abort_receipt"] = json!({"attempt_id":"a1","task_id":"task-1",
+            "assignee":"worker","profile":"worker","queue_ready_event_id":"ready-1",
+            "payload_sha256":"f".repeat(64),"transport_key":"wake-1","attempt_no":1,
+            "run_id":null,"status":"aborted","active":false,"aborted":true,
+            "abort_receipt":"durable-receipt"});
+        observed["run_id"] = Value::Null;
+        observed["status"] = json!("aborted");
+        observed["active"] = json!(false);
+        observed["aborted"] = json!(true);
+        observed["abort_receipt"] = json!("durable-receipt");
+        assert!(attempt_terminal_proof(&reservation, &observed));
+        observed["abort_receipt"] = json!("different");
+        assert!(!attempt_terminal_proof(&reservation, &observed));
+        observed["abort_receipt"] = json!("durable-receipt");
+        observed["run_id"] = json!("run-1");
+        assert!(!attempt_terminal_proof(&reservation, &observed));
+    }
+
+    #[tokio::test]
+    async fn hermes_abort_requires_independent_matching_get_and_rejects_conflict() {
+        use axum::{
+            extract::Path,
+            routing::{get, post},
+        };
+        let reservation = json!({"attempt_id":"attempt-1","task_id":"task-1","assignee":"worker",
+            "profile":"worker","queue_ready_event_id":"ready-1","payload_sha256":"f".repeat(64),
+            "transport_key":"wake-1","attempt_no":1,"issued_at":1,"expires_at":2});
+        let mut receipt = reservation.clone();
+        receipt["run_id"] = Value::Null;
+        receipt["status"] = json!("aborted");
+        receipt["active"] = json!(false);
+        receipt["aborted"] = json!(true);
+        receipt["abort_receipt"] = json!("durable-proof");
+        for (post_status, get_status, change_get, succeeds) in [
+            (StatusCode::OK, StatusCode::OK, false, true),
+            (StatusCode::CONFLICT, StatusCode::OK, false, false),
+            (StatusCode::OK, StatusCode::NOT_FOUND, false, false),
+            (StatusCode::OK, StatusCode::OK, true, false),
+        ] {
+            let mut post_body = receipt.clone();
+            post_body["diagnostic"] = json!("abort response");
+            let mut get_body = receipt.clone();
+            get_body["diagnostic"] = json!("registry response");
+            if change_get {
+                get_body["abort_receipt"] = json!("other-proof");
+            }
+            let app = Router::new()
+                .route(
+                    "/v1/workflow-attempts/{attempt_id}/abort",
+                    post(
+                        move |Path(id): Path<String>,
+                              headers: axum::http::HeaderMap,
+                              Json(body): Json<Value>| {
+                            let body_response = post_body.clone();
+                            async move {
+                                assert_eq!(id, "attempt-1");
+                                assert_eq!(
+                                    headers[axum::http::header::AUTHORIZATION],
+                                    "Bearer test-service-key"
+                                );
+                                assert_eq!(body["ticket"], "signed-ticket");
+                                (post_status, Json(body_response))
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/v1/workflow-attempts/{attempt_id}",
+                    get(move |Path(id): Path<String>| {
+                        let body_response = get_body.clone();
+                        async move {
+                            assert_eq!(id, "attempt-1");
+                            (get_status, Json(body_response))
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let endpoint =
+                reqwest::Url::parse(&format!("http://{address}/v1/workflow-attempts/attempt-1"))
+                    .unwrap();
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let result = hermes_abort_with_client(
+                &reservation,
+                "signed-ticket",
+                &client,
+                endpoint,
+                "test-service-key",
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds);
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn readiness_fields_and_urls_fail_closed() {
+        let mut hermes = json!({"profile":"junior", "protected":true,
+            "workflow_admission_enabled":true, "generic_runs_denied":true});
+        let fields = [
+            "protected",
+            "workflow_admission_enabled",
+            "generic_runs_denied",
+        ];
+        assert!(readiness_fields(&hermes, "junior", &fields));
+        // This is only *current* readiness, not an all-attempt finalization
+        // certificate. A historical task without protected_generation can
+        // have ticketless runs, and two registries can return the same fields.
+        let historical_task = json!({"workflow_generation":"existing-generation"});
+        assert!(historical_task.get("protected_generation").is_none());
+        for missing_proof in [
+            "installation_id",
+            "protected_epoch",
+            "accepted_signing_keyset",
+            "durable_registry_id",
+        ] {
+            assert!(hermes.get(missing_proof).is_none(), "{missing_proof}");
+        }
+        hermes["profile"] = json!("senior");
+        assert!(!readiness_fields(&hermes, "junior", &fields));
+        hermes["profile"] = json!("junior");
+        hermes["generic_runs_denied"] = json!(false);
+        assert!(!readiness_fields(&hermes, "junior", &fields));
+        assert!(
+            service_url(
+                "http://example.org",
+                "p/junior/v1/workflow-profile/readiness"
+            )
+            .is_none()
+        );
+        assert!(service_url("https://username:password@example.org", "v1/readiness").is_none());
+        assert!(
+            service_url("http://localhost:1234/p/junior/", "v1/readiness")
+                .unwrap()
+                .path()
+                .ends_with("/p/junior/v1/readiness")
+        );
+    }
+
+    #[test]
+    fn missing_server_credentials_do_not_fall_back_to_seat_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-seat-id", "seat-manager".parse().unwrap());
+        assert!(!attempt_auth(
+            &headers,
+            "SLC_ATTEMPT_TEST_MISSING_SERVICE_TOKEN"
+        ));
+        assert!(!attempt_auth(&headers, "SLC_ATTEMPT_FINALIZE_TOKEN"));
     }
 }
 
