@@ -197,7 +197,18 @@ pub fn parse_task_assign_acl_env() -> HashMap<String, HashSet<String>> {
 /// visual acceptance verdict.  The task/report domain owns this invariant;
 /// transports only deliver opaque notifications.
 pub fn parse_text_only_principals_env() -> HashSet<String> {
-    std::env::var("SLC_TEXT_ONLY_PRINCIPALS")
+    parse_principal_list_env("SLC_TEXT_ONLY_PRINCIPALS")
+}
+
+/// Principals whose executor an operator stop controller can stop. Only these
+/// accept a stop request for a running task; for any other principal a stop
+/// request would hold the lane forever with nobody to execute it.
+pub fn parse_stoppable_principals_env() -> HashSet<String> {
+    parse_principal_list_env("SLC_STOPPABLE_PRINCIPALS")
+}
+
+fn parse_principal_list_env(name: &str) -> HashSet<String> {
+    std::env::var(name)
         .map(|raw| {
             raw.split(',')
                 .map(str::trim)
