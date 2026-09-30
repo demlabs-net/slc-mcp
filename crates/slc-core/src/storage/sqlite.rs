@@ -98,6 +98,15 @@ CREATE TABLE IF NOT EXISTS timers (
 );
 CREATE INDEX IF NOT EXISTS idx_timers_seat ON timers(seat_id);
 
+CREATE TABLE IF NOT EXISTS task_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    transport_key TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    reservation TEXT NOT NULL,
+    UNIQUE(task_id, transport_key),
+    UNIQUE(task_id, attempt_no)
+);
 CREATE TABLE IF NOT EXISTS records (
     collection TEXT NOT NULL,
     key        TEXT NOT NULL,
@@ -1237,6 +1246,187 @@ impl StorageBackend for SqliteStore {
         .await
     }
 
+    // ── immutable workflow admission reservations ─────────────────
+
+    async fn reserve_task_attempt(&self, task_id: &str, transport_key: &str, reservation: &Value) -> SlcResult<Value> {
+        let (task_id, transport_key, reservation) = (task_id.to_owned(), transport_key.to_owned(), reservation.clone());
+        self.blocking(move |conn| {
+            let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+            let previous: Option<String> = tx.query_row(
+                "SELECT reservation FROM task_attempts WHERE task_id=?1 AND transport_key=?2",
+                params![task_id, transport_key], |row| row.get(0),
+            ).optional()?;
+            if let Some(previous) = previous {
+                let previous: Value = serde_json::from_str(&previous)?;
+                let mut intended = reservation.clone();
+                if let (Some(old), Some(new)) = (previous.as_object(), intended.as_object_mut()) {
+                    new.insert("attempt_id".into(), old["attempt_id"].clone());
+                    new.insert("attempt_no".into(), old["attempt_no"].clone());
+                    new.insert("issued_at".into(), old["issued_at"].clone());
+                    new.insert("expires_at".into(), old["expires_at"].clone());
+                }
+                // Server-owned terminal/binding state is not part of the
+                // transport replay fingerprint; replay never resurrects it.
+                if let Some(old) = previous.as_object() {
+                    for field in ["bound_run_id", "start_event_id", "abort_receipt", "aborted_at"] {
+                        if let Some(value) = old.get(field) { intended[field] = value.clone(); }
+                    }
+                }
+                if previous != intended {
+                    return Err(SlcError::InvalidInput("transport_key replay has a different reservation fingerprint".into()));
+                }
+                tx.commit()?;
+                return Ok(previous);
+            }
+            let attempt_no: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM task_attempts WHERE task_id=?1",
+                params![task_id], |row| row.get(0),
+            )?;
+            let mut created = reservation;
+            created["attempt_no"] = Value::from(attempt_no);
+            tx.execute("INSERT INTO task_attempts(attempt_id,task_id,transport_key,attempt_no,reservation) VALUES(?1,?2,?3,?4,?5)",
+                params![created["attempt_id"].as_str().ok_or_else(|| SlcError::InvalidInput("attempt_id missing".into()))?, task_id, transport_key, attempt_no, created.to_string()])?;
+            tx.commit()?;
+            Ok(created)
+        }).await
+    }
+
+    async fn list_task_attempts(&self, task_id: &str) -> SlcResult<Vec<Value>> {
+        let id = task_id.to_owned();
+        self.blocking(move |conn| {
+            let mut stmt = conn.prepare("SELECT reservation FROM task_attempts WHERE task_id=?1 ORDER BY attempt_no")?;
+            let rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+            rows.map(|row| serde_json::from_str(&row?).map_err(Into::into)).collect()
+        }).await
+    }
+
+    async fn bind_task_attempt(&self, attempt_id: &str, run_id: &str) -> SlcResult<Value> {
+        let (attempt_id, run_id) = (attempt_id.to_owned(), run_id.to_owned());
+        if run_id.trim().is_empty() || run_id.len() > 500 {
+            return Err(SlcError::InvalidInput("invalid Hermes run_id".into()));
+        }
+        self.blocking(move |conn| {
+            // IMMEDIATE takes the SQLite writer lock across processes before reading
+            // either the reservation, task projection, or the event stream.
+            let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+            let raw: String = tx.query_row("SELECT reservation FROM task_attempts WHERE attempt_id=?1",
+                params![attempt_id], |row| row.get(0))?;
+            let mut reservation: Value = serde_json::from_str(&raw)?;
+            if reservation.get("abort_receipt").is_some() {
+                return Err(SlcError::PermissionDenied("aborted attempt cannot be bound".into()));
+            }
+            let task_id = reservation["task_id"].as_str().ok_or_else(|| SlcError::Storage("corrupt attempt task_id".into()))?.to_owned();
+            let event_id = format!("attempt_started_{attempt_id}");
+            if let Some(previous) = reservation["bound_run_id"].as_str() {
+                if previous != run_id { return Err(SlcError::InvalidInput("attempt is bound to another run".into())); }
+                let present: Option<String> = tx.query_row("SELECT value FROM records WHERE collection='task_events_v1' AND key=?1",
+                    params![event_id], |row| row.get(0)).optional()?;
+                if present.is_none() { return Err(SlcError::Storage("bound attempt missing atomic Started event".into())); }
+                tx.commit()?;
+                return Ok(reservation);
+            }
+            let mut doc: Document = tx.query_row("SELECT * FROM documents WHERE document_id=?1", params![task_id], row_to_doc)?;
+            if doc.category != DocumentCategory::Task
+                || doc.metadata.extra.get("status").and_then(Value::as_str) != Some("PENDING")
+                || doc.metadata.extra.get("queue_state").and_then(Value::as_str) != Some("ready")
+                || doc.metadata.extra.get("queue_ready_event_id") != reservation.get("queue_ready_event_id")
+                || doc.metadata.extra.get("assignee") != reservation.get("assignee") {
+                return Err(SlcError::PermissionDenied("attempt task is no longer the READY head".into()));
+            }
+            let competing: Option<String> = tx.query_row(
+                "SELECT attempt_id FROM task_attempts WHERE task_id=?1 AND attempt_id<>?2 AND json_extract(reservation,'$.bound_run_id') IS NOT NULL LIMIT 1",
+                params![task_id, attempt_id], |row| row.get(0)).optional()?;
+            if competing.is_some() { return Err(SlcError::PermissionDenied("another attempt already started this task".into())); }
+            let now = Utc::now();
+            let actor = reservation["assignee"].as_str().ok_or_else(|| SlcError::Storage("corrupt attempt assignee".into()))?.to_owned();
+            let event = serde_json::json!({"event_id":event_id,"task_id":task_id,"kind":"started",
+                "actor":actor,"recipient":doc.metadata.extra.get("issuer").and_then(Value::as_str),
+                "status":"IN_WORK","message":"Hermes held attempt bound",
+                "metadata":{"attempt_id":attempt_id,"run_id":run_id},"created_at":now.to_rfc3339()});
+            let existing: Option<String> = tx.query_row("SELECT key FROM records WHERE collection='task_events_v1' AND json_extract(value,'$.task_id')=?1 AND json_extract(value,'$.kind')='started' LIMIT 1",
+                params![task_id], |row| row.get(0)).optional()?;
+            if existing.is_some() { return Err(SlcError::PermissionDenied("task already has a Started event".into())); }
+            doc.metadata.extra.insert("status".into(), Value::from("IN_WORK"));
+            doc.metadata.extra.insert("queue_state".into(), Value::from("running"));
+            doc.metadata.extra.remove("queue_ready_event_id");
+            doc.metadata.extra.insert("last_event_id".into(), Value::from(event_id.clone()));
+            doc.metadata.extra.insert("last_event_at".into(), Value::from(now.to_rfc3339()));
+            doc.updated_at = now;
+            doc.version += 1;
+            reservation["bound_run_id"] = Value::from(run_id);
+            reservation["start_event_id"] = Value::from(event_id.clone());
+            tx.execute("INSERT INTO records(collection,key,value) VALUES('task_events_v1',?1,?2)", params![event_id,event.to_string()])?;
+            tx.execute("UPDATE documents SET metadata=?2,updated_at=?3,version=?4 WHERE document_id=?1",
+                params![task_id,serde_json::to_string(&doc.metadata)?,now.to_rfc3339(),doc.version])?;
+            tx.execute("UPDATE task_attempts SET reservation=?2 WHERE attempt_id=?1", params![attempt_id,reservation.to_string()])?;
+            tx.commit()?;
+            Ok(reservation)
+        }).await
+    }
+
+    async fn abort_task_attempt(&self, attempt_id: &str, expected: &Value, receipt: &Value) -> SlcResult<Value> {
+        let (attempt_id, expected, receipt) = (attempt_id.to_owned(), expected.clone(), receipt.clone());
+        self.blocking(move |conn| {
+            let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+            let raw: String = tx.query_row("SELECT reservation FROM task_attempts WHERE attempt_id=?1",
+                params![attempt_id], |row| row.get(0))?;
+            let mut reservation: Value = serde_json::from_str(&raw)?;
+            // The caller must have verified the exact Hermes receipt before
+            // entering this transaction. Compare under the writer lock so a
+            // racing bind or second abort cannot silently overwrite evidence.
+            if reservation != expected || reservation.get("bound_run_id").is_some()
+                || reservation.get("start_event_id").is_some() {
+                return Err(SlcError::PermissionDenied("attempt changed or was bound during abort".into()));
+            }
+            let fields = ["attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id",
+                "payload_sha256", "transport_key", "attempt_no"];
+            if fields.iter().any(|field| reservation.get(*field).is_none() || reservation.get(*field) != receipt.get(*field))
+                || receipt.get("run_id") != Some(&Value::Null)
+                || receipt["status"].as_str() != Some("aborted") || receipt["active"].as_bool() != Some(false)
+                || receipt["aborted"].as_bool() != Some(true)
+                || !receipt["abort_receipt"].as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 500) {
+                return Err(SlcError::PermissionDenied("invalid durable Hermes abort receipt".into()));
+            }
+            // Persist only the immutable proof and identity. Hermes' POST and
+            // subsequent GET can differ in unrelated diagnostic/volatile fields.
+            let mut durable = serde_json::Map::new();
+            for field in fields {
+                durable.insert(field.into(), receipt[field].clone());
+            }
+            for field in ["run_id", "status", "active", "aborted", "abort_receipt"] {
+                durable.insert(field.into(), receipt[field].clone());
+            }
+            let durable = Value::Object(durable);
+            if let Some(previous) = reservation.get("abort_receipt") {
+                if durable.as_object().unwrap().iter().any(|(key, value)| previous.get(key) != Some(value)) {
+                    return Err(SlcError::PermissionDenied("abort receipt mismatch".into()));
+                }
+            } else {
+                reservation["abort_receipt"] = durable;
+                reservation["aborted_at"] = Value::from(Utc::now().to_rfc3339());
+                tx.execute("UPDATE task_attempts SET reservation=?2 WHERE attempt_id=?1",
+                    params![attempt_id, reservation.to_string()])?;
+            }
+            tx.commit()?;
+            Ok(reservation)
+        }).await
+    }
+
+    async fn has_task_attempt(&self, task_id: &str) -> SlcResult<bool> {
+        let id = task_id.to_owned();
+        self.blocking(move |conn| {
+            Ok(conn.query_row("SELECT 1 FROM task_attempts WHERE task_id=?1 AND json_extract(reservation,'$.abort_receipt') IS NULL LIMIT 1", params![id], |_| Ok(())).optional()?.is_some())
+        }).await
+    }
+
+    async fn get_task_attempt(&self, attempt_id: &str) -> SlcResult<Option<Value>> {
+        let id = attempt_id.to_owned();
+        self.blocking(move |conn| {
+            let value: Option<String> = conn.query_row("SELECT reservation FROM task_attempts WHERE attempt_id=?1", params![id], |row| row.get(0)).optional()?;
+            value.map(|value| serde_json::from_str(&value).map_err(Into::into)).transpose()
+        }).await
+    }
+
     // ── records ─────────────────────────────────────────────────
 
     async fn put_record(&self, collection: &str, key: &str, value: &Value) -> SlcResult<()> {
@@ -1397,6 +1587,120 @@ mod tests {
     use super::*;
     use crate::model::{DocLevel, DocMeta, Document, DocumentCategory};
     use crate::storage::{DocFilter, DocSort, SortDir};
+
+    #[tokio::test]
+    async fn attempt_reservation_is_atomic_immutable_and_replay_checked() {
+        let store = SqliteStore::in_memory().unwrap();
+        let proposed = serde_json::json!({"attempt_id":"a1","task_id":"task-a","transport_key":"wake-1","profile":"worker","queue_ready_event_id":"ready-1","assignee":"worker","payload_sha256":"f".repeat(64),"issued_at":1,"expires_at":301,"attempt_no":0});
+        let first = store.reserve_task_attempt("task-a", "wake-1", &proposed).await.unwrap();
+        assert_eq!(first["attempt_no"], 1);
+        assert_eq!(store.reserve_task_attempt("task-a", "wake-1", &proposed).await.unwrap(), first);
+        assert!(store.reserve_task_attempt("task-a", "wake-1", &serde_json::json!({"attempt_id":"a2","task_id":"task-a","transport_key":"wake-1","profile":"other","queue_ready_event_id":"ready-1","assignee":"worker","payload_sha256":"f".repeat(64),"issued_at":2,"expires_at":302,"attempt_no":0})).await.is_err());
+        let mut next = proposed.clone();
+        next["attempt_id"] = Value::from("a2");
+        assert_eq!(store.reserve_task_attempt("task-a", "wake-2", &next).await.unwrap()["attempt_no"], 2);
+        assert!(store.has_task_attempt("task-a").await.unwrap());
+        assert_eq!(store.get_task_attempt("a1").await.unwrap().unwrap(), first);
+    }
+
+    fn aborted_receipt(reservation: &Value, proof: &str) -> Value {
+        let mut receipt = reservation.clone();
+        receipt["status"] = Value::from("aborted");
+        receipt["active"] = Value::from(false);
+        receipt["aborted"] = Value::from(true);
+        receipt["run_id"] = Value::Null;
+        receipt["abort_receipt"] = Value::from(proof);
+        receipt
+    }
+
+    #[tokio::test]
+    async fn abort_requires_all_attempts_and_rejects_racing_bind_or_changed_receipt() {
+        let path = std::env::temp_dir().join(format!("slc-attempt-abort-{}.sqlite", uuid::Uuid::new_v4()));
+        let store = SqliteStore::open(&path).unwrap();
+        let second = SqliteStore::open(&path).unwrap();
+        let mut meta = DocMeta::default();
+        for (key, value) in [("status", "PENDING"), ("queue_state", "ready"),
+            ("queue_ready_event_id", "ready-1"), ("assignee", "worker")] {
+            meta.extra.insert(key.into(), Value::from(value));
+        }
+        store.kb_insert(&Document::new("task-abort", DocumentCategory::Task, "abort", meta, vec![], None)).await.unwrap();
+        let proposed = serde_json::json!({"attempt_id":"a1","task_id":"task-abort","transport_key":"wake-1",
+            "profile":"worker","queue_ready_event_id":"ready-1","assignee":"worker",
+            "payload_sha256":"f".repeat(64),"issued_at":1,"expires_at":2,"attempt_no":0});
+        let first = store.reserve_task_attempt("task-abort", "wake-1", &proposed).await.unwrap();
+        let mut next = proposed.clone();
+        next["attempt_id"] = Value::from("a2");
+        let second_attempt = store.reserve_task_attempt("task-abort", "wake-2", &next).await.unwrap();
+        assert!(store.has_task_attempt("task-abort").await.unwrap()); // expiry is not proof
+        let receipt = aborted_receipt(&first, "durable-1");
+        let aborted = second.abort_task_attempt("a1", &first, &receipt).await.unwrap();
+        assert_eq!(store.reserve_task_attempt("task-abort", "wake-1", &proposed).await.unwrap(), aborted);
+        assert!(store.has_task_attempt("task-abort").await.unwrap()); // another unknown attempt
+        assert!(store.bind_task_attempt("a1", "run-1").await.is_err());
+        assert!(second.abort_task_attempt("a1", &first, &receipt).await.is_err()); // stale snapshot
+        let mut replay_receipt = receipt.clone();
+        replay_receipt["diagnostic"] = Value::from("later registry read");
+        assert_eq!(second.abort_task_attempt("a1", &aborted, &replay_receipt).await.unwrap(), aborted);
+        assert!(second.abort_task_attempt("a1", &aborted, &aborted_receipt(&first, "different")).await.is_err());
+        store.bind_task_attempt("a2", "run-2").await.unwrap();
+        assert!(second.abort_task_attempt("a2", &second_attempt, &receipt).await.is_err());
+        assert!(store.has_task_attempt("task-abort").await.unwrap());
+        drop(second);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn all_aborted_attempts_release_ordinary_workflow_hold() {
+        let store = SqliteStore::in_memory().unwrap();
+        let proposed = serde_json::json!({"attempt_id":"a1","task_id":"task-abort-all","transport_key":"wake-1",
+            "profile":"worker","queue_ready_event_id":"ready-1","assignee":"worker",
+            "payload_sha256":"f".repeat(64),"issued_at":1,"expires_at":2,"attempt_no":0});
+        let first = store.reserve_task_attempt("task-abort-all", "wake-1", &proposed).await.unwrap();
+        let mut next = proposed.clone(); next["attempt_id"] = Value::from("a2");
+        let second = store.reserve_task_attempt("task-abort-all", "wake-2", &next).await.unwrap();
+        store.abort_task_attempt("a1", &first, &aborted_receipt(&first, "proof-1")).await.unwrap();
+        assert!(store.has_task_attempt("task-abort-all").await.unwrap());
+        store.abort_task_attempt("a2", &second, &aborted_receipt(&second, "proof-2")).await.unwrap();
+        assert!(!store.has_task_attempt("task-abort-all").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn binding_is_atomic_replayable_and_cross_connection_safe() {
+        let path = std::env::temp_dir().join(format!("slc-attempt-bind-{}.sqlite", uuid::Uuid::new_v4()));
+        let store = SqliteStore::open(&path).unwrap();
+        let second = SqliteStore::open(&path).unwrap();
+        let mut meta = DocMeta::default();
+        for (key, value) in [("status", "PENDING"), ("queue_state", "ready"),
+            ("queue_ready_event_id", "ready-1"), ("assignee", "worker")] {
+            meta.extra.insert(key.into(), Value::from(value));
+        }
+        let doc = Document::new("task-bind", DocumentCategory::Task, "bind", meta, vec![], None);
+        store.kb_insert(&doc).await.unwrap();
+        let proposed = serde_json::json!({"attempt_id":"attempt-1","task_id":"task-bind","transport_key":"key-1",
+            "profile":"worker","queue_ready_event_id":"ready-1","assignee":"worker",
+            "payload_sha256":"f".repeat(64),"issued_at":1,"expires_at":301,"attempt_no":0});
+        store.reserve_task_attempt("task-bind", "key-1", &proposed).await.unwrap();
+        let bound = second.bind_task_attempt("attempt-1", "run-1").await.unwrap();
+        assert_eq!(bound["start_event_id"], "attempt_started_attempt-1");
+        assert_eq!(store.bind_task_attempt("attempt-1", "run-1").await.unwrap(), bound);
+        assert!(store.bind_task_attempt("attempt-1", "run-2").await.is_err());
+        assert_eq!(second.reserve_task_attempt("task-bind", "key-1", &proposed).await.unwrap(), bound);
+        let task = store.kb_get("task-bind").await.unwrap().unwrap();
+        assert_eq!(task.metadata.extra["queue_state"], "running");
+        assert_eq!(task.metadata.extra["status"], "IN_WORK");
+        let events = second.list_records("task_events_v1").await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1["metadata"]["run_id"], "run-1");
+        let mut another = proposed.clone();
+        another["attempt_id"] = Value::from("attempt-2");
+        store.reserve_task_attempt("task-bind", "key-2", &another).await.unwrap();
+        assert!(second.bind_task_attempt("attempt-2", "run-3").await.is_err());
+        assert_eq!(second.list_task_attempts("task-bind").await.unwrap().len(), 2);
+        drop(second);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[tokio::test]
     async fn kb_crud_and_filter() {

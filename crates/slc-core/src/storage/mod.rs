@@ -288,6 +288,30 @@ pub trait StorageBackend: Send + Sync {
     async fn active_timers(&self, seat_id: Option<&str>) -> SlcResult<Vec<PersistedTimer>>;
     async fn set_timer_fired(&self, timer_id: &str, now: DateTime<Utc>) -> SlcResult<()>;
 
+    /// Atomic, immutable reservation for workflow attempt admission. Unsupported
+    /// backends MUST reject this operation; put_record is not an acceptable substitute.
+    async fn reserve_task_attempt(&self, _task_id: &str, _transport_key: &str, _reservation: &Value) -> SlcResult<Value> {
+        Err(crate::error::SlcError::PermissionDenied("task attempt admission requires an atomic supported backend (SQLite)".into()))
+    }
+    async fn get_task_attempt(&self, _attempt_id: &str) -> SlcResult<Option<Value>> {
+        Err(crate::error::SlcError::PermissionDenied("task attempt admission requires an atomic supported backend (SQLite)".into()))
+    }
+    /// Bind a verified held run and append Started plus its task projection
+    /// in one SQLite transaction. Unsupported stores must never admit.
+    async fn bind_task_attempt(&self, _attempt_id: &str, _run_id: &str) -> SlcResult<Value> {
+        Err(crate::error::SlcError::PermissionDenied("atomic attempt binding requires SQLite".into()))
+    }
+    /// Persist a verified Hermes no-run abort receipt atomically, rejecting any
+    /// intervening bind or reservation mutation. Never synthesize this from expiry.
+    async fn abort_task_attempt(&self, _attempt_id: &str, _expected: &Value, _receipt: &Value) -> SlcResult<Value> {
+        Err(crate::error::SlcError::PermissionDenied("atomic attempt abort requires SQLite".into()))
+    }
+    async fn list_task_attempts(&self, _task_id: &str) -> SlcResult<Vec<Value>> {
+        Err(crate::error::SlcError::PermissionDenied("attempt enumeration requires SQLite".into()))
+    }
+    async fn has_task_attempt(&self, _task_id: &str) -> SlcResult<bool> {
+        Ok(false) // unsupported stores cannot create attempts in the first place
+    }
     /// Free-form JSON records (task/project extras, notifications, …).
     async fn put_record(&self, collection: &str, key: &str, value: &Value) -> SlcResult<()>;
     async fn get_record(&self, collection: &str, key: &str) -> SlcResult<Option<Value>>;

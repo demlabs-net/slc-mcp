@@ -41,6 +41,8 @@ jsonwebtoken = { workspace = true }
 bcrypt = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
+hmac = "0.12"
+base64 = "0.22"
 slc-core = { workspace = true }
 
 [dev-dependencies]

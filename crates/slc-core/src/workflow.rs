@@ -14,6 +14,7 @@ use crate::tasks::{
     STATUS_PENDING, TaskInfo, apply_description_patch, doc_to_task, is_workflow_task,
     normalize_task_status,
 };
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -25,6 +26,20 @@ const TASK_EVENT_IDEMPOTENCY: &str = "task_event_idempotency_v1";
 const TASK_ASSIGN_IDEMPOTENCY: &str = "task_assign_idempotency_v1";
 const MAX_ASSIGNEE_QUEUE_DEPTH: usize = 5_000;
 const LEADS_PORTFOLIO_PROJECT: &str = "leads_mass_redesign";
+
+/// Implementations must query the authoritative executor registry, not accept
+/// a caller-provided claim of termination. A positive answer binds this exact
+/// SLC start event to this executor run and confirms it is no longer active.
+#[async_trait]
+pub trait RunTerminationVerifier: Send + Sync {
+    async fn verify_stopped(
+        &self,
+        task_id: &str,
+        assignee: &str,
+        start_event_id: &str,
+        run_id: &str,
+    ) -> SlcResult<bool>;
+}
 
 pub const QUEUE_STATE_QUEUED: &str = "queued";
 pub const QUEUE_STATE_READY: &str = "ready";
@@ -47,6 +62,7 @@ pub enum TaskEventKind {
     /// its participants; a manager with an explicit manage ACL over the task
     /// owner seat edits through this durable event, never behind the stream.
     Update,
+    CancellationRequested,
 }
 
 impl TaskEventKind {
@@ -61,6 +77,7 @@ impl TaskEventKind {
             Self::StatusChanged => "status_changed",
             Self::Transport => "transport",
             Self::Update => "update",
+            Self::CancellationRequested => "cancellation_requested",
         }
     }
 }
@@ -604,6 +621,11 @@ impl SlcEngine {
     pub fn workflow_principal_held(&self, principal: &str) -> bool {
         self.workflow_seat(principal)
             .is_none_or(|seat| self.workflow_held(&seat))
+    }
+
+    pub fn workflow_principal_protected(&self, principal: &str) -> bool {
+        self.config.protected_workflow_principals.contains(principal)
+            || self.config.protected_workflow_principals.contains("*")
     }
 
     fn workflow_generation_current(&self, doc: &Document) -> bool {
@@ -1734,6 +1756,39 @@ impl SlcEngine {
         Ok(tasks)
     }
 
+    /// Admission-first reserve is server-only: callers must enforce a distinct
+    /// service credential; this method never accepts a seat authentication claim.
+    pub async fn workflow_reserve_attempt(&self, task_id: &str, assignee: &str, profile: &str, queue_ready_event_id: &str, payload_sha256: &str, transport_key: &str) -> SlcResult<Value> {
+        let _guard = self.workflow_lock.lock().await;
+        for (name, value) in [("task_id", task_id), ("assignee", assignee), ("profile", profile), ("queue_ready_event_id", queue_ready_event_id), ("transport_key", transport_key)] {
+            clean_required(value, name, 500)?;
+        }
+        if !self.workflow_principal_protected(assignee) {
+            return Err(SlcError::PermissionDenied("attempt reservation requires an explicitly protected assignee".into()));
+        }
+        if payload_sha256.len() != 64 || !payload_sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+            return Err(SlcError::InvalidInput("payload_sha256 must be lowercase SHA-256 hex".into()));
+        }
+        let queue = self.reconcile_task_queue_locked(assignee).await?;
+        if queue.ready_task_id.as_deref() != Some(task_id) || queue.running_task_id.is_some() {
+            return Err(SlcError::PermissionDenied("only the reserved READY FIFO head may be admitted".into()));
+        }
+        let doc = task_document(self.store().kb_get(task_id).await?, task_id)?;
+        self.require_workflow_generation(&doc)?;
+        if workflow_string(&doc, "assignee").as_deref() != Some(assignee)
+            || workflow_string(&doc, "queue_ready_event_id").as_deref() != Some(queue_ready_event_id)
+            || effective_queue_state(&doc) != QUEUE_STATE_READY {
+            return Err(SlcError::PermissionDenied("task assignee/ready event mismatch".into()));
+        }
+        let issued = Utc::now();
+        self.store().reserve_task_attempt(task_id, transport_key, &json!({
+            "attempt_id": Uuid::new_v4().to_string(), "task_id": task_id,
+            "assignee": assignee, "profile": profile, "queue_ready_event_id": queue_ready_event_id,
+            "payload_sha256": payload_sha256, "transport_key": transport_key,
+            "attempt_no": 0, "issued_at": issued.timestamp(), "expires_at": (issued + chrono::Duration::minutes(5)).timestamp()
+        })).await
+    }
+
     pub async fn workflow_start_task(
         &self,
         seat_id: &str,
@@ -1749,6 +1804,12 @@ impl SlcEngine {
         }
         let task_id = self.workflow_task_id_or_active(seat_id, task_id).await?;
         let task_id = task_id.as_str();
+        let doc = self.workflow_task_document(seat_id, task_id).await?;
+        if self.workflow_principal_protected(
+            workflow_string(&doc, "assignee").as_deref().unwrap_or("")
+        ) || !self.store().list_task_attempts(task_id).await?.is_empty() {
+            return Err(SlcError::PermissionDenied("protected or reserved workflow task requires verified server bind before Started".into()));
+        }
         let mut doc = self.workflow_task_document(seat_id, task_id).await?;
         self.require_workflow_generation(&doc)?;
         let actor = self.workflow_principal(seat_id);
@@ -1905,6 +1966,11 @@ impl SlcEngine {
         let task_id = self.workflow_task_id_or_active(seat_id, task_id).await?;
         let task_id = task_id.as_str();
         let doc = self.workflow_task_document(seat_id, task_id).await?;
+        if self.workflow_principal_protected(
+            workflow_string(&doc, "assignee").as_deref().unwrap_or("")
+        ) || !self.store().list_task_attempts(task_id).await?.is_empty() {
+            return Err(SlcError::PermissionDenied("protected or reserved workflow attempt cannot be finalized without all Hermes attempts verified stopped and bound".into()));
+        }
         let actor = self.workflow_principal(seat_id);
         let assignee = workflow_string(&doc, "assignee")
             .unwrap_or_else(|| doc.seat_id.clone().unwrap_or_default());
@@ -1929,6 +1995,18 @@ impl SlcEngine {
             TaskEventKind::Progress
         };
         let issuer = workflow_string(&doc, "issuer");
+        // A verified cancellation may have been appended just before a crash,
+        // leaving the projection IN_WORK. The immutable terminal event fences
+        // reports until cancellation replay repairs that projection.
+        if self
+            .has_terminal_event(task_id, TaskEventKind::StatusChanged)
+            .await?
+            && !is_terminal_status(&workflow_string(&doc, "status").unwrap_or_default())
+        {
+            return Err(SlcError::InvalidInput(
+                "task was cancelled; cannot report a conflicting transition".into(),
+            ));
+        }
         let fingerprint = task_event_fingerprint(
             task_id,
             event_kind,
@@ -1951,6 +2029,9 @@ impl SlcEngine {
                 )
                 .await?;
             if terminal {
+                if repaired.status != status {
+                    return Err(SlcError::InvalidInput("task was cancelled after this report; cannot replay a conflicting terminal transition".into()));
+                }
                 repaired = self
                     .set_task_queue_projection(task_id, QUEUE_STATE_TERMINAL, None)
                     .await?;
@@ -2077,6 +2158,238 @@ impl SlcEngine {
         Ok((task, event, next_ready))
     }
 
+    async fn cancellation_events(
+        &self,
+        task_id: &str,
+    ) -> SlcResult<(Option<TaskEvent>, Option<TaskEvent>)> {
+        let mut start = None;
+        let mut request = None;
+        for (_, value) in self.store().list_records(TASK_EVENTS).await? {
+            let event: TaskEvent = serde_json::from_value(value)?;
+            if event.task_id != task_id {
+                continue;
+            }
+            match event.kind {
+                TaskEventKind::Started => {
+                    if start
+                        .as_ref()
+                        .is_some_and(|previous: &TaskEvent| previous.event_id != event.event_id)
+                    {
+                        return Err(SlcError::Storage(
+                            "multiple task start events; cannot verify executor binding".into(),
+                        ));
+                    }
+                    start = Some(event);
+                }
+                TaskEventKind::CancellationRequested => {
+                    if request
+                        .as_ref()
+                        .is_some_and(|previous: &TaskEvent| previous.event_id != event.event_id)
+                    {
+                        return Err(SlcError::Storage(
+                            "multiple cancellation requests; cannot finalize".into(),
+                        ));
+                    }
+                    request = Some(event);
+                }
+                _ => {}
+            }
+        }
+        Ok((start, request))
+    }
+
+    async fn has_terminal_event(&self, task_id: &str, kind: TaskEventKind) -> SlcResult<bool> {
+        for (_, value) in self.store().list_records(TASK_EVENTS).await? {
+            let event: TaskEvent = serde_json::from_value(value)?;
+            if event.task_id == task_id
+                && event.kind == kind
+                && event.status.as_deref().is_some_and(is_terminal_status)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Phase two. The verifier is injected by the server, never provided by the
+    /// calling seat. A request, exact start binding, and authoritative stopped
+    /// observation must all agree before the FIFO reservation is released.
+    pub async fn workflow_finalize_cancel_task(
+        &self,
+        seat_id: &str,
+        task_id: &str,
+        request_event_id: &str,
+        start_event_id: &str,
+        run_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> SlcResult<(TaskInfo, TaskEvent, Option<TaskInfo>)> {
+        let _guard = self.workflow_lock.lock().await;
+        let task_id = clean_required(task_id, "task_id", 500)?;
+        // Even aborted reservations remain part of the immutable attempt history.
+        // The legacy single-run verifier cannot prove that *every* Hermes attempt
+        // is fenced/terminal, so no protected task may use this finalizer.
+        if !self.store().list_task_attempts(&task_id).await?.is_empty() {
+            return Err(SlcError::PermissionDenied("protected attempt finalization unavailable: a trusted all-attempt verifier is required; FIFO lane remains held".into()));
+        }
+        let doc = self.workflow_task_document(seat_id, &task_id).await?;
+        if self.workflow_principal_protected(
+            workflow_string(&doc, "assignee").as_deref().unwrap_or("")
+        ) {
+            return Err(SlcError::PermissionDenied("protected attempt finalization unavailable: a trusted all-attempt verifier is required; FIFO lane remains held".into()));
+        }
+        let request_event_id = clean_required(request_event_id, "request_event_id", 200)?;
+        let start_event_id = clean_required(start_event_id, "start_event_id", 200)?;
+        let run_id = clean_required(run_id, "run_id", 500)?;
+        let doc = self.workflow_task_document(seat_id, &task_id).await?;
+        let actor = self.workflow_principal(seat_id);
+        let issuer = workflow_string(&doc, "issuer");
+        let assignee = workflow_string(&doc, "assignee")
+            .unwrap_or_else(|| doc.seat_id.clone().unwrap_or_default());
+        let global_coordinator = self
+            .config
+            .task_assign_acl
+            .get(&actor)
+            .is_some_and(|targets| targets.contains("*"));
+        if issuer.as_deref() != Some(&actor) && assignee != actor && !global_coordinator {
+            return Err(SlcError::PermissionDenied(
+                "only the issuer, assignee, or global task coordinator can finalize cancellation"
+                    .into(),
+            ));
+        }
+        let (start, request) = self.cancellation_events(&task_id).await?;
+        let start = start
+            .ok_or_else(|| SlcError::InvalidInput("no durable start event for task".into()))?;
+        let request = request.ok_or_else(|| {
+            SlcError::InvalidInput("no durable cancellation request for task".into())
+        })?;
+        if start.event_id != start_event_id
+            || request.event_id != request_event_id
+            || request
+                .metadata
+                .get("start_event_id")
+                .and_then(Value::as_str)
+                != Some(&start_event_id)
+        {
+            return Err(SlcError::InvalidInput(
+                "cancellation request/start binding mismatch".into(),
+            ));
+        }
+        let metadata = json!({"request_event_id":request_event_id,"start_event_id":start_event_id,"run_id":run_id});
+        let fingerprint = task_event_fingerprint(
+            &task_id,
+            TaskEventKind::StatusChanged,
+            &actor,
+            Some(assignee.as_str()),
+            Some(STATUS_CANCELLED),
+            &request.message,
+            &metadata,
+        )?;
+        let existing = self
+            .existing_task_event(&actor, idempotency_key, &fingerprint)
+            .await?;
+        // A report can be durable while its projection is still IN_WORK. Never
+        // let a retry of either transition silently claim that stale projection.
+        if self
+            .has_terminal_event(&task_id, TaskEventKind::Report)
+            .await?
+            || (is_terminal_status(&workflow_string(&doc, "status").unwrap_or_default())
+                && workflow_string(&doc, "status").as_deref() != Some(STATUS_CANCELLED))
+        {
+            return Err(SlcError::InvalidInput(
+                "terminal report won cancellation race".into(),
+            ));
+        }
+        if existing.is_none()
+            && is_terminal_status(&workflow_string(&doc, "status").unwrap_or_default())
+        {
+            return Err(SlcError::InvalidInput(
+                "terminal report won cancellation race".into(),
+            ));
+        }
+        if existing.is_none() && effective_queue_state(&doc) != QUEUE_STATE_RUNNING {
+            return Err(SlcError::InvalidInput("task is not running".into()));
+        }
+        // A persisted event alone is not permission to release a running lane:
+        // replay must independently verify the exact stopped binding again.
+        let verifier = self.run_termination_verifier.as_ref().ok_or_else(|| {
+            SlcError::PermissionDenied(
+                "no trusted Hermes run verifier configured; FIFO lane remains held".into(),
+            )
+        })?;
+        if !verifier
+            .verify_stopped(&task_id, &assignee, &start_event_id, &run_id)
+            .await?
+        {
+            return Err(SlcError::PermissionDenied(
+                "Hermes did not verify exact stopped run binding; FIFO lane remains held".into(),
+            ));
+        }
+        if let Some(event) = existing {
+            let projected = self
+                .touch_task_projection(
+                    &task_id,
+                    &event,
+                    Some(STATUS_CANCELLED),
+                    Some(&request.message),
+                )
+                .await?;
+            if projected.status != STATUS_CANCELLED {
+                return Err(SlcError::InvalidInput(
+                    "terminal report won cancellation race".into(),
+                ));
+            }
+            let task = self
+                .set_task_queue_projection(&task_id, QUEUE_STATE_TERMINAL, None)
+                .await?;
+            if let Some(seat) = self.workflow_seat(&assignee)
+                && let Some(active) = self.seats.get_seat(&seat).await?
+                && active.active_task_id.as_deref() == Some(&task_id)
+            {
+                self.seats.set_active_task(&seat, None, None).await?;
+            }
+            // Reconcile missing queue projection without returning a second wake.
+            self.reconcile_task_queue_locked(&assignee).await?;
+            return Ok((task, event, None));
+        }
+        let event = self
+            .append_task_event(
+                &task_id,
+                TaskEventKind::StatusChanged,
+                &actor,
+                Some(&assignee),
+                Some(STATUS_CANCELLED),
+                &request.message,
+                metadata,
+                idempotency_key,
+            )
+            .await?;
+        let mut task = self
+            .touch_task_projection(
+                &task_id,
+                &event,
+                Some(STATUS_CANCELLED),
+                Some(&request.message),
+            )
+            .await?;
+        if task.status != STATUS_CANCELLED {
+            return Err(SlcError::Storage("cancellation projection failed".into()));
+        }
+        task = self
+            .set_task_queue_projection(&task_id, QUEUE_STATE_TERMINAL, None)
+            .await?;
+        if let Some(seat) = self.workflow_seat(&assignee)
+            && let Some(active) = self.seats.get_seat(&seat).await?
+            && active.active_task_id.as_deref() == Some(&task_id)
+        {
+            self.seats.set_active_task(&seat, None, None).await?;
+        }
+        let next = self
+            .reconcile_task_queue_locked(&assignee)
+            .await?
+            .ready_task();
+        Ok((task, event, next))
+    }
+
     pub async fn workflow_cancel_task(
         &self,
         seat_id: &str,
@@ -2088,6 +2401,14 @@ impl SlcEngine {
         let _workflow_guard = self.workflow_lock.lock().await;
         let task_id = clean_required(task_id, "task_id", 500)?;
         let doc = self.workflow_task_document(seat_id, &task_id).await?;
+        // A locally aborted reservation is not a globally verified terminal
+        // attempt set. Do not let a manager cancel a READY protected head and
+        // emit a terminal wake merely because has_task_attempt became false.
+        if self.workflow_principal_protected(
+            workflow_string(&doc, "assignee").as_deref().unwrap_or("")
+        ) || !self.store().list_task_attempts(&task_id).await?.is_empty() {
+            return Err(SlcError::PermissionDenied("protected attempt cancellation unavailable until trusted all-attempt verification; FIFO lane remains held".into()));
+        }
         let actor = self.workflow_principal(seat_id);
         let issuer = workflow_string(&doc, "issuer");
         let assignee = workflow_string(&doc, "assignee")
@@ -2152,17 +2473,60 @@ impl SlcEngine {
             ));
         }
 
-        // SLC owns durable task state, not the transport/process lifecycle. A
-        // coordinator cancelling a RUNNING projection cannot prove that the
-        // corresponding Hermes run has stopped; releasing the lane here could
-        // promote a second writer while the first one is still editing. A
-        // live assignee must close its run with report_task. After a crashed
-        // transport is confirmed idle, wake that same assignee to recover and
-        // report the existing task instead of manufacturing a replacement.
+        // Phase one: durable request without a status change or FIFO release.
+        // The start ID comes from the immutable SLC event stream, never caller
+        // metadata. Conflicting second requests are rejected (including actors
+        // using different idempotency keys), while exact replays are stable.
         if effective_queue_state(&doc) == QUEUE_STATE_RUNNING {
-            return Err(SlcError::InvalidInput(
-                "running task cannot be cancelled because SLC does not control its executor; let the assignee report it, or stop the transport and recover the same task"
-                    .into(),
+            let (start, existing_request) = self.cancellation_events(&task_id).await?;
+            let start = start.ok_or_else(|| {
+                SlcError::Storage("running task lacks durable start event".into())
+            })?;
+            let request_metadata = json!({"start_event_id":start.event_id,"details":metadata});
+            let fingerprint = task_event_fingerprint(
+                &task_id,
+                TaskEventKind::CancellationRequested,
+                &actor,
+                recipient,
+                None,
+                &reason,
+                &request_metadata,
+            )?;
+            if let Some(event) = self
+                .existing_task_event(&actor, idempotency_key, &fingerprint)
+                .await?
+            {
+                if existing_request
+                    .as_ref()
+                    .is_none_or(|request| request.event_id != event.event_id)
+                {
+                    return Err(SlcError::InvalidInput(
+                        "cancellation request superseded; cannot replay".into(),
+                    ));
+                }
+                return Ok((doc_to_task(&doc), event, None));
+            }
+            if existing_request.is_some() {
+                return Err(SlcError::InvalidInput("running task already has a cancellation request; retry with its original idempotency_key".into()));
+            }
+            let event = self
+                .append_task_event(
+                    &task_id,
+                    TaskEventKind::CancellationRequested,
+                    &actor,
+                    recipient,
+                    None,
+                    &reason,
+                    request_metadata,
+                    idempotency_key,
+                )
+                .await?;
+            self.touch_task_projection(&task_id, &event, None, None)
+                .await?;
+            return Ok((
+                doc_to_task(&self.workflow_task_document(seat_id, &task_id).await?),
+                event,
+                None,
             ));
         }
 
@@ -2535,6 +2899,25 @@ mod tests {
             ..Default::default()
         };
         SlcEngine::with(store, Arc::new(MockLlm::new(vec![])), config)
+    }
+
+    #[tokio::test]
+    async fn protected_role_cannot_start_report_or_cancel_before_reservation() {
+        let mut engine = engine();
+        engine.config.protected_workflow_principals.insert("junior".into());
+        let task = engine.workflow_assign_task("seat-manager", "junior", "Protected", "work",
+            None, None, &[], &json!({}), Some("protected-early-start")).await.unwrap();
+        assert!(task.queue_ready_event_id.is_some());
+        let err = engine.workflow_start_task("seat-junior", &task.task_id, "Bypass",
+            Some("protected-bypass")).await.unwrap_err();
+        assert!(err.to_string().contains("verified server bind"));
+        let err = engine.workflow_report_task("seat-junior", &task.task_id, "completed", "Bypass",
+            json!({}), Some("protected-report")).await.unwrap_err();
+        assert!(err.to_string().contains("all Hermes attempts"));
+        assert!(engine.workflow_cancel_task("seat-manager", &task.task_id, "Bypass", json!({}),
+            Some("protected-cancel-before-reserve")).await.unwrap_err().to_string().contains("protected attempt cancellation"));
+        let queue = engine.workflow_reconcile_task_queue("seat-manager", "junior").await.unwrap();
+        assert_eq!(queue.ready_task_id.as_deref(), Some(task.task_id.as_str()));
     }
 
     /// The stop must hold on the promotion point itself, not only on the
@@ -4670,6 +5053,528 @@ mod tests {
         );
     }
 
+    struct BoundStoppedRun;
+
+    #[async_trait]
+    impl RunTerminationVerifier for BoundStoppedRun {
+        async fn verify_stopped(
+            &self,
+            task_id: &str,
+            assignee: &str,
+            start_event_id: &str,
+            run_id: &str,
+        ) -> SlcResult<bool> {
+            Ok(!task_id.is_empty()
+                && assignee == "junior"
+                && start_event_id.starts_with("task_event_")
+                && run_id == "bound-stopped-run")
+        }
+    }
+
+    struct ToggleStoppedRun(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait]
+    impl RunTerminationVerifier for ToggleStoppedRun {
+        async fn verify_stopped(
+            &self,
+            _task_id: &str,
+            _assignee: &str,
+            _start_event_id: &str,
+            run_id: &str,
+        ) -> SlcResult<bool> {
+            Ok(run_id == "bound-stopped-run" && self.0.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_replay_repairs_crash_after_event_before_projection() {
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine =
+            engine().with_run_termination_verifier(Arc::new(ToggleStoppedRun(stopped.clone())));
+        let first = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "First crash",
+                "Work",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("crash-first"),
+            )
+            .await
+            .unwrap();
+        let second = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Next crash",
+                "Work",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("crash-next"),
+            )
+            .await
+            .unwrap();
+        let (_, start) = engine
+            .workflow_start_task("seat-junior", &first.task_id, "Begin", Some("crash-start"))
+            .await
+            .unwrap();
+        let (_, request, _) = engine
+            .workflow_cancel_task(
+                "seat-senior",
+                &first.task_id,
+                "Stopped",
+                json!({}),
+                Some("crash-request"),
+            )
+            .await
+            .unwrap();
+        // Failure injection: persist the exact finalization event and index,
+        // then simulate a crash before touch_task_projection / anchor / queue.
+        let event = engine.append_task_event(
+            &first.task_id, TaskEventKind::StatusChanged, "senior", Some("junior"),
+            Some(STATUS_CANCELLED), &request.message,
+            json!({"request_event_id":request.event_id,"start_event_id":start.event_id,"run_id":"bound-stopped-run"}),
+            Some("crash-finalize"),
+        ).await.unwrap();
+        assert_eq!(
+            engine
+                .workflow_task_document("seat-junior", &first.task_id)
+                .await
+                .unwrap()
+                .metadata
+                .extra["status"],
+            STATUS_ACTIVE
+        );
+        assert!(
+            engine
+                .workflow_report_task(
+                    "seat-junior",
+                    &first.task_id,
+                    "completed",
+                    "late report",
+                    json!({}),
+                    Some("crash-late-report")
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert!(
+            engine
+                .workflow_finalize_cancel_task(
+                    "seat-senior",
+                    &first.task_id,
+                    &request.event_id,
+                    &start.event_id,
+                    "bound-stopped-run",
+                    Some("crash-finalize")
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("did not verify")
+        );
+        assert_eq!(
+            engine
+                .workflow_reconcile_task_queue("seat-senior", "junior")
+                .await
+                .unwrap()
+                .running_task_id
+                .as_deref(),
+            Some(first.task_id.as_str())
+        );
+        stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (repaired, replay, next) = engine
+            .workflow_finalize_cancel_task(
+                "seat-senior",
+                &first.task_id,
+                &request.event_id,
+                &start.event_id,
+                "bound-stopped-run",
+                Some("crash-finalize"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(event.event_id, replay.event_id);
+        assert_eq!(repaired.status, STATUS_CANCELLED);
+        assert_eq!(repaired.terminal_summary.as_deref(), Some("Stopped"));
+        assert_eq!(repaired.queue_state.as_deref(), Some(QUEUE_STATE_TERMINAL));
+        assert!(next.is_none());
+        assert!(
+            engine
+                .task_get_active("seat-junior")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            engine
+                .workflow_reconcile_task_queue("seat-senior", "junior")
+                .await
+                .unwrap()
+                .ready_task_id
+                .as_deref(),
+            Some(second.task_id.as_str())
+        );
+        let (_, same_event, no_next) = engine
+            .workflow_finalize_cancel_task(
+                "seat-senior",
+                &first.task_id,
+                &request.event_id,
+                &start.event_id,
+                "bound-stopped-run",
+                Some("crash-finalize"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(same_event.event_id, event.event_id);
+        assert!(no_next.is_none());
+        assert_eq!(
+            engine
+                .workflow_task_events("seat-senior", &first.task_id, 100)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|item| item.event_id == event.event_id)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_replay_rejects_durable_competing_report_with_stale_projection() {
+        let engine = engine().with_run_termination_verifier(Arc::new(BoundStoppedRun));
+        let task = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Competing report",
+                "Work",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("compete-assign"),
+            )
+            .await
+            .unwrap();
+        let (_, start) = engine
+            .workflow_start_task("seat-junior", &task.task_id, "Begin", Some("compete-start"))
+            .await
+            .unwrap();
+        let (_, request, _) = engine
+            .workflow_cancel_task(
+                "seat-senior",
+                &task.task_id,
+                "Stopped",
+                json!({}),
+                Some("compete-request"),
+            )
+            .await
+            .unwrap();
+        // Inject two persisted terminal events with neither projection touched.
+        engine
+            .append_task_event(
+                &task.task_id, TaskEventKind::StatusChanged, "senior", Some("junior"),
+                Some(STATUS_CANCELLED), &request.message,
+                json!({"request_event_id":request.event_id,"start_event_id":start.event_id,"run_id":"bound-stopped-run"}),
+                Some("compete-finalize"),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_task_event(
+                &task.task_id,
+                TaskEventKind::Report,
+                "junior",
+                Some("senior"),
+                Some(STATUS_COMPLETED),
+                "Competing terminal report",
+                json!({}),
+                Some("compete-report"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .workflow_finalize_cancel_task(
+                    "seat-senior",
+                    &task.task_id,
+                    &request.event_id,
+                    &start.event_id,
+                    "bound-stopped-run",
+                    Some("compete-finalize"),
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("terminal report won")
+        );
+        assert_eq!(
+            engine
+                .workflow_task_document("seat-junior", &task.task_id)
+                .await
+                .unwrap()
+                .metadata
+                .extra["status"],
+            STATUS_ACTIVE
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_finalize_requires_exact_binding_and_replays_without_second_promotion() {
+        let engine = engine().with_run_termination_verifier(Arc::new(BoundStoppedRun));
+        let first = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "First",
+                "Work",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("verified-first"),
+            )
+            .await
+            .unwrap();
+        let second = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                "Second",
+                "Work",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("verified-second"),
+            )
+            .await
+            .unwrap();
+        let (_, started) = engine
+            .workflow_start_task(
+                "seat-junior",
+                &first.task_id,
+                "Begin",
+                Some("verified-start"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .workflow_cancel_task(
+                    "seat-outsider",
+                    &first.task_id,
+                    "Untrusted",
+                    json!({}),
+                    Some("outsider-request")
+                )
+                .await
+                .is_err()
+        );
+        let (_, requested, _) = engine
+            .workflow_cancel_task(
+                "seat-senior",
+                &first.task_id,
+                "Stop",
+                json!({}),
+                Some("verified-request"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .workflow_finalize_cancel_task(
+                    "seat-outsider",
+                    &first.task_id,
+                    &requested.event_id,
+                    &started.event_id,
+                    "bound-stopped-run",
+                    Some("outsider-finalize")
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .workflow_finalize_cancel_task(
+                    "seat-senior",
+                    &first.task_id,
+                    &requested.event_id,
+                    "forged-start",
+                    "bound-stopped-run",
+                    Some("wrong-start")
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .workflow_finalize_cancel_task(
+                    "seat-senior",
+                    &first.task_id,
+                    &requested.event_id,
+                    &started.event_id,
+                    "unverified-run",
+                    Some("wrong-run")
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            engine
+                .workflow_reconcile_task_queue("seat-senior", "junior")
+                .await
+                .unwrap()
+                .running_task_id
+                .as_deref(),
+            Some(first.task_id.as_str())
+        );
+        let (cancelled, event, next) = engine
+            .workflow_finalize_cancel_task(
+                "seat-senior",
+                &first.task_id,
+                &requested.event_id,
+                &started.event_id,
+                "bound-stopped-run",
+                Some("verified-finalize"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status, STATUS_CANCELLED);
+        assert_eq!(next.unwrap().task_id, second.task_id);
+        let (_, replay_event, no_next) = engine
+            .workflow_finalize_cancel_task(
+                "seat-senior",
+                &first.task_id,
+                &requested.event_id,
+                &started.event_id,
+                "bound-stopped-run",
+                Some("verified-finalize"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(event.event_id, replay_event.event_id);
+        assert!(no_next.is_none());
+        assert!(
+            engine
+                .workflow_report_task(
+                    "seat-junior",
+                    &first.task_id,
+                    "completed",
+                    "Late report",
+                    json!({}),
+                    Some("late-after-finalize")
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("terminal task")
+        );
+    }
+
+    #[tokio::test]
+    async fn aborted_reservations_do_not_allow_manager_terminal_wake() {
+        let engine = engine();
+        let ready = engine.workflow_assign_task(
+            "seat-senior", "junior", "Protected ready", "Work", None, None,
+            &[], &json!({}), Some("protected-ready"),
+        ).await.unwrap();
+        let queued = engine.workflow_assign_task(
+            "seat-senior", "junior", "Waiting", "Work", None, None,
+            &[], &json!({}), Some("protected-waiting"),
+        ).await.unwrap();
+        let proposed = json!({"attempt_id":"ready-a1","task_id":ready.task_id,
+            "transport_key":"ready-wake","profile":"junior","queue_ready_event_id":ready.queue_ready_event_id,
+            "assignee":"junior","payload_sha256":"f".repeat(64),
+            "issued_at":1,"expires_at":2,"attempt_no":0});
+        let reservation = engine.store().reserve_task_attempt(&ready.task_id, "ready-wake", &proposed).await.unwrap();
+        let mut receipt = reservation.clone();
+        receipt["run_id"] = Value::Null;
+        receipt["status"] = Value::from("aborted");
+        receipt["active"] = Value::from(false);
+        receipt["aborted"] = Value::from(true);
+        receipt["abort_receipt"] = Value::from("ready-proof");
+        engine.store().abort_task_attempt("ready-a1", &reservation, &receipt).await.unwrap();
+        assert!(!engine.store().has_task_attempt(&ready.task_id).await.unwrap());
+        assert!(engine.workflow_cancel_task(
+            "seat-manager", &ready.task_id, "Release", json!({}), Some("protected-ready-cancel"),
+        ).await.unwrap_err().to_string().contains("protected attempt cancellation unavailable"));
+        let queue = engine.workflow_reconcile_task_queue("seat-manager", "junior").await.unwrap();
+        assert_eq!(queue.ready_task_id.as_deref(), Some(ready.task_id.as_str()));
+        assert!(queue.entries.iter().any(|entry| entry.task.task_id == queued.task_id
+            && entry.task.queue_state.as_deref() == Some(QUEUE_STATE_QUEUED)));
+        assert!(!engine.workflow_task_events("seat-manager", &ready.task_id, 100).await.unwrap()
+            .iter().any(|event| event.status.as_deref() == Some(STATUS_CANCELLED)));
+    }
+
+    #[tokio::test]
+    async fn aborted_reservations_do_not_enable_single_run_finalization() {
+        // This test verifier deliberately trusts one run. It must never be called
+        // for protected tasks, even if every known reservation was aborted.
+        let engine = engine().with_run_termination_verifier(Arc::new(BoundStoppedRun));
+        let running = engine.workflow_assign_task(
+            "seat-senior", "junior", "Protected running", "Work", None, None,
+            &[], &json!({}), Some("protected-running"),
+        ).await.unwrap();
+        let queued = engine.workflow_assign_task(
+            "seat-senior", "junior", "Protected next", "Work", None, None,
+            &[], &json!({}), Some("protected-next"),
+        ).await.unwrap();
+        let (_, start) = engine.workflow_start_task(
+            "seat-junior", &running.task_id, "Begin", Some("protected-start"),
+        ).await.unwrap();
+        let (_, request, next) = engine.workflow_cancel_task(
+            "seat-manager", &running.task_id, "Stop", json!({}), Some("protected-request"),
+        ).await.unwrap();
+        assert!(next.is_none());
+        let proposed = json!({"attempt_id":"protected-a1","task_id":running.task_id,
+            "transport_key":"wake-a1","profile":"junior","queue_ready_event_id":"ready-1",
+            "assignee":"junior","payload_sha256":"f".repeat(64),
+            "issued_at":1,"expires_at":2,"attempt_no":0});
+        let first = engine.store().reserve_task_attempt(&running.task_id, "wake-a1", &proposed).await.unwrap();
+        let mut another = proposed.clone();
+        another["attempt_id"] = Value::from("protected-a2");
+        let second = engine.store().reserve_task_attempt(&running.task_id, "wake-a2", &another).await.unwrap();
+        for reservation in [&first, &second] {
+            let mut receipt = reservation.clone();
+            receipt["run_id"] = Value::Null;
+            receipt["status"] = Value::from("aborted");
+            receipt["active"] = Value::from(false);
+            receipt["aborted"] = Value::from(true);
+            receipt["abort_receipt"] = Value::from(format!("proof-{}", reservation["attempt_id"].as_str().unwrap()));
+            engine.store().abort_task_attempt(reservation["attempt_id"].as_str().unwrap(), reservation, &receipt).await.unwrap();
+        }
+        assert!(!engine.store().has_task_attempt(&running.task_id).await.unwrap());
+        assert_eq!(engine.store().list_task_attempts(&running.task_id).await.unwrap().len(), 2);
+        let cancel_error = engine.workflow_cancel_task(
+            "seat-manager", &running.task_id, "Stop again", json!({}), Some("protected-cancel"),
+        ).await.unwrap_err();
+        assert!(cancel_error.to_string().contains("protected attempt cancellation unavailable"));
+        let error = engine.workflow_finalize_cancel_task(
+            "seat-manager", &running.task_id, &request.event_id, &start.event_id,
+            "bound-stopped-run", Some("protected-finalize"),
+        ).await.unwrap_err();
+        assert!(error.to_string().contains("protected attempt finalization unavailable"));
+        let state = engine.workflow_get_task("seat-manager", &running.task_id).await.unwrap();
+        assert_eq!(state.status, STATUS_ACTIVE);
+        assert_eq!(state.queue_state.as_deref(), Some(QUEUE_STATE_RUNNING));
+        assert!(!engine.workflow_task_events("seat-manager", &running.task_id, 100).await.unwrap()
+            .iter().any(|event| event.status.as_deref() == Some(STATUS_CANCELLED)));
+        let queue = engine.workflow_reconcile_task_queue("seat-manager", "junior").await.unwrap();
+        assert_eq!(queue.running_task_id.as_deref(), Some(running.task_id.as_str()));
+        assert!(queue.ready_task_id.is_none());
+        assert!(queue.entries.iter().any(|entry| entry.task.task_id == queued.task_id
+            && entry.task.queue_state.as_deref() == Some(QUEUE_STATE_QUEUED)));
+    }
+
     #[tokio::test]
     async fn cancellation_cannot_release_a_running_executor_lane() {
         let engine = engine();
@@ -4728,23 +5633,62 @@ mod tests {
                 .contains("only the assignee can report")
         );
 
-        for actor in ["seat-senior", "seat-junior", "seat-manager"] {
-            let error = engine
+        let (requested, request, next) = engine
+            .workflow_cancel_task(
+                "seat-senior",
+                &running.task_id,
+                "Do not release a live process",
+                json!({}),
+                Some("cancel-running-seat-senior"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(requested.status, STATUS_ACTIVE);
+        assert_eq!(requested.queue_state.as_deref(), Some(QUEUE_STATE_RUNNING));
+        assert_eq!(request.kind, TaskEventKind::CancellationRequested);
+        assert!(next.is_none());
+        let (replayed, same_event, replay_next) = engine
+            .workflow_cancel_task(
+                "seat-senior",
+                &running.task_id,
+                "Do not release a live process",
+                json!({}),
+                Some("cancel-running-seat-senior"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed.status, STATUS_ACTIVE);
+        assert_eq!(request.event_id, same_event.event_id);
+        assert!(replay_next.is_none());
+        assert!(
+            engine
                 .workflow_cancel_task(
-                    actor,
+                    "seat-manager",
                     &running.task_id,
-                    "Do not release a live process",
+                    "different request",
                     json!({}),
-                    Some(&format!("cancel-running-{actor}")),
+                    Some("cancel-running-manager")
                 )
                 .await
-                .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("running task cannot be cancelled")
-            );
-        }
+                .unwrap_err()
+                .to_string()
+                .contains("already has a cancellation request")
+        );
+        assert!(
+            engine
+                .workflow_finalize_cancel_task(
+                    "seat-senior",
+                    &running.task_id,
+                    &request.event_id,
+                    request.metadata["start_event_id"].as_str().unwrap(),
+                    "forged-run",
+                    Some("finalize-no-verifier")
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no trusted Hermes run verifier")
+        );
 
         let queue = engine
             .workflow_reconcile_task_queue("seat-senior", "junior")
@@ -4774,6 +5718,52 @@ mod tests {
                 .unwrap()
                 .task_id,
             running.task_id
+        );
+        // External transport stop is an operator prerequisite; the same role
+        // reports on the existing IN_WORK task, without another start_task.
+        let (terminal, _, promoted) = engine
+            .workflow_report_task(
+                "seat-junior",
+                &running.task_id,
+                "blocked",
+                "Stopped by operator",
+                json!({}),
+                Some("recovery-report"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.status, STATUS_BLOCKED);
+        assert_eq!(promoted.unwrap().task_id, queued.task_id);
+        assert!(
+            engine
+                .workflow_finalize_cancel_task(
+                    "seat-senior",
+                    &running.task_id,
+                    &request.event_id,
+                    request.metadata["start_event_id"].as_str().unwrap(),
+                    "forged-run",
+                    Some("finalize-after-report")
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("terminal report won")
+        );
+        assert_eq!(
+            engine
+                .workflow_report_task(
+                    "seat-junior",
+                    &running.task_id,
+                    "blocked",
+                    "Stopped by operator",
+                    json!({}),
+                    Some("recovery-report")
+                )
+                .await
+                .unwrap()
+                .0
+                .status,
+            STATUS_BLOCKED
         );
     }
 
