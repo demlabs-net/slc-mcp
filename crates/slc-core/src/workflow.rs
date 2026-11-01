@@ -3039,7 +3039,18 @@ impl SlcEngine {
                 superseded: true,
             });
         }
-        let finalize_key = format!("operator-stop-finalize-v1:{task_id}:{claim_id}");
+        // The task id plus the controller claim id can exceed the 200-char
+        // idempotency limit; finalize would then fail with HTTP 500 and the
+        // operator-stop controller would stop the executor on every tick.
+        let finalize_raw = format!("operator-stop-finalize-v1:{task_id}:{claim_id}");
+        let finalize_key = if finalize_raw.len() <= 200 {
+            finalize_raw
+        } else {
+            format!(
+                "operator-stop-finalize-v1:{}",
+                &crate::model::content_hash(&finalize_raw)[..32]
+            )
+        };
         let event = self
             .append_task_event(
                 &task_id,
@@ -3099,10 +3110,22 @@ impl SlcEngine {
         milestone: &str,
         message: &str,
     ) -> SlcResult<()> {
-        let key = format!(
+        let raw_key = format!(
             "operator-stop-note-v1:{}:{}:{milestone}",
             request.task_id, request.request_event_id
         );
+        // Task ids and event ids together can exceed the 200-char idempotency
+        // limit; the finalize call then fails with HTTP 500 and the operator
+        // stop controller keeps stopping the executor on every tick. Keep the
+        // readable prefix and disambiguate the overflow with a content digest.
+        let key = if raw_key.len() <= 200 {
+            raw_key
+        } else {
+            format!(
+                "operator-stop-note-v1:{}",
+                &crate::model::content_hash(&raw_key)[..32]
+            )
+        };
         let event = self
             .append_task_event(
                 &request.task_id,
@@ -6631,6 +6654,58 @@ mod tests {
 
     /// Full operator stop: request -> claim -> (executor stopped) -> finalize.
     /// The lane is released only by the finalize, which promotes the next head.
+    #[tokio::test]
+    async fn operator_stop_finalize_survives_a_task_id_longer_than_the_key_limit() {
+        // Regression: the stop-note idempotency key embeds task_id + event id.
+        // For long task ids it used to exceed the 200-char limit, the finalize
+        // call failed with HTTP 500, and the operator-stop controller kept
+        // stopping the executor on every tick.
+        let engine = engine();
+        let long_name = format!("long {} task", "x".repeat(90));
+        let task = engine
+            .workflow_assign_task(
+                "seat-senior",
+                "junior",
+                &long_name,
+                "live",
+                None,
+                None,
+                &[],
+                &json!({}),
+                Some("stop-long-head"),
+            )
+            .await
+            .unwrap();
+        assert!(task.task_id.len() > 90);
+        engine
+            .workflow_start_task("seat-junior", &task.task_id, "go", Some("stop-long-start"))
+            .await
+            .unwrap();
+        engine
+            .workflow_cancel_task_with_outcome(
+                "seat-manager",
+                &task.task_id,
+                "stuck",
+                json!({}),
+                Some("stop-long-cancel"),
+            )
+            .await
+            .unwrap();
+        let claim = engine
+            .workflow_claim_task_stop(
+                &task.task_id,
+                &format!("roy1-stop-sales-swarm-1:task_event_{}", "a".repeat(64)),
+            )
+            .await
+            .unwrap();
+        let claim_id = claim.claim_id.as_deref().unwrap_or("");
+        assert!(format!("operator-stop-finalize-v1:{}:{}", task.task_id, claim_id).len() > 200);
+        engine
+            .workflow_finalize_task_stop(&task.task_id, claim_id, json!({"stopped": true}))
+            .await
+            .expect("finalize must succeed for long task ids");
+    }
+
     #[tokio::test]
     async fn operator_stop_releases_the_lane_only_after_finalize() {
         let engine = engine();
