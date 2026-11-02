@@ -49,7 +49,11 @@ const FLUSH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const GIT_MAINTENANCE_CHECK_INTERVAL: u64 = 16;
 const GIT_MAINTENANCE_LOOSE_OBJECT_LIMIT: u64 = 1024;
 const GIT_MAINTENANCE_LOOSE_KIB_LIMIT: u64 = 128 * 1024;
-const DERIVED_SIDECAR_IGNORE_BLOCK: &str = "# SLC derived caches (rebuilt locally; do not version)\n/.slc/index.json\n/.slc/embeddings.json\n";
+/// `records.json` is the runtime record store (paginated responses, task-event
+/// idempotency): it is rewritten on almost every write, so versioning it made
+/// each commit add a multi-megabyte blob and filled the vault's disk. It stays
+/// on disk and is loaded at startup, it is just not versioned.
+const DERIVED_SIDECAR_IGNORE_BLOCK: &str = "# SLC derived caches (rebuilt locally; do not version)\n/.slc/index.json\n/.slc/embeddings.json\n/.slc/records.json\n";
 static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static GIT_COMMITS_SINCE_START: AtomicU64 = AtomicU64::new(0);
 /// Emit the "no remote" explanation at most once per process. Without this the
@@ -168,8 +172,9 @@ fn parse_git_count_objects(output: &str) -> Option<(u64, u64)> {
 }
 
 /// Keep rebuildable sidecars out of vault history. `index.json` is rebuilt
-/// from Markdown on every open and embeddings are a local search cache; the
-/// authoritative timers and workflow records remain versioned.
+/// from Markdown on every open, embeddings are a local search cache, and
+/// `records.json` is the runtime record store that is rewritten on nearly every
+/// write; all three stay on disk, but none of them belongs in Git history.
 fn ensure_derived_sidecars_ignored(root: &Path) -> std::io::Result<()> {
     let path = root.join(".gitignore");
     let existing = match std::fs::read_to_string(&path) {
@@ -177,7 +182,11 @@ fn ensure_derived_sidecars_ignored(root: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error),
     };
-    let required = ["/.slc/index.json", "/.slc/embeddings.json"];
+    let required = [
+        "/.slc/index.json",
+        "/.slc/embeddings.json",
+        "/.slc/records.json",
+    ];
     if required
         .iter()
         .all(|entry| existing.lines().any(|line| line.trim() == *entry))
@@ -308,6 +317,7 @@ fn run_vault_git_commit(root: &Path, author: &str) -> VaultPush {
         "--",
         ".slc/index.json",
         ".slc/embeddings.json",
+        ".slc/records.json",
     ]) {
         Ok(out) if out.status.success() => {}
         Ok(out) => failed(&out),
@@ -2698,6 +2708,9 @@ mod tests {
         assert!(ignored.lines().any(|line| line == "core"));
         assert_eq!(ignored.matches("/.slc/index.json").count(), 1);
         assert_eq!(ignored.matches("/.slc/embeddings.json").count(), 1);
+        // records.json is rewritten on nearly every write; versioning it grew
+        // vault history by gigabytes per day until the disk filled.
+        assert_eq!(ignored.matches("/.slc/records.json").count(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 
