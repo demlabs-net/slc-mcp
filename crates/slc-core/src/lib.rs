@@ -202,6 +202,11 @@ pub struct SlcConfig {
     /// `SLC_SEAT_MANAGE_ACL` (`manager=developer|designer,root=*`).
     /// An operator without an ACL entry remains restricted to its own seat.
     pub seat_manage_acl: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Read-only cross-seat visibility.  From env `SLC_SEAT_READ_ACL`
+    /// (`writer=*,critic=*`, same syntax as the manage ACL).  Grants reads of
+    /// other seats' documents WITHOUT write/task authority — the least-privilege
+    /// way to let pipeline roles read each other's artifacts.
+    pub seat_read_acl: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Stable workflow principal → SLC seat mapping. Workflow records never
     /// contain Swarm MCP endpoint names or transport-specific identities.
     pub principal_seats: std::collections::HashMap<String, String>,
@@ -284,6 +289,7 @@ impl Default for SlcConfig {
                 .unwrap_or(true),
             seat_roles: roles::parse_roles_env(),
             seat_manage_acl: roles::parse_manage_acl_env(),
+            seat_read_acl: roles::parse_read_acl_env(),
             principal_seats: roles::parse_principal_seats_env(),
             principal_policy_documents: roles::parse_principal_policy_documents_env(),
             task_assign_acl: roles::parse_task_assign_acl_env(),
@@ -1212,11 +1218,20 @@ impl SlcEngine {
     /// Whether a seat can read/edit a document: its own/public
     /// (is_kb_visible) or an operator (managing other seats' context).
     pub fn can_read_document(&self, seat_id: &str, doc: &Document) -> bool {
-        doc.is_kb_visible(seat_id)
-            || doc
-                .seat_id
-                .as_deref()
-                .is_some_and(|owner| self.can_manage_target(seat_id, owner))
+        if doc.is_kb_visible(seat_id) {
+            return true;
+        }
+        let Some(owner) = doc.seat_id.as_deref() else {
+            return false;
+        };
+        if self.can_manage_target(seat_id, owner) {
+            return true;
+        }
+        // Read-only ACL: explicit visibility without write/task authority.
+        self.config
+            .seat_read_acl
+            .get(seat_id)
+            .is_some_and(|targets| targets.contains(owner) || targets.contains("*"))
     }
 
     /// Whether a seat may mutate or delete an existing knowledge document.

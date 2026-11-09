@@ -91,6 +91,16 @@ pub fn parse_manage_acl(raw: &str) -> HashMap<String, HashSet<String>> {
     map
 }
 
+/// Parse `SLC_SEAT_READ_ACL` — read-only cross-seat visibility
+/// (`writer=*,critic=*`). Same syntax as the manage ACL but grants ONLY reads:
+/// it never enables writes, task management or activation.
+pub fn parse_read_acl_env() -> HashMap<String, HashSet<String>> {
+    std::env::var("SLC_SEAT_READ_ACL")
+        .ok()
+        .map(|raw| parse_manage_acl(&raw))
+        .unwrap_or_default()
+}
+
 /// Read [`parse_manage_acl`] input from `SLC_SEAT_MANAGE_ACL`.
 pub fn parse_manage_acl_env() -> HashMap<String, HashSet<String>> {
     std::env::var("SLC_SEAT_MANAGE_ACL")
