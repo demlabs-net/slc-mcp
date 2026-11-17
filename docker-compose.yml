@@ -23,3 +23,7 @@ services:
       - "${SLC_VAULT_HOST_PATH:?run deploy.sh (sets SLC_VAULT_HOST_PATH)}:/data/vault"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+      # LM Studio живёт на atlant-llm0 (AWG-адрес 10.0.44.6, слушает 0.0.0.0:1234).
+      # В docker-DNS имени нет, без записи LMSTUDIO_URL=http://atlant-llm0:1234 из
+      # контейнера не резолвится (NXDOMAIN) и эмбеддинги SLC молча деградируют.
+      - "atlant-llm0:10.0.44.6"
