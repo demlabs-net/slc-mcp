@@ -40,7 +40,9 @@ pub mod workflow;
 pub use auth::{AuthMode, Principal, auth_mode_from_env, authenticate};
 pub use error::{SlcError, SlcResult};
 pub use focus::{FocusItem, FocusManager};
-pub use llm::{LlmClient, LmStudioClient, McpSamplingLlm, MockLlm, OllamaClient};
+pub use llm::{
+    LlmClient, LmStudioClient, McpSamplingLlm, MockLlm, OllamaClient, SamplingWithEmbeddings,
+};
 pub use memory::{CompressionReport, ConsolidationReport, HistoryCompressor, MemoryConsolidator};
 pub use model::*;
 pub use notifications::NotificationQueue;
@@ -489,7 +491,7 @@ impl SlcEngine {
     /// 3. Nothing configured → onboard: GPU + downloaded model → candle
     ///    embeddings (bge-m3); otherwise → CPU-hash embeddings. The model is
     ///    NEVER auto-downloaded — `slc-mcp init` prepares it.
-    fn pick_llm() -> std::sync::Arc<dyn LlmClient> {
+    pub fn pick_llm() -> std::sync::Arc<dyn LlmClient> {
         match std::env::var("SLC_LLM").as_deref() {
             Ok("hash") => return std::sync::Arc::new(llm::CpuHashLlm),
             Ok("ollama") => return std::sync::Arc::new(OllamaClient::from_env()),

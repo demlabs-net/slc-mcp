@@ -2,7 +2,9 @@
 //!
 //! Production can use [`McpSamplingLlm`] for seat-scoped reasoning through the
 //! already connected MCP client's model. It needs no dedicated model server;
-//! embeddings are unavailable in this mode and search falls back to BM25.
+//! on its own it cannot embed (search falls back to BM25) — for RAG + sampling
+//! together use [`SamplingWithEmbeddings`] (reason via sampling, embeddings
+//! via a server-side provider).
 //! Standalone deployments can instead select LM Studio, Ollama, Candle, or the
 //! deterministic CPU-hash provider.
 //!
@@ -490,6 +492,39 @@ impl LlmClient for McpSamplingLlm {
     }
 }
 
+/// Hybrid inference: `reason`/`reason_for` go through MCP sampling (the
+/// connected client's own model), while embeddings stay on a server-side
+/// provider (LM Studio / Ollama / candle / CPU-hash). This keeps RAG —
+/// semantic/hybrid search — working even when sampling is the inference
+/// path, instead of degrading the whole engine to BM25-only.
+pub struct SamplingWithEmbeddings {
+    pub sampler: std::sync::Arc<McpSamplingLlm>,
+    pub embedder: std::sync::Arc<dyn LlmClient>,
+}
+
+#[async_trait]
+impl LlmClient for SamplingWithEmbeddings {
+    async fn reason(&self, prompt: &str) -> SlcResult<String> {
+        self.sampler.reason(prompt).await
+    }
+    async fn reason_for(&self, seat: &str, prompt: &str) -> SlcResult<String> {
+        self.sampler.reason_for(seat, prompt).await
+    }
+    async fn generate_embedding(&self, text: &str) -> SlcResult<Vec<f32>> {
+        self.embedder.generate_embedding(text).await
+    }
+    async fn generate_embedding_kind(
+        &self,
+        text: &str,
+        kind: EmbeddingKind,
+    ) -> SlcResult<Vec<f32>> {
+        self.embedder.generate_embedding_kind(text, kind).await
+    }
+    fn embedding_model_name(&self) -> String {
+        self.embedder.embedding_model_name()
+    }
+}
+
 /// Deterministic lexical embedding: char n-grams (2..=4) hashed into a
 /// 512-dim vector, L2-normalized. Shared by the CPU-hash fallback
 /// (`CpuHashLlm`) and the test mock (`MockLlm`) — the mock must be
@@ -641,6 +676,34 @@ mod tests {
         // The entry from the timed-out path must be gone (guard dropped it).
         // The spawned task above removed it on delivery, so the map is empty.
         assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hybrid_reason_uses_sampling_embeddings_use_provider() {
+        // Sampling answers reason_for; embeddings come from the wrapped provider.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let sampler = std::sync::Arc::new(McpSamplingLlm::new(tx, pending.clone()));
+        let hybrid = SamplingWithEmbeddings {
+            sampler,
+            embedder: std::sync::Arc::new(CpuHashLlm),
+        };
+        let pending2 = pending.clone();
+        tokio::spawn(async move {
+            let msg = rx.recv().await.unwrap();
+            let rid = msg["request_id"].as_str().unwrap().to_string();
+            let tx = pending2.lock().unwrap().remove(&rid).unwrap();
+            tx.send("ответ через sampling".into()).await.unwrap();
+        });
+        assert_eq!(
+            hybrid.reason_for("dev", "текст").await.unwrap(),
+            "ответ через sampling"
+        );
+        // Embedding path never touches the sampling channel.
+        let emb = hybrid.generate_embedding("кофе чёрный").await.unwrap();
+        let plain = CpuHashLlm.generate_embedding("кофе чёрный").await.unwrap();
+        assert_eq!(emb, plain);
+        assert_eq!(hybrid.embedding_model_name(), "cpu-hash");
     }
 
     #[tokio::test]

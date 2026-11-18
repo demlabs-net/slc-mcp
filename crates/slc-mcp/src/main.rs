@@ -182,13 +182,18 @@ async fn main() -> anyhow::Result<()> {
             let auth_state = auth::AuthState::from_env(&config.path);
             auth_state.store.load().context("auth store load")?;
             if config.mcp_sampling {
-                // Inference through the MCP client (sampling) — no local
-                // GPU/LLM needed; embeddings degrade to text-only search.
+                // Reasoning through the MCP client (sampling); embeddings stay
+                // on the configured provider (SLC_LLM/LMSTUDIO_URL/OLLAMA, else
+                // onboard candle, else CPU-hash) — RAG keeps working alongside
+                // sampling instead of degrading to BM25-only search.
                 let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
                 let pending =
                     std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-                let llm: std::sync::Arc<dyn slc_core::LlmClient> =
+                let sampler =
                     std::sync::Arc::new(slc_core::McpSamplingLlm::new(out_tx, pending.clone()));
+                let embedder = SlcEngine::pick_llm();
+                let llm: std::sync::Arc<dyn slc_core::LlmClient> =
+                    std::sync::Arc::new(slc_core::SamplingWithEmbeddings { sampler, embedder });
                 let engine = SlcEngine::open_async_with_llm(config, llm).await?;
                 server::run(engine, port, dist.into(), auth_state, Some(out_rx), pending).await
             } else {
