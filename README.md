@@ -106,7 +106,7 @@ Copy `.env.example` to `.env`. Key variables:
 |---|---|---|
 | `SLC_VAULT_PATH` | `~/.slc/vault` | Obsidian vault (or SQLite file) location |
 | `SLC_LLM` | — | Provider: `lmstudio`, `ollama`, `candle`, `hash` |
-| `SLC_MCP_SAMPLING` | `false` | Delegate reasoning to the connected MCP client (`sampling/createMessage`); no generative endpoint needed. `SLC_LLM=hash` is then the fail-closed fallback for CLI paths |
+| `SLC_MCP_SAMPLING` | `true` | Delegate reasoning to the connected MCP client (`sampling/createMessage`); no generative endpoint needed. Embeddings still come from the configured provider (`SLC_LLM`/`LMSTUDIO_URL`/…), so RAG works alongside sampling. Set `false` for deployments without a sampling-capable client |
 | `LMSTUDIO_URL` / `LMSTUDIO_MODEL` / `LMSTUDIO_EMBED_MODEL` | — | OpenAI-compatible LM Studio endpoint and models |
 | `OLLAMA_ENDPOINT` / `OLLAMA_REASONING_MODEL` / `OLLAMA_EMBEDDING_MODEL` | — | Ollama fallback |
 | `SLC_AI_ORGANIZE` | `true` | Ask the reasoning LLM where a new document belongs (project folder) |
@@ -273,10 +273,13 @@ Auth is per-request: the client sends its seat in the `X-Seat-ID` header
 (`SLC_MCP_AUTH=legacy_seat_id`, the default). In `bearer_plus_seat` mode a
 bearer token is required as well.
 
-With `SLC_MCP_SAMPLING=true`, reasoning requests (compression,
-consolidation, AI id naming) are returned to the authenticated seat's
-connected MCP client as `sampling/createMessage` — SLC then needs no
-dedicated generative endpoint; embeddings degrade to BM25 text search.
+With `SLC_MCP_SAMPLING=true` (the default), reasoning requests
+(compression, consolidation, AI id naming) are returned to the
+authenticated seat's connected MCP client as `sampling/createMessage` —
+SLC then needs no dedicated generative endpoint. Embedding requests are
+still answered by the configured provider (`SLC_LLM`, `LMSTUDIO_URL`,
+Ollama, onboard candle, else CPU-hash fallback), so semantic search keeps
+working alongside sampling.
 
 ### Tool groups
 

@@ -170,7 +170,7 @@ AI auto-determines folder (`SLC_AI_ORGANIZE=true`):
 | `LMSTUDIO_URL` | — | LM Studio URL |
 | `LMSTUDIO_MODEL` | `google/gemma-4-e4b` | Reasoning model |
 | `LMSTUDIO_EMBED_MODEL` | `text-embedding-nomic-embed-text-v1.5` | Embedding model |
-| `SLC_MCP_SAMPLING` | `false` | Use the authenticated seat's MCP client for reasoning; no dedicated generative endpoint |
+| `SLC_MCP_SAMPLING` | `true` | Use the authenticated seat's MCP client for reasoning; no dedicated generative endpoint. Embeddings still use the configured provider, so RAG works alongside sampling; set `false` to disable |
 | `SLC_AI_ORGANIZE` | `true` | AI folder determination on add_document |
 | `SLC_SEAT_TTL_SECONDS` | `86400` | Seat TTL (0 = never expire) |
 | `SLC_SEARCH_MIN_SCORE` | `0.20` | Minimum search score |

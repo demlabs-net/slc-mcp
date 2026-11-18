@@ -285,7 +285,13 @@ impl Default for SlcConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100_000),
             mongodb_uri: std::env::var("SLC_MONGODB_URI").ok(),
-            mcp_sampling: std::env::var("SLC_MCP_SAMPLING").is_ok_and(|v| v == "true" || v == "1"),
+            // On by default: an MCP-connected seat is the normal deployment mode,
+            // and reasoning then needs no dedicated generative endpoint. Disable
+            // explicitly with SLC_MCP_SAMPLING=false (CLI/cron-only setups without
+            // a sampling-capable client).
+            mcp_sampling: std::env::var("SLC_MCP_SAMPLING")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
             ai_organize: std::env::var("SLC_AI_ORGANIZE")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
