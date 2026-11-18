@@ -428,7 +428,7 @@ impl LlmClient for McpSamplingLlm {
     /// seat-scoped calls must go through [`reason_for`](Self::reason_for).
     async fn reason(&self, prompt: &str) -> SlcResult<String> {
         let _ = prompt;
-        Err(SlcError::Storage(
+        Err(SlcError::Llm(
             "sampling requires a seat — call reason_for(seat, prompt)".into(),
         ))
     }
@@ -440,7 +440,7 @@ impl LlmClient for McpSamplingLlm {
         if seat.is_empty() {
             // An event with an empty seat would be received by nobody
             // (deny-by-default) — fail instantly instead of a 60-second wait.
-            return Err(SlcError::Storage(
+            return Err(SlcError::Llm(
                 "sampling requires a non-empty seat (X-Seat-ID)".into(),
             ));
         }
@@ -471,18 +471,18 @@ impl LlmClient for McpSamplingLlm {
         self.outbound
             .send(msg)
             .await
-            .map_err(|_| SlcError::Storage("sampling channel closed".into()))?;
+            .map_err(|_| SlcError::Llm("sampling channel closed".into()))?;
         match tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
             Ok(Some(text)) => Ok(text),
-            Ok(None) => Err(SlcError::Storage("sampling channel closed".into())),
-            Err(_) => Err(SlcError::Storage(
+            Ok(None) => Err(SlcError::Llm("sampling channel closed".into())),
+            Err(_) => Err(SlcError::Llm(
                 "sampling timed out — is the MCP client connected?".into(),
             )),
         }
     }
 
     async fn generate_embedding(&self, _text: &str) -> SlcResult<Vec<f32>> {
-        Err(SlcError::Storage(
+        Err(SlcError::Llm(
             "sampling client cannot embed — text-only search fallback".into(),
         ))
     }
@@ -563,7 +563,7 @@ pub struct CpuHashLlm;
 #[async_trait]
 impl LlmClient for CpuHashLlm {
     async fn reason(&self, _prompt: &str) -> SlcResult<String> {
-        Err(SlcError::Storage(
+        Err(SlcError::Llm(
             "no local LLM: enable SLC_MCP_SAMPLING for client inference or point SLC_LLM at Ollama/LM Studio".into(),
         ))
     }
