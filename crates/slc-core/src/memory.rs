@@ -51,16 +51,30 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
     /// consumed sources are marked `archived` + `compression_batch_id`.
     pub async fn compress(&self, seat_id: &str) -> SlcResult<CompressionReport> {
         let batch_id = crate::model::unique_id("batch");
-        let report = CompressionReport {
-            l1_to_l2: self.compress_l1_to_l2(seat_id, &batch_id).await?,
-            l2_to_l3: self.compress_l2_to_l3(seat_id, &batch_id).await?,
-            l3_to_l4: self.compress_l3_to_l4(seat_id, &batch_id).await?,
-        };
-        Ok(report)
+        let (l1_to_l2, s1) = self.compress_l1_to_l2(seat_id, &batch_id).await?;
+        let (l2_to_l3, s2) = self.compress_l2_to_l3(seat_id, &batch_id).await?;
+        let (l3_to_l4, s3) = self.compress_l3_to_l4(seat_id, &batch_id).await?;
+        let mut skipped = Vec::new();
+        for reason in [s1, s2, s3].into_iter().flatten() {
+            skipped.push(reason);
+        }
+        Ok(CompressionReport {
+            l1_to_l2,
+            l2_to_l3,
+            l3_to_l4,
+            skipped,
+        })
     }
 
     /// Yesterday's L1 events → one L2 daily summary.
-    async fn compress_l1_to_l2(&self, seat_id: &str, batch_id: &str) -> SlcResult<usize> {
+    /// Returns `(consumed, skip_reason)` — the reason is `Some` only when
+    /// there WERE candidates but the stage could not run (LLM unavailable),
+    /// so callers never confuse "nothing to do" with "failed silently".
+    async fn compress_l1_to_l2(
+        &self,
+        seat_id: &str,
+        batch_id: &str,
+    ) -> SlcResult<(usize, Option<String>)> {
         let now = Utc::now();
         let yesterday_start = now
             .with_hour(0)
@@ -85,15 +99,18 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
             .filter(|d| d.created_at >= yesterday_start && d.created_at < yesterday_end)
             .collect();
         if l1.is_empty() {
-            return Ok(0);
+            return Ok((0, None));
         }
 
         let combined = combine(&l1, PROMPT_CHARS);
         let prompt = format!(
             "Summarize this day's work log into a concise daily summary (3-5 bullet points):\n\n{combined}"
         );
-        let Ok(summary) = self.llm.reason_for(seat_id, &prompt).await else {
-            return Ok(0); // LLM unavailable — keep sources unmarked, retry next run
+        // LLM unavailable — keep sources unmarked, retry next run, but say
+        // why: a bare 0 here is indistinguishable from an empty window.
+        let summary = match self.llm.reason_for(seat_id, &prompt).await {
+            Ok(s) => s,
+            Err(e) => return Ok((0, Some(skip_reason("l1_to_l2", l1.len(), &e)))),
         };
 
         let date_str = yesterday_start.format("%Y-%m-%d").to_string();
@@ -132,11 +149,15 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
                 },
             )
             .await?;
-        Ok(l1.len())
+        Ok((l1.len(), None))
     }
 
     /// ≥7 un-archived L2 daily summaries → one L3 weekly digest.
-    async fn compress_l2_to_l3(&self, seat_id: &str, batch_id: &str) -> SlcResult<usize> {
+    async fn compress_l2_to_l3(
+        &self,
+        seat_id: &str,
+        batch_id: &str,
+    ) -> SlcResult<(usize, Option<String>)> {
         let filter = DocFilter {
             seat_id: Some(seat_id.into()),
             doc_level: Some(DocLevel::L2),
@@ -148,15 +169,16 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
             .episodic_find(&filter, &DocSort::by_created(SortDir::Asc), 100)
             .await?;
         if l2.len() < 7 {
-            return Ok(0);
+            return Ok((0, None));
         }
         let batch = &l2[..7];
         let combined = combine(batch, PROMPT_CHARS);
         let prompt = format!(
             "Summarize this week's daily summaries into a weekly digest (key achievements, decisions, blockers):\n\n{combined}"
         );
-        let Ok(summary) = self.llm.reason_for(seat_id, &prompt).await else {
-            return Ok(0);
+        let summary = match self.llm.reason_for(seat_id, &prompt).await {
+            Ok(s) => s,
+            Err(e) => return Ok((0, Some(skip_reason("l2_to_l3", batch.len(), &e)))),
         };
 
         let week_id = batch[0]
@@ -196,11 +218,15 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
                 },
             )
             .await?;
-        Ok(batch.len())
+        Ok((batch.len(), None))
     }
 
     /// ≥4 un-archived L3 weekly digests → upsert the L4 project insights doc.
-    async fn compress_l3_to_l4(&self, seat_id: &str, batch_id: &str) -> SlcResult<usize> {
+    async fn compress_l3_to_l4(
+        &self,
+        seat_id: &str,
+        batch_id: &str,
+    ) -> SlcResult<(usize, Option<String>)> {
         let filter = DocFilter {
             seat_id: Some(seat_id.into()),
             doc_level: Some(DocLevel::L3),
@@ -212,7 +238,7 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
             .episodic_find(&filter, &DocSort::by_created(SortDir::Asc), 100)
             .await?;
         if l3.len() < 4 {
-            return Ok(0);
+            return Ok((0, None));
         }
         let batch = &l3[..4];
         let combined = combine(batch, PROMPT_CHARS);
@@ -244,8 +270,9 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
                 "Distill these weekly digests into high-level project insights (key learnings, architectural patterns, team dynamics):\n\n{combined}"
             ),
         };
-        let Ok(insights) = self.llm.reason_for(seat_id, &prompt).await else {
-            return Ok(0);
+        let insights = match self.llm.reason_for(seat_id, &prompt).await {
+            Ok(s) => s,
+            Err(e) => return Ok((0, Some(skip_reason("l3_to_l4", batch.len(), &e)))),
         };
 
         let mut meta = DocMeta::default();
@@ -282,8 +309,14 @@ impl<S: StorageBackend, L: LlmClient> HistoryCompressor<S, L> {
                 },
             )
             .await?;
-        Ok(batch.len())
+        Ok((batch.len(), None))
     }
+}
+
+/// One human-readable line explaining why a stage with pending sources was
+/// skipped (almost always: no reasoning LLM reachable — see llm.rs backends).
+fn skip_reason(stage: &str, pending: usize, err: &crate::error::SlcError) -> String {
+    format!("{stage}: {pending} source(s) pending, stage skipped — {err}")
 }
 
 /// Per-run summary of what the compressor did.
@@ -292,6 +325,12 @@ pub struct CompressionReport {
     pub l1_to_l2: usize,
     pub l2_to_l3: usize,
     pub l3_to_l4: usize,
+    /// Stages that had sources but could not run (e.g. the reasoning LLM is
+    /// unreachable: no sampling client connected, provider down). The
+    /// sources stay unmarked and are retried on the next run; without this
+    /// field the caller sees a bare `0` and cannot tell it from an empty
+    /// window.
+    pub skipped: Vec<String>,
 }
 
 // ─────────────────────────────── consolidation ───────────────────────────────
@@ -332,8 +371,21 @@ impl<S: StorageBackend, L: LlmClient> MemoryConsolidator<S, L> {
             "{summaries}",
             &truncate(&combined.join("\n\n"), PROMPT_CHARS),
         );
-        let Ok(raw) = self.llm.reason_for(seat_id, &prompt).await else {
-            return Ok(ConsolidationReport::default());
+        // Same contract as the compressor: sources stay unmarked for the next
+        // cycle, but the report must not look like "nothing was pending".
+        let raw = match self.llm.reason_for(seat_id, &prompt).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(ConsolidationReport {
+                    sources: sources.len(),
+                    skipped: Some(skip_reason(
+                        "consolidation",
+                        sources.len(),
+                        &e,
+                    )),
+                    ..Default::default()
+                });
+            }
         };
 
         let facts = parse_facts(&raw);
@@ -372,6 +424,7 @@ impl<S: StorageBackend, L: LlmClient> MemoryConsolidator<S, L> {
             sources: sources.len(),
             facts_added: added,
             facts_total: facts.len(),
+            skipped: None,
         })
     }
 
@@ -447,6 +500,9 @@ pub struct ConsolidationReport {
     pub sources: usize,
     pub facts_added: usize,
     pub facts_total: usize,
+    /// Set when sources were pending but extraction could not run (reasoning
+    /// LLM unreachable); the sources stay unconsolidated and are retried.
+    pub skipped: Option<String>,
 }
 
 /// Extract the first JSON array of strings from the LLM reply (≤10 facts).
@@ -680,5 +736,72 @@ mod tests {
             "today's event must NOT be consumed: {:?}",
             today_doc.metadata
         );
+    }
+
+    /// Regression for the "phantom 0": a stage with pending sources and an
+    /// unreachable reasoning LLM must NOT report a bare 0 — the caller cannot
+    /// tell that apart from an empty window. `CpuHashLlm.reason()` fails by
+    /// design (no inference on this machine), which is exactly that case.
+    #[tokio::test]
+    async fn llm_unavailable_is_reported_not_swallowed() {
+        let store = SqliteStore::in_memory().unwrap();
+        let seat = "seat_llm_down";
+        store
+            .episodic_insert(&l1_doc(seat, 1, "yesterday work"))
+            .await
+            .unwrap();
+
+        let compressor = HistoryCompressor::new(store.clone(), crate::llm::CpuHashLlm);
+        let report = compressor.compress(seat).await.unwrap();
+        assert_eq!(report.l1_to_l2, 0, "no L2 could be produced");
+        assert_eq!(report.skipped.len(), 1, "the skip reason must be reported");
+        assert!(report.skipped[0].contains("l1_to_l2"));
+        assert!(report.skipped[0].contains("1 source(s) pending"));
+
+        // A skipped stage leaves its sources unmarked — the next run retries.
+        let remaining = store
+            .episodic_count(&DocFilter {
+                seat_id: Some(seat.into()),
+                has_compression_batch: Some(false),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1, "failed stage must not consume sources");
+
+        // An empty window is honest silence: counts 0 and NO skip reasons.
+        let quiet = compressor.compress("seat_nobody").await.unwrap();
+        assert_eq!(quiet.l1_to_l2, 0);
+        assert!(quiet.skipped.is_empty());
+    }
+
+    /// Same contract for consolidation: pending sources + dead LLM must be
+    /// visible in the report, and the sources stay unconsolidated.
+    #[tokio::test]
+    async fn consolidation_llm_unavailable_is_reported() {
+        let store = SqliteStore::in_memory().unwrap();
+        let seat = "seat_cons_down";
+        let mut m = DocMeta::default();
+        m.doc_level = Some(DocLevel::L2);
+        m.seat_id = Some(seat.into());
+        store
+            .episodic_insert(&Document::new(
+                "src-1",
+                DocumentCategory::History,
+                "the team ships on Fridays",
+                m,
+                vec![],
+                Some(seat.into()),
+            ))
+            .await
+            .unwrap();
+
+        let consolidator = MemoryConsolidator::new(store.clone(), crate::llm::CpuHashLlm);
+        let report = consolidator.consolidate(seat).await.unwrap();
+        assert_eq!(report.sources, 1, "the pending source must be counted");
+        assert_eq!(report.facts_added, 0);
+        let reason = report.skipped.expect("skip reason must be reported");
+        assert!(reason.contains("consolidation"));
+        assert!(reason.contains("1 source(s) pending"));
     }
 }

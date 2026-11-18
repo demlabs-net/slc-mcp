@@ -10,7 +10,10 @@
 //!   history/YYYY/MM/<document_id>.md   ← episodic (diary layout by date)
 //!   seats/<seat_id>.json          ← seats (operational data)
 //!   .slc/
-//!     index.json                  ← fast document index (id → path + filter fields)
+//!     index.json                  ← write-only snapshot of the live index for
+//!                                     inspection; never read back — the live
+//!                                     index is rebuilt from file frontmatter
+//!                                     on open() and every refresh()
 //!     embeddings.json             ← embedding chunks
 //!     timers.json                 ← persisted timers
 //!     records.json                ← free-form JSON records
@@ -913,6 +916,10 @@ impl ObsidianVaultStore {
         Ok(())
     }
 
+    /// Dump the live in-memory index for inspection/debugging. Nothing reads
+    /// this file back: `open()`/`refresh()` rebuild the index from markdown
+    /// frontmatter, so hand-edits to the files are picked up without touching
+    /// the sidecar (and hand-edits to the sidecar alone have no effect).
     fn persist_index(&self) -> SlcResult<()> {
         let map = self.index.lock().unwrap();
         let text = serde_json::to_string_pretty(&*map)?;

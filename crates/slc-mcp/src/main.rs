@@ -295,6 +295,9 @@ async fn main() -> anyhow::Result<()> {
                 "L1→L2: {}, L2→L3: {}, L3→L4: {}",
                 r.l1_to_l2, r.l2_to_l3, r.l3_to_l4
             );
+            for reason in &r.skipped {
+                println!("  ! {reason}");
+            }
             Ok(())
         }
         Cmd::Consolidate { seat_id } => {
@@ -304,6 +307,9 @@ async fn main() -> anyhow::Result<()> {
                 "sources: {}, facts added: {} (total extracted: {})",
                 r.sources, r.facts_added, r.facts_total
             );
+            if let Some(reason) = &r.skipped {
+                println!("  ! {reason}");
+            }
             Ok(())
         }
         Cmd::Search { query, seat, limit } => {

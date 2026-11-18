@@ -1695,6 +1695,11 @@ impl SlcEngine {
                         report.l2_to_l3,
                         report.l3_to_l4
                     );
+                    // A skipped stage is not "nothing to do" — log loudly so
+                    // the operator notices a dead/unreachable reasoning path.
+                    for reason in &report.skipped {
+                        tracing::warn!("history compression [{seat}]: {reason}");
+                    }
                     Ok(())
                 })
             })),
@@ -1708,6 +1713,9 @@ impl SlcEngine {
                 Box::pin(async move {
                     let report = consolidator.consolidate(&seat).await?;
                     tracing::info!("consolidation [{seat}]: +{} facts", report.facts_added);
+                    if let Some(reason) = &report.skipped {
+                        tracing::warn!("consolidation [{seat}]: {reason}");
+                    }
                     Ok(())
                 })
             })),

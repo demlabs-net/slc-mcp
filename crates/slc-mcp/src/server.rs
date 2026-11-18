@@ -3215,11 +3215,13 @@ async fn call_tool(
         },
         "compress_now" => {
             let r = engine.compress(seat_id).await.map_err(json_err)?;
-            json!({"l1_to_l2": r.l1_to_l2, "l2_to_l3": r.l2_to_l3, "l3_to_l4": r.l3_to_l4})
+            json!({"l1_to_l2": r.l1_to_l2, "l2_to_l3": r.l2_to_l3, "l3_to_l4": r.l3_to_l4,
+                   "skipped": r.skipped})
         }
         "consolidate_now" => {
             let r = engine.consolidate(seat_id).await.map_err(json_err)?;
-            json!({"sources": r.sources, "facts_added": r.facts_added})
+            json!({"sources": r.sources, "facts_added": r.facts_added,
+                   "facts_total": r.facts_total, "skipped": r.skipped})
         }
         "focus_add" => {
             let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
