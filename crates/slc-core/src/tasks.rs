@@ -590,9 +590,59 @@ pub fn apply_description_patch(body: &str, patch: &Value) -> Result<String, Stri
     Ok(out)
 }
 
+/// True for ATX headings: optional ≤ 3 spaces of indent, then `#`…`##`…
+/// followed by whitespace or end-of-line (so `#hashtag` is not one, and a
+/// 4-space-indented line is indented code, not a heading).
+fn atx_heading_level(line: &str) -> Option<usize> {
+    let indent = line.len() - line.trim_start().len();
+    if indent >= 4 {
+        return None;
+    }
+    let t = line.trim_start();
+    let lvl = t.chars().take_while(|c| *c == '#').count();
+    if lvl > 0 && lvl <= 6 && (t.len() == lvl || t[lvl..].starts_with(char::is_whitespace)) {
+        Some(lvl)
+    } else {
+        None
+    }
+}
+
+/// A line opens a code fence when it starts (with ≤ 3 spaces of indent) with
+/// three or more matching backticks or tildes. Returns `(marker, run_len)`.
+fn fence_opens(line: &str) -> Option<(char, usize)> {
+    let indent = line.len() - line.trim_start().len();
+    if indent >= 4 {
+        return None;
+    }
+    let t = line.trim_start();
+    let c = t.chars().next()?;
+    if c != '`' && c != '~' {
+        return None;
+    }
+    let run = t.chars().take_while(|&x| x == c).count();
+    if run >= 3 { Some((c, run)) } else { None }
+}
+
+/// A line closes a fence opened by `marker`/`open_len` when it consists of
+/// at least that many matching markers and nothing but trailing blanks
+/// (a closing fence carries no info string).
+fn fence_closes(line: &str, marker: char, open_len: usize) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let run = t.chars().take_while(|&x| x == marker).count();
+    run >= open_len && t[run..].chars().all(char::is_whitespace)
+}
+
 /// Replace/remove a markdown section by heading. The section runs from the
 /// heading to the next heading of THE SAME or a higher level (or the end of
 /// the text). `keep_heading=false` removes the heading too.
+///
+/// Heading detection is code-fence aware: `#`-comment lines inside ```/~~~
+/// fences are NOT headings. Without this, a bash comment like `# балансер`
+/// inside a fenced block closed a level-1 section mid-document and
+/// `replace_section` silently swallowed everything after it.
 fn apply_section_op(
     body: &str,
     heading: &str,
@@ -600,23 +650,37 @@ fn apply_section_op(
     keep_heading: bool,
 ) -> Result<String, String> {
     let target = heading.trim();
-    let h_level = target.chars().take_while(|c| *c == '#').count();
-    if h_level == 0 || !target[h_level..].starts_with(char::is_whitespace) {
+    let Some(h_level) = atx_heading_level(target) else {
         return Err(format!("heading must be a markdown heading: `{heading}`"));
-    }
-    let heading_level = |line: &str| -> Option<usize> {
-        let t = line.trim_start();
-        let lvl = t.chars().take_while(|c| *c == '#').count();
-        if lvl > 0 && (t.len() == lvl || t[lvl..].starts_with(char::is_whitespace)) {
-            Some(lvl)
-        } else {
-            None
-        }
     };
+    let heading_level = atx_heading_level;
     let mut out = String::with_capacity(body.len());
     let mut skipping = false;
     let mut found = false;
+    // Some((marker, run_len)) while inside an open code fence.
+    let mut fence: Option<(char, usize)> = None;
     for line in body.lines() {
+        // Fence tracking runs BEFORE heading detection and regardless of
+        // `skipping`: content inside a fence is never a heading boundary,
+        // and a skipped section may itself contain the fence.
+        if let Some((marker, open_len)) = fence {
+            if fence_closes(line, marker, open_len) {
+                fence = None;
+            }
+            if !skipping {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        if let Some(opened) = fence_opens(line) {
+            fence = Some(opened);
+            if !skipping {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
         if let Some(lvl) = heading_level(line) {
             if lvl <= h_level {
                 // A heading of the same/higher level closes any section.
@@ -975,6 +1039,69 @@ mod patch_tests {
         assert!(!out2.contains("Фаза 2"));
         assert!(!out2.contains("финал"));
         assert!(out2.contains("## Фаза 1"));
+    }
+
+    /// Regression: a `# ...` bash comment inside a ``` fence is not a heading.
+    /// The naive parser stopped the section at the comment line, so replacing
+    /// a heading whose body contains a fenced block replaced only up to that
+    /// comment and left the rest of the section body orphaned after the new
+    /// content (in batch edits this also ate sibling sections and later ops
+    /// failed with "heading not found").
+    ///
+    /// Documented semantics kept: a section runs to the next heading of the
+    /// SAME or a higher level, so the `##` child below belongs to `# Заголовок`
+    /// and is legitimately replaced along with it.
+    #[test]
+    fn patch_section_ignores_hash_comments_inside_fences() {
+        let body = "# Заголовок\n\nстарая вводная\n\n```bash\n# комментарий не заголовок\nssh root@host\n```\n\n## Подраздел\n\nшаг\n";
+        let out = apply_description_patch(
+            body,
+            &json!([{"op":"replace_section","heading":"# Заголовок","content":"новая вводная"}]),
+        )
+        .unwrap();
+        // Whole section (fence included, child heading included) replaced —
+        // the fence comment did NOT stop the section mid-block.
+        assert_eq!(out, "# Заголовок\nновая вводная");
+    }
+
+    /// Exact shape: tilde fence too — and the next real level-1 heading still
+    /// closes the section exactly where markdown says it should.
+    #[test]
+    fn patch_section_fence_content_replaced_but_real_headings_close() {
+        let body = "# A\n\nintro\n\n~~~sh\n# not a heading\n~~~\n\n# B\n\nb-body\n";
+        let out = apply_description_patch(
+            body,
+            &json!([{"op":"replace_section","heading":"# A","content":"new"}]),
+        )
+        .unwrap();
+        assert_eq!(out, "# A\nnew\n# B\n\nb-body");
+    }
+
+    /// A `##` section whose body ends with a fenced block containing a
+    /// `# comment`: the fence comment must not close the section early and
+    /// orphan the tail — the following `## ` sibling closes it.
+    #[test]
+    fn patch_section_fence_comment_does_not_close_early() {
+        let body = "# Title\n\n## One\n\nintro\n```bash\n#!/bin/sh\n# comment\nping -c1 host # inline\n```\n\n## Two\n\ntail\n";
+        let out = apply_description_patch(
+            body,
+            &json!([{"op":"replace_section","heading":"## One","content":"replaced"}]),
+        )
+        .unwrap();
+        assert_eq!(out, "# Title\n\n## One\nreplaced\n## Two\n\ntail");
+    }
+
+    /// Lines that only LOOK like headings (4-space indented code, `#tag`
+    /// without space) are section content, not boundaries.
+    #[test]
+    fn patch_section_ignores_heading_lookalikes() {
+        let body = "# A\n\nintro\n\n    ## четыре пробела — код\n\n#hashtag-без-пробела\n\nконец\n";
+        let out = apply_description_patch(
+            body,
+            &json!([{"op":"replace_section","heading":"# A","content":"new"}]),
+        )
+        .unwrap();
+        assert_eq!(out, "# A\nnew");
     }
 
     #[test]
