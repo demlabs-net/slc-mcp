@@ -1,0 +1,23 @@
+name: build-deb
+# Mirrors scripts/build-deb.sh inside the pinned builder image and publishes
+# the package to the DemLabs apt repo (deb.zeus.demlabs) via the aptly API.
+on:
+  push:
+    branches: [develop, main]
+    tags: ["v*"]
+
+jobs:
+  deb:
+    runs-on: deb-build-slc
+    steps:
+      - uses: actions/checkout@v4
+      - name: test
+        run: cargo test --workspace --locked
+        env:
+          CARGO_TARGET_DIR: target
+      - name: install cargo-deb
+        run: cargo install cargo-deb --locked --version 3.7.0
+      - name: build
+        run: cargo deb --locked --package slc-mcp --output dist
+      - name: publish
+        run: bash ci/publish-deb.sh slc-mcp dist/slc-mcp_*.deb
