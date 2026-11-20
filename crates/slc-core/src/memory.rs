@@ -378,11 +378,7 @@ impl<S: StorageBackend, L: LlmClient> MemoryConsolidator<S, L> {
             Err(e) => {
                 return Ok(ConsolidationReport {
                     sources: sources.len(),
-                    skipped: Some(skip_reason(
-                        "consolidation",
-                        sources.len(),
-                        &e,
-                    )),
+                    skipped: Some(skip_reason("consolidation", sources.len(), &e)),
                     ..Default::default()
                 });
             }
