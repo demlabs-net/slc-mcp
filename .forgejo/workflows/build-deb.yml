@@ -10,7 +10,13 @@ jobs:
   deb:
     runs-on: deb-build-slc
     steps:
-      - uses: actions/checkout@v4
+      - name: checkout
+        # actions/checkout needs node, which the pinned rust image lacks
+        run: |
+          git init -q .
+          git remote add origin "http://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch -q origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
       - name: test
         run: cargo test --workspace --locked
         env:
