@@ -13,19 +13,19 @@ command -v dpkg-deb >/dev/null || { echo "dpkg-deb missing" >&2; exit 1; }
 ver=$(dpkg-deb -f "$file" Version)
 
 # drop same name+version if re-publishing
-old=$(curl -sf "$aptly/api/packages/$repo" \
+old=$(curl -sf "$aptly/api/repos/$repo/packages" \
   | python3 -c '
 import sys, json
 name, ver = sys.argv[1], sys.argv[2]
-for k in json.load(sys.stdin):
-    key = k["Key"] if isinstance(k, dict) else k
+# aptly package key format: "P<arch> <name> <version> <hash>"
+for key in json.load(sys.stdin):
     parts = key.split(" ")
-    if parts[0] == name and parts[1] == ver:
+    if len(parts) >= 3 and parts[1] == name and parts[2] == ver:
         print(key)
 ' "$pkg" "$ver")
 if [ -n "${old:-}" ]; then
   enc=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$old")
-  curl -sf -X DELETE "$aptly/api/packages/$repo/$enc" >/dev/null
+  curl -sf -X DELETE "$aptly/api/repos/$repo/packages/$enc" >/dev/null
 fi
 
 key=$(curl -sf -F "file=@$file" "$aptly/api/package/upload" \
