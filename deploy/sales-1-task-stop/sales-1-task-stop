@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""sales-1-task-stop: operator stop controller for running SLC workflow tasks.
+
+SLC cannot stop a Hermes run, so `cancel_task` on a RUNNING task only records a
+durable stop request and keeps the assignee's FIFO lane reserved. This host-side
+controller executes those requests safely:
+
+  1. claim the request in SLC (fence: the old run can no longer report/start);
+     if SLC answers that the task already finished, leave the executor alone;
+  2. stop the assignee's Hermes container and verify that it is really down
+     (container not running, API port closed) -- this kills the run and every
+     process it spawned, and while the container is down no new run can start;
+  3. wait a short settle period so requests the killed run already sent (for
+     example a CRM write) finish before the lane is released;
+  4. finalize the stop in SLC: the task becomes CANCELLED, or keeps the
+     assignee's own report if it had finished first; the lane is released and
+     the next FIFO head promoted -- only after step 2 is verified;
+  5. start the container again and wait until its API answers /health;
+  6. re-read SLC's current READY head and wake it, unless it already has a run
+     in Swarm (the manager may have woken it meanwhile).
+
+Any failure before step 4 leaves the lane reserved (fail closed). A marker
+written before the container is stopped guarantees that a later run finishes
+the job (container started, next head woken), even after a crash. Every error
+holds only its own task; other stops and recoveries still proceed.
+
+Stopping the container also ends any other run of that role (a Telegram or
+webhook turn); this is an explicit operator action, rate limited per container.
+
+Runs as root from a systemd timer. Secrets come from the environment file
+/etc/sales-1-task-stop/env (SLC_OPERATOR_STOP_TOKEN, MANAGER_SWARM_MCP_TOKEN).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+STATE_DIR = Path(os.environ.get("SALES_1_TASK_STOP_STATE_DIR", "/var/lib/sales-1-task-stop"))
+LOCK_PATH = STATE_DIR / "controller.lock"
+
+
+class ControllerError(RuntimeError):
+    """A step failed; the lane must stay reserved."""
+
+
+class RateLimited(ControllerError):
+    """The container was restarted too recently; try again later."""
+
+
+# --------------------------------------------------------------------------- config
+
+
+@dataclass
+class RoleTarget:
+    container: str
+    api_port: int
+
+
+@dataclass
+class Config:
+    slc_url: str
+    slc_token: str
+    swarm_url: str
+    swarm_token: str
+    manager_role: str
+    roles: dict[str, RoleTarget]
+    controller_id: str = "sales-1-task-stop"
+    stop_timeout: int = 60
+    health_timeout: int = 180
+    # FaraCRM MCP requests time out after 30 s; give in-flight writes of the
+    # killed run time to land before the lane is released.
+    settle_seconds: int = 35
+    min_restart_interval: int = 300
+
+    @classmethod
+    def from_env(cls, env: dict[str, str]) -> "Config":
+        def need(name: str) -> str:
+            value = env.get(name, "").strip()
+            if not value:
+                raise ControllerError(f"missing required setting {name}")
+            return value
+
+        roles: dict[str, RoleTarget] = {}
+        # SALES_1_STOP_ROLES="crm-operator=hermes-crm-operator:8653,contactor=hermes-contactor:8649"
+        for item in need("SALES_1_STOP_ROLES").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            role, _, target = item.partition("=")
+            container, _, port = target.partition(":")
+            if not role or not container or not port.isdigit():
+                raise ControllerError(f"bad SALES_1_STOP_ROLES entry {item!r}")
+            roles[role.strip()] = RoleTarget(container.strip(), int(port))
+        return cls(
+            slc_url=need("SLC_URL").rstrip("/"),
+            slc_token=need("SLC_OPERATOR_STOP_TOKEN"),
+            swarm_url=need("SWARM_MANAGER_MCP_URL"),
+            swarm_token=need("MANAGER_SWARM_MCP_TOKEN"),
+            manager_role=env.get("SWARM_MANAGER_ROLE", "manager").strip() or "manager",
+            roles=roles,
+            # Stable across host renames; a claim with this id is always ours.
+            controller_id=env.get("SALES_1_STOP_CONTROLLER_ID", "sales-1-task-stop").strip() or "sales-1-task-stop",
+            stop_timeout=int(env.get("SALES_1_STOP_TIMEOUT", "60")),
+            health_timeout=int(env.get("SALES_1_HEALTH_TIMEOUT", "180")),
+            settle_seconds=int(env.get("SALES_1_SETTLE_SECONDS", "35")),
+            min_restart_interval=int(env.get("SALES_1_MIN_RESTART_INTERVAL", "300")),
+        )
+
+
+# --------------------------------------------------------------------------- clients
+
+
+def parse_ts(value: Any) -> "datetime | None":
+    """Parse RFC 3339 from SLC (nanoseconds, +00:00) or Swarm (Z); None if absent."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    match = re.match(r"^(.*T\d{2}:\d{2}:\d{2})(\.\d+)?(.*)$", text)
+    if match:
+        fraction = (match.group(2) or "")[:7]  # '.' + at most 6 digits
+        text = match.group(1) + fraction + match.group(3)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _http_json(method: str, url: str, token: str, body: Any = None, timeout: float = 20.0,
+               extra_headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any], dict[str, str]]:
+    data = None if body is None else json.dumps(body).encode()
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json, text/event-stream"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    headers.update(extra_headers or {})
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode()
+            status = response.status
+            response_headers = {k.lower(): v for k, v in response.headers.items()}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode(errors="replace")
+        status = exc.code
+        response_headers = {k.lower(): v for k, v in (exc.headers or {}).items()}
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        raise ControllerError(f"{method} {url} failed: {exc}") from exc
+    content_type = response_headers.get("content-type", "")
+    if "text/event-stream" in content_type:
+        payloads = [line[5:].strip() for line in raw.splitlines() if line.startswith("data:") and line[5:].strip()]
+        raw = payloads[-1] if payloads else "{}"
+    try:
+        parsed = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        parsed = {"raw": raw[:500]}
+    return status, parsed if isinstance(parsed, dict) else {"value": parsed}, response_headers
+
+
+class SlcOperator:
+    def __init__(self, base_url: str, token: str):
+        self.base = base_url
+        self.token = token
+
+    def _call(self, method: str, path: str, body: Any = None) -> dict[str, Any]:
+        status, payload, _ = _http_json(method, f"{self.base}{path}", self.token, body)
+        if status != 200 or payload.get("success") is not True:
+            raise ControllerError(f"SLC {path} -> HTTP {status}: {payload.get('error') or payload}")
+        return payload
+
+    def list_requests(self) -> list[dict[str, Any]]:
+        return list(self._call("GET", "/internal/operator/task-stops").get("requests") or [])
+
+    def claim(self, task_id: str, claim_id: str) -> dict[str, Any]:
+        return self._call("POST", "/internal/operator/task-stops/claim",
+                          {"task_id": task_id, "claim_id": claim_id})["request"]
+
+    def finalize(self, task_id: str, claim_id: str, evidence: dict[str, Any]) -> dict[str, Any]:
+        return self._call("POST", "/internal/operator/task-stops/finalize",
+                          {"task_id": task_id, "claim_id": claim_id, "evidence": evidence})
+
+
+class SwarmManager:
+    """Minimal Streamable-HTTP MCP client for the manager role endpoint."""
+
+    def __init__(self, url: str, token: str):
+        self.url = url
+        self.token = token
+        self.session = ""
+        self.next_id = 0
+
+    def _post(self, message: dict[str, Any]) -> dict[str, Any]:
+        extra = {"Mcp-Session-Id": self.session} if self.session else {}
+        status, payload, headers = _http_json("POST", self.url, self.token, message, extra_headers=extra)
+        self.session = headers.get("mcp-session-id", self.session)
+        if status not in (200, 202):
+            raise ControllerError(f"Swarm MCP HTTP {status}: {payload}")
+        return payload
+
+    def _init(self) -> None:
+        if self.session:
+            return
+        self.next_id += 1
+        self._post({"jsonrpc": "2.0", "id": self.next_id, "method": "initialize",
+                    "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                               "clientInfo": {"name": "sales-1-task-stop", "version": "2"}}})
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+
+    def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self._init()
+        self.next_id += 1
+        response = self._post({"jsonrpc": "2.0", "id": self.next_id, "method": "tools/call",
+                               "params": {"name": name, "arguments": arguments}})
+        if response.get("error"):
+            raise ControllerError(f"Swarm {name}: {response['error']}")
+        result = response.get("result") or {}
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            payload = dict(structured)
+        else:
+            payload = {}
+            for item in result.get("content") or []:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    try:
+                        payload = json.loads(item.get("text") or "{}")
+                    except json.JSONDecodeError:
+                        payload = {"text": item.get("text")}
+                    break
+        payload["_is_error"] = bool(result.get("isError"))
+        return payload
+
+    def read_resource(self, uri: str) -> dict[str, Any]:
+        self._init()
+        self.next_id += 1
+        response = self._post({"jsonrpc": "2.0", "id": self.next_id, "method": "resources/read",
+                               "params": {"uri": uri}})
+        for item in (response.get("result") or {}).get("contents") or []:
+            if isinstance(item, dict) and item.get("text"):
+                return json.loads(item["text"])
+        raise ControllerError(f"Swarm resource {uri} returned nothing")
+
+    def task_has_run(self, task_id: str, since: str | None) -> bool:
+        """Whether Swarm started (or queued) a run for this task after `since`.
+
+        Only dispatches after the stop was claimed count: before that the task
+        was queued behind the stuck one, so an earlier run could not start it.
+        """
+        cutoff = parse_ts(since)
+        snapshot = self.read_resource("swarm://operations")
+        for operation in snapshot.get("operations") or []:
+            result = operation.get("result") or {}
+            if result.get("correlation_id") != task_id or operation.get("status") != "accepted":
+                continue
+            created = parse_ts(operation.get("created_at"))
+            if cutoff is not None and (created is None or created <= cutoff):
+                continue
+            if result.get("run_id") or result.get("queued"):
+                return True
+            for delivery in operation.get("deliveries") or []:
+                if delivery.get("status") in ("pending", "delivered"):
+                    return True
+        return False
+
+
+# --------------------------------------------------------------------------- host ops
+
+
+class DockerHost:
+    def __init__(self, run: Callable[..., subprocess.CompletedProcess] = subprocess.run):
+        self.run = run
+
+    def _docker(self, args: list[str], timeout: int) -> subprocess.CompletedProcess:
+        try:
+            return self.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise ControllerError(f"docker {' '.join(args)} failed: {exc}") from exc
+
+    def running(self, container: str) -> bool:
+        result = self._docker(["inspect", "-f", "{{.State.Running}}", container], 30)
+        if result.returncode != 0:
+            raise ControllerError(f"docker inspect {container} failed: {result.stderr.strip()}")
+        return result.stdout.strip() == "true"
+
+    def stop(self, container: str, timeout: int) -> None:
+        result = self._docker(["stop", "-t", str(timeout), container], timeout + 60)
+        if result.returncode != 0:
+            raise ControllerError(f"docker stop {container} failed: {result.stderr.strip()}")
+
+    def start(self, container: str) -> None:
+        result = self._docker(["start", container], 120)
+        if result.returncode != 0:
+            raise ControllerError(f"docker start {container} failed: {result.stderr.strip()}")
+
+    @staticmethod
+    def port_open(port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.0)
+            return sock.connect_ex(("127.0.0.1", port)) == 0
+
+    @staticmethod
+    def healthy(port: int) -> bool:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as response:
+                return response.status == 200
+        except Exception:
+            return False
+
+
+# --------------------------------------------------------------------------- controller
+
+
+@dataclass
+class Controller:
+    config: Config
+    slc: Any
+    swarm: Any
+    docker: Any
+    state_dir: Path = STATE_DIR
+    sleep: Callable[[float], None] = time.sleep
+    now: Callable[[], float] = time.time
+    log: Callable[[str], None] = lambda message: print(message, flush=True)
+
+    def claim_id_for(self, request: dict[str, Any]) -> str:
+        # Deterministic per request and host-independent, so any run (even
+        # after a rename or crash) recognises and resumes its own claim.
+        return f"{self.config.controller_id}:{request['request_event_id']}"
+
+    # -- durable state --------------------------------------------------------
+
+    def _safe(self, name: str) -> str:
+        return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in name)
+
+    def _marker(self, task_id: str) -> Path:
+        return self.state_dir / f"pending-{self._safe(task_id)}.json"
+
+    def _write_json(self, path: Path, data: dict[str, Any]) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _pending_markers(self) -> list[dict[str, Any]]:
+        if not self.state_dir.exists():
+            return []
+        markers = []
+        for path in sorted(self.state_dir.glob("pending-*.json")):
+            try:
+                markers.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError) as exc:
+                self.log(f"unreadable marker {path.name}: {exc}")
+        return markers
+
+    def _restart_log(self) -> Path:
+        return self.state_dir / "restarts.json"
+
+    def _last_restart(self, container: str) -> float:
+        try:
+            return float(json.loads(self._restart_log().read_text(encoding="utf-8")).get(container, 0))
+        except (OSError, ValueError, AttributeError):
+            return 0.0
+
+    def _record_restart(self, container: str) -> None:
+        try:
+            data = json.loads(self._restart_log().read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        data[container] = self.now()
+        self._write_json(self._restart_log(), data)
+
+    # -- main loop -----------------------------------------------------------
+
+    def run_once(self) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        # Finish anything a previous run left half-done first: its container
+        # may be stopped and its next head not yet woken.
+        marked: set[str] = set()
+        for marker in self._pending_markers():
+            task_id = str(marker.get("task_id"))
+            marked.add(task_id)
+            results.append(self._guard(task_id, lambda marker=marker: self.recover(marker)))
+        try:
+            requests = self.slc.list_requests()
+        except Exception as exc:  # noqa: BLE001 - keep recoveries' results
+            self.log(f"cannot list stop requests: {exc}")
+            return results + [{"task_id": None, "status": "held", "error": str(exc)}]
+        for request in requests:
+            task_id = str(request.get("task_id"))
+            if request.get("state") not in ("requested", "claimed") or task_id in marked:
+                continue
+            if request.get("state") == "claimed" and request.get("claim_id") != self.claim_id_for(request):
+                # Another controller holds it; SLC lets us take it over only once
+                # that claim is stale, so just try and let SLC decide.
+                self.log(f"{task_id}: claimed by {request.get('claim_id')}; trying takeover")
+            results.append(self._guard(task_id, lambda request=request: self.execute(request)))
+        return results
+
+    def _guard(self, task_id: str, action: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        try:
+            return action()
+        except RateLimited as exc:
+            self.log(f"WAIT {task_id}: {exc}")
+            return {"task_id": task_id, "status": "waiting", "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - one task must never block the others
+            self.log(f"HOLD {task_id}: {type(exc).__name__}: {exc}")
+            return {"task_id": task_id, "status": "held", "error": f"{type(exc).__name__}: {exc}"}
+
+    def execute(self, request: dict[str, Any]) -> dict[str, Any]:
+        task_id = request["task_id"]
+        role = request["assignee"]
+        target = self.config.roles.get(role)
+        if target is None:
+            raise ControllerError(f"role {role} has no configured container; lane stays reserved")
+        since = self.now() - self._last_restart(target.container)
+        if since < self.config.min_restart_interval:
+            raise RateLimited(f"{target.container} was restarted {int(since)}s ago; "
+                              f"waiting {self.config.min_restart_interval}s between restarts")
+        claim_id = self.claim_id_for(request)
+        claimed = self.slc.claim(task_id, claim_id)
+        if claimed.get("state") == "abandoned":
+            self.log(f"{task_id} finished on its own ({claimed.get('final_status')}); executor untouched")
+            return {"task_id": task_id, "status": "abandoned", "role": role,
+                    "final_status": claimed.get("final_status")}
+        claim_id = claimed.get("claim_id") or claim_id
+        self.log(f"claimed {task_id} ({role}) as {claim_id}")
+        # Written before the container is touched: a crash from here on is
+        # finished by recover() (stop/verify, finalize, restart, wake).
+        self._write_json(self._marker(task_id), {
+            "task_id": task_id, "role": role, "claim_id": claim_id,
+            "container": target.container, "api_port": target.api_port, "stage": "stopping"})
+        return self.recover({"task_id": task_id, "role": role, "claim_id": claim_id,
+                             "container": target.container, "api_port": target.api_port,
+                             "stage": "stopping"})
+
+    def recover(self, marker: dict[str, Any]) -> dict[str, Any]:
+        task_id = marker["task_id"]
+        role = marker["role"]
+        claim_id = marker["claim_id"]
+        target = RoleTarget(marker["container"], int(marker["api_port"]))
+        if marker.get("stage") == "stopping":
+            self.stop_and_verify(target)
+            self._record_restart(target.container)
+            if self.config.settle_seconds > 0:
+                self.sleep(self.config.settle_seconds)
+            finalized = self.slc.finalize(task_id, claim_id, self.evidence(target, claim_id))
+            outcome = "superseded" if finalized.get("superseded") else "cancelled"
+            self.log(f"finalized {task_id}: {outcome} ({(finalized.get('task') or {}).get('status')})")
+            marker = {**marker, "stage": "restarting", "outcome": outcome}
+            self._write_json(self._marker(task_id), marker)
+        else:
+            self.log(f"resuming {task_id}: restarting {target.container}")
+        return self.restart_and_wake(task_id, role, claim_id, target, marker.get("outcome", "cancelled"))
+
+    # -- steps ---------------------------------------------------------------
+
+    def stop_and_verify(self, target: RoleTarget) -> None:
+        if self.docker.running(target.container):
+            self.log(f"stopping {target.container} (timeout {self.config.stop_timeout}s)")
+            self.docker.stop(target.container, self.config.stop_timeout)
+        deadline = self.now() + 30
+        while self.docker.running(target.container) or self.docker.port_open(target.api_port):
+            if self.now() > deadline:
+                raise ControllerError(f"{target.container} still running after stop; lane stays reserved")
+            self.sleep(1)
+
+    def evidence(self, target: RoleTarget, claim_id: str) -> dict[str, Any]:
+        return {
+            "controller": "sales-1-task-stop",
+            "claim_id": claim_id,
+            "container": target.container,
+            "container_running": False,
+            "api_port": target.api_port,
+            "api_port_open": False,
+            "settle_seconds": self.config.settle_seconds,
+            "verified_at_unix": int(self.now()),
+        }
+
+    def restart_and_wake(self, task_id: str, role: str, claim_id: str, target: RoleTarget,
+                         outcome: str) -> dict[str, Any]:
+        if not self.docker.running(target.container):
+            self.docker.start(target.container)
+        deadline = self.now() + self.config.health_timeout
+        while not self.docker.healthy(target.api_port):
+            if self.now() > deadline:
+                raise ControllerError(
+                    f"{target.container} did not become healthy after the stop; the task is closed in "
+                    f"SLC, the next head stays READY until the container is up (retried every run)")
+            self.sleep(2)
+        self.log(f"{target.container} is healthy again")
+        # The executor is back and the task is closed: the marker has done its
+        # job. Drop it before the best-effort wake, so a wake failure can never
+        # make a later run restart the container again.
+        self._marker(task_id).unlink(missing_ok=True)
+        woke = False
+        next_task_id = None
+        try:
+            # Re-read the current READY head right before waking: the saved
+            # result may be stale (the manager may have woken or cancelled it
+            # meanwhile). finalize is idempotent and returns the fresh head.
+            fresh = self.slc.finalize(task_id, claim_id, self.evidence(target, claim_id))
+            next_task_id = (fresh.get("next_ready_task") or {}).get("task_id")
+            woke = self.wake_next(fresh)
+        except Exception as exc:  # noqa: BLE001 - the stop itself is complete
+            # The next head stays READY in SLC; the manager's queue check wakes it.
+            self.log(f"wake of the next head skipped ({type(exc).__name__}: {exc}); it stays READY in SLC")
+        return {"task_id": task_id, "status": outcome, "role": role,
+                "next_task_id": next_task_id, "woke_next": woke}
+
+    def wake_next(self, finalized: dict[str, Any]) -> bool:
+        delivery = finalized.get("next_delivery")
+        if not finalized.get("next_wake_recommended") or not isinstance(delivery, dict):
+            return False
+        next_task = delivery.get("correlation_id")
+        claimed_at = (finalized.get("request") or {}).get("claimed_at")
+        try:
+            if next_task and self.swarm.task_has_run(next_task, claimed_at):
+                self.log(f"next head {next_task} already has a run; not waking it again")
+                return False
+        except Exception as exc:  # noqa: BLE001 - dedup below still protects
+            self.log(f"cannot read swarm://operations ({exc}); relying on the idempotency key")
+        result = self.swarm.call("dispatch_to", {
+            "recipient": delivery["recipient"],
+            "message": delivery["message"],
+            "correlation_id": next_task,
+            "idempotency_key": delivery.get("idempotency_key"),
+        })
+        if result.get("_is_error") or result.get("ok") is False:
+            self.log(f"wake of next head failed (it stays READY in SLC): {result}")
+            return False
+        return True
+
+
+# --------------------------------------------------------------------------- main
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            env.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    return env
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--env-file", default="/etc/sales-1-task-stop/env")
+    parser.add_argument("--list", action="store_true", help="only print stop requests")
+    args = parser.parse_args(argv)
+    config = Config.from_env(load_env_file(Path(args.env_file)))
+    slc = SlcOperator(config.slc_url, config.slc_token)
+    if args.list:
+        print(json.dumps(slc.list_requests(), ensure_ascii=False, indent=2))
+        return 0
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    import fcntl
+    with open(LOCK_PATH, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        controller = Controller(config, slc, SwarmManager(config.swarm_url, config.swarm_token), DockerHost())
+        results = controller.run_once()
+    if results:
+        print(json.dumps(results, ensure_ascii=False))
+    return 1 if any(item.get("status") == "held" for item in results) else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except ControllerError as exc:
+        print(f"sales-1-task-stop: {exc}", file=sys.stderr)
+        sys.exit(2)

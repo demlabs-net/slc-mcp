@@ -1,0 +1,12 @@
+[Unit]
+Description=Sales-1: остановка running-задач SLC по запросу cancel_task (оператор)
+After=network-online.target docker.service slc-mcp.service swarm-mcp.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/bin/sales-1-task-stop --env-file /etc/sales-1-task-stop/env
+StateDirectory=sales-1-task-stop
+# A stop may wait for docker stop (60s) and the restarted API (180s).
+TimeoutStartSec=15min
+Nice=5
